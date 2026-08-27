@@ -35,6 +35,7 @@
     "test:interrupted-build": "tsx --tsconfig scripts/e2e/tsconfig.json scripts/test-interrupted-build.ts",
     "test:landing-gallery": "tsx scripts/test-landing-gallery.ts",
     "test:tmux-agent": "tsx scripts/test-tmux-agent.ts",
+    "test:agent-result-lifecycle": "tsx scripts/test-agent-result-lifecycle.ts",
     "telegram:setup": "tsx src/telegram/bot.ts",
     "ui:dev": "pnpm --dir ui dev",
     "ui:build": "pnpm --dir ui build",

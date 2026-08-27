@@ -36,6 +36,7 @@ import {
   sessionName, terminalFailureError, tmuxAvailable,
 } from '../src/agents/tmuxRuntime.js';
 import { shouldUseAttachableTerminal, getRuntimeById } from '../src/agents/runtime.js';
+import { prepareCodeAgentInvocation } from '../src/agents/result.js';
 import { preTrustWorkspace, guardSettings } from '../src/agents/claudeCodeRuntime.js';
 import { TERMINAL_USER, terminalPassword, ttydArgs } from '../src/agents/terminalServer.js';
 import { RateLimitedError } from '../src/agents/types.js';
@@ -304,6 +305,7 @@ if (wantsLive) {
     console.log(`  .... running a real ${liveRuntime} session in tmux (${session}); this takes a minute`);
     const startedAt = Date.now();
     try {
+      const invocation = await prepareCodeAgentInvocation(ws);
       const result = await runCodeAgentTmux(
         {
           name: 'tmux-selftest',
@@ -316,6 +318,7 @@ if (wantsLive) {
         schema,
         session,
         getRuntimeById(liveRuntime),
+        invocation,
       );
       const seconds = Math.round((Date.now() - startedAt) / 1000);
       check('the agent returned a schema-valid result', result.ok === true, JSON.stringify(result));

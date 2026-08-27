@@ -158,6 +158,21 @@ export interface CodeAgentOptions {
 }
 
 /**
+ * Trusted identity of one workspace-agent invocation.
+ *
+ * Created only by the public `runCodeAgent()` boundary after it removes the
+ * previous result artifact. Adapters receive this immutable lease; callers and
+ * transports must not create a second one, otherwise tmux/headless fallback
+ * could disagree about which `result.json` belongs to the current run.
+ */
+export interface CodeAgentInvocationContext {
+  readonly invocationId: string;
+  readonly workspace: string;
+  readonly resultPath: string;
+  readonly notBeforeMs: number;
+}
+
+/**
  * How a runtime's CLI is launched inside an attachable tmux session.
  * The contract is the same as `codeAgent()`: the prompt reaches the agent and
  * the agent writes `result.json` — only the delivery differs.
@@ -203,7 +218,11 @@ export interface AgentRuntime {
     opts?: StructuredOptions,
   ): Promise<T>;
   /** Workspace agent with tools; result read from `result.json` and validated. */
-  codeAgent<T>(opts: CodeAgentOptions, resultSchema: ZodType<T>): Promise<T>;
+  codeAgent<T>(
+    opts: CodeAgentOptions,
+    resultSchema: ZodType<T>,
+    invocation: CodeAgentInvocationContext,
+  ): Promise<T>;
   /**
    * Detect an exhausted subscription window in UNSTRUCTURED output — CLI
    * stdout/stderr or tmux scrollback. Returns the RateLimitedError to throw

@@ -23,6 +23,10 @@ import { eq } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { getObject } from '../lib/storage.js';
 import { runCodeAgent } from '../agents/codeAgent.js';
+import {
+  artifactProducedDuringInvocation,
+  invocationFromError,
+} from '../agents/result.js';
 import { config } from '../config.js';
 import { enqueue, type JobPayload } from '../orchestrator/queue.js';
 import { buildSnapshot } from '../build/snapshot.js';
@@ -249,9 +253,11 @@ action. Everything else can be perfect and the run still reports badly without i
    * wrote a correct site, and simply never wrote result.json — throwing away a
    * verified-good build over a missing status file is the wrong trade.
    *
-   * So a missing/invalid result.json degrades to a synthesised one and is recorded
-   * as an unresolved note. A build that is genuinely broken still fails, because
-   * the independent build + provenance checks below are what actually gate.
+   * So a missing/invalid result.json degrades to a synthesised one only when this
+   * invocation produced `out/index.html`, and is recorded as an unresolved note.
+   * An old output in a reused QA workspace is never recovery evidence. A build
+   * that is genuinely broken still fails, because the independent build and
+   * provenance checks below are what actually gate.
    */
   await logStage(
     logPath,
@@ -283,7 +289,10 @@ action. Everything else can be perfect and the run still reports badly without i
       BuildResultSchema,
     );
   } catch (err) {
-    const builtAnyway = existsSync(path.join(dir, 'out', 'index.html'));
+    const invocation = invocationFromError(err);
+    const builtAnyway = invocation
+      ? await artifactProducedDuringInvocation(path.join(dir, 'out', 'index.html'), invocation)
+      : false;
     await logStage(
       logPath,
       builtAnyway

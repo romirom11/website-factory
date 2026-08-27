@@ -37,12 +37,13 @@ import { codeAgentEnv } from './sandbox.js';
 import { withStructuredRetries } from './retry.js';
 import { looksRateLimited, rateLimitedFromText } from './ratelimit.js';
 import { effectiveModel } from './modelPolicy.js';
-import { readAndValidateResult, resultPathIn } from './result.js';
+import { readAndValidateResult } from './result.js';
 import { appendBuildLog, clip, type BuildLogEvent } from '../build/buildLog.js';
 import {
   RateLimitedError,
   RUNTIME_LABELS,
   type AgentRuntime,
+  type CodeAgentInvocationContext,
   type AgentUsage,
   type CodeAgentOptions,
   type StructuredOptions,
@@ -417,9 +418,12 @@ export const opencodeRuntime: AgentRuntime = {
     });
   },
 
-  async codeAgent<T>(opts: CodeAgentOptions, resultSchema: ZodType<T>): Promise<T> {
+  async codeAgent<T>(
+    opts: CodeAgentOptions,
+    resultSchema: ZodType<T>,
+    invocation: CodeAgentInvocationContext,
+  ): Promise<T> {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_CODE_TIMEOUT_MS;
-    const resultPath = resultPathIn(opts.cwd);
     const model = effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
     const startedAt = Date.now();
 
@@ -443,10 +447,12 @@ export const opencodeRuntime: AgentRuntime = {
 
       assertNotRateLimited(outcome, `${outcome.res.stdout}\n${outcome.res.stderr}`.slice(-600), opts.name);
 
-      // The artifact is the contract: salvage it before declaring failure,
-      // exactly like the Claude adapter treats error_max_turns sessions.
+      // The current invocation's artifact is the contract: salvage it before
+      // declaring failure, exactly like Claude treats error_max_turns sessions.
       if (outcome.res.code !== 0 || outcome.events.some((e) => e.type === 'error')) {
-        const salvaged = await readAndValidateResult(resultPath, opts.name, resultSchema).catch(() => undefined);
+        const salvaged = await readAndValidateResult(
+          invocation.resultPath, opts.name, resultSchema, invocation,
+        ).catch(() => undefined);
         if (salvaged !== undefined) {
           log.warn('code agent wrote a valid result.json despite a failed run', {
             name: opts.name, exit: outcome.res.code,
@@ -462,7 +468,9 @@ export const opencodeRuntime: AgentRuntime = {
         );
       }
 
-      const result = await readAndValidateResult(resultPath, opts.name, resultSchema);
+      const result = await readAndValidateResult(
+        invocation.resultPath, opts.name, resultSchema, invocation,
+      );
       reportUsage(opts.onUsage, outcome.events, model, startedAt);
       return result;
     });

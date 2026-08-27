@@ -35,11 +35,12 @@ import { codeAgentEnv, buildPreToolUseGuard } from './sandbox.js';
 import { withStructuredRetries } from './retry.js';
 import { looksRateLimited, rateLimitedFromInfo, rateLimitedFromText } from './ratelimit.js';
 import { effectiveModel } from './modelPolicy.js';
-import { readAndValidateResult, resultPathIn } from './result.js';
+import { readAndValidateResult } from './result.js';
 import {
   RateLimitedError,
   RUNTIME_LABELS,
   type AgentRuntime,
+  type CodeAgentInvocationContext,
   type AgentUsage,
   type CodeAgentOptions,
   type StructuredOptions,
@@ -413,9 +414,12 @@ export const claudeCodeRuntime: AgentRuntime = {
     });
   },
 
-  async codeAgent<T>(opts: CodeAgentOptions, resultSchema: ZodType<T>): Promise<T> {
+  async codeAgent<T>(
+    opts: CodeAgentOptions,
+    resultSchema: ZodType<T>,
+    invocation: CodeAgentInvocationContext,
+  ): Promise<T> {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_CODE_TIMEOUT_MS;
-    const resultPath = resultPathIn(opts.cwd);
     const model = effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
 
     return withAgentSlot(`code:${opts.name}`, async () => {
@@ -463,10 +467,12 @@ export const claudeCodeRuntime: AgentRuntime = {
       reportUsage(opts.onUsage, run, model, startedAt);
 
       // A session can end on error_max_turns having ALREADY written a valid
-      // result.json. The artifact on disk is the contract, so check it before
-      // declaring failure — but only trust it if it validates.
+      // result.json. The current invocation's artifact is the contract, so
+      // check it before declaring failure — but only trust it if it validates.
       if (!run.success) {
-        const salvaged = await readAndValidateResult(resultPath, opts.name, resultSchema).catch(() => undefined);
+        const salvaged = await readAndValidateResult(
+          invocation.resultPath, opts.name, resultSchema, invocation,
+        ).catch(() => undefined);
         if (salvaged !== undefined) {
           log.warn('code agent wrote a valid result.json despite a failed session subtype', {
             name: opts.name, subtype: run.errorSubtype, turns: run.numTurns,
@@ -478,7 +484,7 @@ export const claudeCodeRuntime: AgentRuntime = {
           `${[run.threwAfterResult, run.resultText, ...run.errors].filter(Boolean).join(' ').slice(0, 300)}`,
         );
       }
-      return readAndValidateResult(resultPath, opts.name, resultSchema);
+      return readAndValidateResult(invocation.resultPath, opts.name, resultSchema, invocation);
     });
   },
 };

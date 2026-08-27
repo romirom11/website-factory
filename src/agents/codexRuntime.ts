@@ -25,12 +25,13 @@ import { codeAgentEnv } from './sandbox.js';
 import { withStructuredRetries } from './retry.js';
 import { looksRateLimited, rateLimitedFromText } from './ratelimit.js';
 import { effectiveModel } from './modelPolicy.js';
-import { readAndValidateResult, resultPathIn } from './result.js';
+import { readAndValidateResult } from './result.js';
 import { kickoffLine, PROMPT_FILE } from './tmuxRuntime.js';
 import {
   RateLimitedError,
   RUNTIME_LABELS,
   type AgentRuntime,
+  type CodeAgentInvocationContext,
   type CodeAgentOptions,
   type StructuredOptions,
   type TerminalLaunchSpec,
@@ -153,9 +154,12 @@ export const codexRuntime: AgentRuntime = {
     }
   },
 
-  async codeAgent<T>(opts: CodeAgentOptions, resultSchema: ZodType<T>): Promise<T> {
+  async codeAgent<T>(
+    opts: CodeAgentOptions,
+    resultSchema: ZodType<T>,
+    invocation: CodeAgentInvocationContext,
+  ): Promise<T> {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_CODE_TIMEOUT_MS;
-    const resultPath = resultPathIn(opts.cwd);
 
     return withAgentSlot(`code:${opts.name}`, async () => {
       const prompt =
@@ -179,7 +183,7 @@ export const codexRuntime: AgentRuntime = {
       if (res.code !== 0) {
         throw new Error(`codex code agent "${opts.name}" exited ${res.code}: ${res.stderr.slice(-400)}`);
       }
-      return readAndValidateResult(resultPath, opts.name, resultSchema);
+      return readAndValidateResult(invocation.resultPath, opts.name, resultSchema, invocation);
     });
   },
 };

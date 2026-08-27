@@ -60,10 +60,11 @@ import { appendBuildLog, clip } from '../build/buildLog.js';
 import { zodToJsonSchema } from './schema.js';
 import { withAgentSlot } from './semaphore.js';
 import { codeAgentEnv } from './sandbox.js';
-import { readAndValidateResult, resultPathIn } from './result.js';
+import { readAndValidateResult } from './result.js';
 import { startTerminalServer, stopTerminalServer } from './terminalServer.js';
 import type {
   AgentRuntime,
+  CodeAgentInvocationContext,
   CodeAgentOptions,
 } from './types.js';
 
@@ -419,8 +420,9 @@ async function waitForResult(
 /**
  * Run one workspace agent session inside tmux and return its validated result.
  *
- * Signature-compatible with any adapter's `codeAgent()` on purpose: the builder
- * does not branch, `runCodeAgent()` picks the runtime and passes the object.
+ * It fulfils the same artifact contract as an adapter's `codeAgent()`; the
+ * additional runtime/session arguments are transport dependencies supplied by
+ * `runCodeAgent()`, so the builder itself never branches.
  */
 export async function runCodeAgentTmux<T>(
   opts: CodeAgentOptions,
@@ -429,8 +431,10 @@ export async function runCodeAgentTmux<T>(
   session = sessionName(path.basename(opts.cwd)),
   /** The selected subscription runtime. Its capabilities drive launch, guard and rate-limit handling. */
   runtime: AgentRuntime,
+  /** Shared lease created by runCodeAgent() before transport selection. */
+  invocation: CodeAgentInvocationContext,
 ): Promise<T> {
-  const resultPath = resultPathIn(opts.cwd);
+  const resultPath = invocation.resultPath;
   const promptPath = path.join(opts.cwd, PROMPT_FILE);
   const settingsPath = path.join(opts.cwd, SETTINGS_FILE);
   const terminalLogPath = path.join(opts.cwd, TERMINAL_LOG);
@@ -438,11 +442,6 @@ export async function runCodeAgentTmux<T>(
 
   return withAgentSlot(`tmux:${opts.name}`, async () => {
     await mkdir(opts.cwd, { recursive: true });
-
-    // A stale result.json from a previous iteration would be read as this run's
-    // answer within one poll tick. Removing it is what makes the artifact a
-    // completion SIGNAL rather than just a file that happens to exist.
-    await rm(resultPath, { force: true });
 
     // The prompt file carries the same text the SDK path sends as the prompt,
     // including the mandatory result.json instruction — the contract is
@@ -563,7 +562,7 @@ export async function runCodeAgentTmux<T>(
       summary: `Агент завершив роботу в терміналі за ${Math.round(outcome.elapsedMs / 60_000)} хв`,
     });
 
-    return readAndValidateResult(resultPath, opts.name, resultSchema);
+    return readAndValidateResult(resultPath, opts.name, resultSchema, invocation);
   });
 }
 

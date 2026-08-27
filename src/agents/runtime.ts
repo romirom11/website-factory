@@ -30,6 +30,10 @@ import { log } from '../lib/logger.js';
 import { claudeCodeRuntime } from './claudeCodeRuntime.js';
 import { codexRuntime } from './codexRuntime.js';
 import { opencodeRuntime } from './opencodeRuntime.js';
+import {
+  associateInvocationWithError,
+  prepareCodeAgentInvocation,
+} from './result.js';
 import type {
   AgentKind,
   AgentRuntime,
@@ -99,23 +103,31 @@ export async function runCodeAgent<T>(
   opts: CodeAgentOptions,
   resultSchema: ZodType<T>,
 ): Promise<T> {
-  const runtime = getRuntime(opts.kind ?? 'builder');
+  // The lease is created BEFORE runtime/transport selection. A tmux fallback
+  // therefore cannot accidentally start a second lifecycle or see an old file.
+  const invocation = await prepareCodeAgentInvocation(opts.cwd);
 
-  const wantsTerminal = shouldUseAttachableTerminal(opts, config.build.mode);
-  if (wantsTerminal) {
-    const { runCodeAgentTmux, tmuxAvailable } = await import('./tmuxRuntime.js');
-    if (await tmuxAvailable()) {
-      return runCodeAgentTmux(opts, resultSchema, undefined, runtime);
+  try {
+    const runtime = getRuntime(opts.kind ?? 'builder');
+
+    const wantsTerminal = shouldUseAttachableTerminal(opts, config.build.mode);
+    if (wantsTerminal) {
+      const { runCodeAgentTmux, tmuxAvailable } = await import('./tmuxRuntime.js');
+      if (await tmuxAvailable()) {
+        return await runCodeAgentTmux(opts, resultSchema, undefined, runtime, invocation);
+      }
+      // Not an error: a dev box without tmux should still build. Warned rather
+      // than silent, because "why can't I attach to the terminal" has exactly one
+      // answer and this is it.
+      log.warn('tmux is not installed; falling back to the selected headless runtime', {
+        agent: opts.name, runtime: runtime.id,
+      });
     }
-    // Not an error: a dev box without tmux should still build. Warned rather
-    // than silent, because "why can't I attach to the terminal" has exactly one
-    // answer and this is it.
-    log.warn('tmux is not installed; falling back to the selected headless runtime', {
-      agent: opts.name, runtime: runtime.id,
-    });
-  }
 
-  return runtime.codeAgent(opts, resultSchema);
+    return await runtime.codeAgent(opts, resultSchema, invocation);
+  } catch (error) {
+    throw associateInvocationWithError(error, invocation);
+  }
 }
 
 export { z };

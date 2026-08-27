@@ -22,6 +22,11 @@ import {
   type EnqueueResult,
   type EnqueueMutation,
 } from './workflowRunStore.js';
+import {
+  failEnrichmentBranchInTransaction,
+  type EnrichmentBranch,
+} from './enrichmentBarrier.js';
+import { businessTransitions } from './statuses.js';
 
 export type { JobName } from './jobDefinitions.js';
 export type { EnqueueResult } from './workflowRunStore.js';
@@ -37,6 +42,12 @@ export type Handler = (payload: JobPayload) => Promise<void>;
 export type HandlerRegistry = Readonly<Record<JobName, Handler>>;
 
 let boss: PgBoss | null = null;
+
+function enrichmentBranchFor(name: JobName): EnrichmentBranch | null {
+  if (name === 'collect-assets') return 'assets';
+  if (name === 'audit-website') return 'audit';
+  return null;
+}
 
 export async function getBoss(): Promise<PgBoss> {
   if (boss) return boss;
@@ -273,6 +284,35 @@ export async function processJob(
             finishedAt: terminal ? finishedAt : null,
           })
           .where(eq(schema.workflowJobRuns.id, currentAttempt.runId));
+      }
+      const enrichmentBranch = enrichmentBranchFor(name);
+      if (
+        terminal
+        && enrichmentBranch
+        && typeof payload.enrichmentRunId === 'string'
+        && typeof payload.businessId === 'string'
+      ) {
+        const [business] = await tx.select({ status: schema.businesses.status })
+          .from(schema.businesses)
+          .where(eq(schema.businesses.id, payload.businessId))
+          .limit(1)
+          .for('update');
+        const branchFailure = await failEnrichmentBranchInTransaction(tx, {
+          runId: payload.enrichmentRunId,
+          businessId: payload.businessId,
+          branch: enrichmentBranch,
+          reason: `${name} ${needsHuman ? 'needs human' : 'retries exhausted'}: ${String(err?.message ?? err)}`
+            .slice(0, 500),
+        });
+        if (branchFailure.kind === 'blocked' && branchFailure.changed && business?.status === 'enriching') {
+          await businessTransitions.normalInTransaction(tx, {
+            businessId: payload.businessId,
+            expectedStatus: 'enriching',
+            to: 'needs_review',
+            actor: `${name}-lifecycle`,
+            reason: `${name} could not complete its enrichment evidence branch`,
+          });
+        }
       }
       return true;
     });

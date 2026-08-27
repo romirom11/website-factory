@@ -29,7 +29,41 @@ import { db, schema } from '../db/client.js';
 import type { JobPayload } from '../orchestrator/queue.js';
 import { log } from '../lib/logger.js';
 import { extractBrandIdentity } from '../enrichment/brandIdentity.js';
-import { collectAssetsHandler } from './assets.js';
+import {
+  collectAssets,
+  type AssetCollectionResult,
+} from '../enrichment/assetCollection.js';
+
+export interface BrandRefreshDependencies {
+  collect: typeof collectAssets;
+  extract: typeof extractBrandIdentity;
+}
+
+export interface BrandRefreshResult {
+  collection: AssetCollectionResult;
+  brand: Awaited<ReturnType<typeof extractBrandIdentity>>;
+}
+
+const DEFAULT_DEPENDENCIES: BrandRefreshDependencies = {
+  collect: collectAssets,
+  extract: extractBrandIdentity,
+};
+
+/**
+ * Explicit refresh policy: collect once, then extract brand once even when no
+ * bytes were added (logo ranking or existing evidence may still have changed).
+ */
+export async function refreshBrandEvidence(
+  businessId: string,
+  dependencies: BrandRefreshDependencies = DEFAULT_DEPENDENCIES,
+): Promise<BrandRefreshResult> {
+  const collection = await dependencies.collect({ businessId, imageUrls: [] });
+  const brand = await dependencies.extract(businessId, {
+    skipVoice: true,
+    preserveVoice: true,
+  });
+  return { collection, brand };
+}
 
 export async function refreshBrandHandler(payload: JobPayload): Promise<void> {
   const businessId = payload.businessId!;
@@ -39,21 +73,7 @@ export async function refreshBrandHandler(payload: JobPayload): Promise<void> {
   const before = await db.select().from(schema.assets).where(eq(schema.assets.businessId, businessId));
   const logosBefore = before.filter((a) => a.intendedUsage === 'logo').length;
 
-  // Asset collection with NO payload offers: everything comes from the stored
-  // captures, mined by the scored hunter. This is what re-labels a business
-  // whose "logo" is really L'Oréal's.
-  await collectAssetsHandler({ businessId, campaignId: biz.campaignId, imageUrls: [] });
-
-  // `collect-assets` already refreshes the palette when it saved something, but
-  // only then. A business whose assets were all already present still needs the
-  // palette recomputed — the logo may have been RE-RANKED without a new file
-  // being downloaded, and that changes which asset the palette is read from.
-  //
-  // The DESIGNER agent runs here (no `skipAgent`), which is the point of the
-  // button: re-ranking a logo or landing a profile screenshot is exactly the
-  // change that alters a designer's reading. `skipVoice` still holds — the
-  // separate voice call reads bios, and no bio changed.
-  const brand = await extractBrandIdentity(businessId, { skipVoice: true, preserveVoice: true });
+  const { collection, brand } = await refreshBrandEvidence(businessId);
 
   const after = await db.select().from(schema.assets).where(eq(schema.assets.businessId, businessId));
   const logosAfter = after.filter((a) => a.intendedUsage === 'logo');
@@ -62,6 +82,7 @@ export async function refreshBrandHandler(payload: JobPayload): Promise<void> {
     businessId,
     photosBefore: before.length,
     photosAfter: after.length,
+    assetsSaved: collection.saved,
     logosBefore,
     logosAfter: logosAfter.length,
     logoSources: logosAfter.map((a) => a.sourceUrl.slice(0, 90)),

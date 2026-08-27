@@ -30,7 +30,9 @@ import {
   canContinueAfterTransition,
   requireBusinessStatus,
 } from '../orchestrator/statuses.js';
-import { enqueue, type JobPayload } from '../orchestrator/queue.js';
+import type { JobPayload } from '../orchestrator/queue.js';
+import { settleEnrichmentBranchInTransaction } from '../orchestrator/enrichmentBarrier.js';
+import { prepareEnrichmentBranch } from '../orchestrator/enrichmentBarrierRuntime.js';
 import { log } from '../lib/logger.js';
 import { classifySocialUrl, cleanProfileUrl } from '../enrichment/messengers.js';
 
@@ -363,6 +365,19 @@ export async function auditHandler(payload: JobPayload): Promise<void> {
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   if (!biz) throw new Error(`business not found: ${businessId}`);
   const expectedStatus = requireBusinessStatus(biz.status, `business ${businessId}`);
+  const { barrier, runId: enrichmentRunId, authorization } = await prepareEnrichmentBranch(
+    payload,
+    businessId,
+    'audit',
+  );
+  if (authorization !== 'run') {
+    log.info('website audit skipped for inactive enrichment branch', {
+      businessId,
+      enrichmentRunId,
+      authorization,
+    });
+    return;
+  }
 
   let verdict: Verdict = 'no_website';
   let matrix: EndpointResult[] = [];
@@ -527,23 +542,56 @@ export async function auditHandler(payload: JobPayload): Promise<void> {
   }
   if (contradictions.length) notes.push(`CONTRADICTION: ${contradictions.join('; ')}`);
 
-  await db.insert(schema.websiteAudits).values({
+  const auditRecord = {
     businessId, endpointMatrix: matrix, bestEndpoint, verdict,
     desktopScreenshotKey: desktopKey, desktopFullScreenshotKey: desktopFullKey,
     mobileScreenshotKey: mobileKey,
     meaningfulContent: meaningful, notes: notes.join(' | ').slice(0, 2000) || null,
-  });
-  log.info('audit done', { businessId, verdict, bestEndpoint, contradictions: contradictions.length });
+  };
 
   if (contradictions.length) {
-    const transitioned = await businessTransitions.normal({
-      businessId,
-      expectedStatus,
-      to: 'needs_review',
-      actor: 'audit-worker',
-      reason: `contradiction: ${contradictions.join('; ')}`.slice(0, 300),
+    const reason = `contradiction: ${contradictions.join('; ')}`.slice(0, 300);
+    const outcome = await db.transaction(async (tx) => {
+      await tx.select({ id: schema.businesses.id })
+        .from(schema.businesses)
+        .where(eq(schema.businesses.id, businessId))
+        .limit(1)
+        .for('update');
+      const decision = await settleEnrichmentBranchInTransaction(tx, {
+        runId: enrichmentRunId,
+        businessId,
+        branch: 'audit',
+        outcome: 'blocked',
+        reason,
+      });
+      if (decision.kind === 'stale' || (decision.kind === 'blocked' && !decision.changed)) {
+        return { decision, transitioned: null };
+      }
+      await tx.insert(schema.websiteAudits).values(auditRecord);
+      const transitioned = await businessTransitions.normalInTransaction(tx, {
+        businessId,
+        expectedStatus,
+        to: 'needs_review',
+        actor: 'audit-worker',
+        reason,
+      });
+      return { decision, transitioned };
     });
-    canContinueAfterTransition(transitioned, { businessId, actor: 'audit-worker' });
+    if (outcome.transitioned) {
+      log.info('audit done', {
+        businessId,
+        verdict,
+        bestEndpoint,
+        contradictions: contradictions.length,
+      });
+      canContinueAfterTransition(outcome.transitioned, { businessId, actor: 'audit-worker' });
+    } else {
+      log.info('stale or already-settled contradictory audit ignored', {
+        businessId,
+        enrichmentRunId,
+        result: outcome.decision.kind,
+      });
+    }
     return;
   }
   const stillCurrent = await businessTransitions.normal({
@@ -553,5 +601,17 @@ export async function auditHandler(payload: JobPayload): Promise<void> {
     actor: 'audit-worker',
   });
   if (!canContinueAfterTransition(stillCurrent, { businessId, actor: 'audit-worker' })) return;
-  await enqueue('score-and-qa', { businessId, campaignId: biz.campaignId });
+  const result = await barrier.completeBranch(
+    { runId: enrichmentRunId, businessId, branch: 'audit' },
+    async (tx) => { await tx.insert(schema.websiteAudits).values(auditRecord); },
+  );
+  if (result.kind === 'recorded' || result.kind === 'score_enqueued') {
+    log.info('audit done', {
+      businessId,
+      verdict,
+      bestEndpoint,
+      contradictions: contradictions.length,
+    });
+  }
+  log.info('audit enrichment branch settled', { businessId, result: result.kind });
 }

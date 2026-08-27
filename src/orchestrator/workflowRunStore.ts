@@ -68,6 +68,9 @@ type ConnectionPool = Pick<pg.Pool, 'connect'>;
 type WorkflowDatabase = NodePgDatabase<typeof schema>;
 export type WorkflowRunTransaction = Parameters<Parameters<WorkflowDatabase['transaction']>[0]>[0];
 export type EnqueueMutation = (transaction: WorkflowRunTransaction) => Promise<void>;
+export type EnqueueTransactionPlanner = (
+  transaction: WorkflowRunTransaction,
+) => Promise<readonly EnqueueCommand[]>;
 
 function clientDb(client: pg.PoolClient): PgBoss.Db {
   return {
@@ -126,85 +129,121 @@ export class WorkflowRunStore {
       throw new Error(`invalid ${command.name} payload: ${validation.issues.join('; ')}`);
     }
 
-    const key = idempotencyKey(command);
-    const runId = randomUUID();
-    const bossJobId = randomUUID();
+    const results = await this.enqueueTransaction(async (tx) => {
+      await mutation?.(tx);
+      return [command];
+    });
+    const result = results[0];
+    if (!result) throw new Error(`enqueue transaction returned no result for ${command.name}`);
+    return result;
+  }
+
+  /**
+   * Atomically apply a domain mutation and enqueue every command it produces.
+   * Returning an empty list is valid and commits the domain-only decision.
+   */
+  async enqueueTransaction(
+    plan: EnqueueTransactionPlanner,
+  ): Promise<EnqueueResult[]> {
     const client = await this.pool.connect();
     const database = drizzle(client, { schema });
 
     try {
       return await database.transaction(async (tx) => {
-        await mutation?.(tx);
-        const insertedRuns = await tx.insert(schema.workflowJobRuns).values({
-          id: runId,
-          jobType: command.name,
-          idempotencyKey: key,
-          businessId: command.payload.businessId ?? null,
-          campaignId: command.payload.campaignId ?? null,
-          status: 'queued',
-          currentAttemptSequence: 1,
-        }).onConflictDoNothing().returning();
-
-        if (!insertedRuns.length) {
-          const [existingRun] = await tx.select().from(schema.workflowJobRuns)
-            .where(and(
-              eq(schema.workflowJobRuns.jobType, command.name),
-              eq(schema.workflowJobRuns.idempotencyKey, key),
-              inArray(schema.workflowJobRuns.status, ACTIVE_WORKFLOW_RUN_STATUSES),
-            ))
-            .limit(1);
-          if (!existingRun) {
-            throw new Error(`active workflow run conflict disappeared for ${command.name}:${key}`);
+        const commands = await plan(tx);
+        for (const command of commands) {
+          const validation = validateJobPayload(command.name, command.payload);
+          if (!validation.ok) {
+            throw new Error(`invalid ${command.name} payload: ${validation.issues.join('; ')}`);
           }
-          const [attempt] = await tx.select().from(schema.workflowJobs)
-            .where(eq(schema.workflowJobs.runId, existingRun.id))
-            .orderBy(desc(schema.workflowJobs.attemptSequence))
-            .limit(1);
-          return {
-            kind: 'duplicate',
-            runId: existingRun.id,
-            runStatus: existingRun.status as ActiveWorkflowRunStatus,
-            attemptId: attempt?.id ?? null,
-            attemptSequence: existingRun.currentAttemptSequence,
-            bossJobId: attempt?.bossJobId ?? null,
-          };
         }
 
-        const [attempt] = await tx.insert(schema.workflowJobs).values({
-          bossJobId,
-          jobType: command.name,
-          businessId: command.payload.businessId ?? null,
-          campaignId: command.payload.campaignId ?? null,
-          payload: command.payload,
-          idempotencyKey: key,
-          runId,
-          attemptSequence: 1,
-          status: 'queued',
-        }).returning({ id: schema.workflowJobs.id });
-        if (!attempt) throw new Error(`failed to create first attempt for workflow run ${runId}`);
-
-        const definition = getJobDefinition(command.name);
-        const sentId = await this.boss.send(
-          definition.physicalQueue,
-          physicalJobData(command.name, command.payload),
-          sendOptions(command, bossJobId, key, clientDb(client)),
-        );
-        if (sentId !== bossJobId) {
-          throw new Error(`pg-boss did not create expected job ${bossJobId}`);
+        const results: EnqueueResult[] = [];
+        for (const command of commands) {
+          results.push(await this.enqueueInTransaction(tx, client, command));
         }
-
-        return {
-          kind: 'accepted',
-          runId,
-          runStatus: 'queued',
-          attemptId: attempt.id,
-          attemptSequence: 1,
-          bossJobId,
-        };
+        return results;
       });
     } finally {
       client.release();
     }
+  }
+
+  private async enqueueInTransaction(
+    tx: WorkflowRunTransaction,
+    client: pg.PoolClient,
+    command: EnqueueCommand,
+  ): Promise<EnqueueResult> {
+    const key = idempotencyKey(command);
+    const runId = randomUUID();
+    const bossJobId = randomUUID();
+
+    const insertedRuns = await tx.insert(schema.workflowJobRuns).values({
+      id: runId,
+      jobType: command.name,
+      idempotencyKey: key,
+      businessId: command.payload.businessId ?? null,
+      campaignId: command.payload.campaignId ?? null,
+      status: 'queued',
+      currentAttemptSequence: 1,
+    }).onConflictDoNothing().returning();
+
+    if (!insertedRuns.length) {
+      const [existingRun] = await tx.select().from(schema.workflowJobRuns)
+        .where(and(
+          eq(schema.workflowJobRuns.jobType, command.name),
+          eq(schema.workflowJobRuns.idempotencyKey, key),
+          inArray(schema.workflowJobRuns.status, ACTIVE_WORKFLOW_RUN_STATUSES),
+        ))
+        .limit(1);
+      if (!existingRun) {
+        throw new Error(`active workflow run conflict disappeared for ${command.name}:${key}`);
+      }
+      const [attempt] = await tx.select().from(schema.workflowJobs)
+        .where(eq(schema.workflowJobs.runId, existingRun.id))
+        .orderBy(desc(schema.workflowJobs.attemptSequence))
+        .limit(1);
+      return {
+        kind: 'duplicate',
+        runId: existingRun.id,
+        runStatus: existingRun.status as ActiveWorkflowRunStatus,
+        attemptId: attempt?.id ?? null,
+        attemptSequence: existingRun.currentAttemptSequence,
+        bossJobId: attempt?.bossJobId ?? null,
+      };
+    }
+
+    const [attempt] = await tx.insert(schema.workflowJobs).values({
+      bossJobId,
+      jobType: command.name,
+      businessId: command.payload.businessId ?? null,
+      campaignId: command.payload.campaignId ?? null,
+      payload: command.payload,
+      idempotencyKey: key,
+      runId,
+      attemptSequence: 1,
+      status: 'queued',
+    }).returning({ id: schema.workflowJobs.id });
+    if (!attempt) throw new Error(`failed to create first attempt for workflow run ${runId}`);
+
+    const definition = getJobDefinition(command.name);
+    const sentId = await this.boss.send(
+      definition.physicalQueue,
+      physicalJobData(command.name, command.payload),
+      sendOptions(command, bossJobId, key, clientDb(client)),
+    );
+    if (sentId !== bossJobId) {
+      throw new Error(`pg-boss did not create expected job ${bossJobId}`);
+    }
+
+    return {
+      kind: 'accepted',
+      runId,
+      runStatus: 'queued',
+      attemptId: attempt.id,
+      attemptSequence: 1,
+      bossJobId,
+    };
   }
 
   /** Schedule exactly one successor physical attempt for a rate-limited run. */

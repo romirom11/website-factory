@@ -63,6 +63,8 @@ const BUSINESS_PAYLOAD = {
     followupIndex: 'integer',
     designAttempt: 'integer',
     designFeedback: 'nonEmptyString',
+    enrichmentRunId: 'nonEmptyString',
+    enrichmentGeneration: 'integer',
     issues: 'stringArray',
     imageUrls: 'array',
     silent: 'boolean',

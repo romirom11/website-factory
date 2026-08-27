@@ -26,7 +26,8 @@ import {
   canContinueAfterTransition,
   requireBusinessStatus,
 } from '../orchestrator/statuses.js';
-import { enqueue, type JobPayload } from '../orchestrator/queue.js';
+import type { JobPayload } from '../orchestrator/queue.js';
+import { getEnrichmentBarrier } from '../orchestrator/enrichmentBarrierRuntime.js';
 import { log } from '../lib/logger.js';
 import { config } from '../config.js';
 import {
@@ -538,8 +539,8 @@ export async function enrichHandler(payload: JobPayload): Promise<void> {
   // evidence it reads. `collect-assets` has not run yet at this point, so this
   // pass sees the captured PAGES but no downloaded logo file — the site's
   // declared colours, the profile avatar and the voice, which is the half that
-  // photographs cannot supply. `collectAssetsHandler` re-runs the colour half
-  // the moment the logo lands, which is what upgrades the palette from
+  // photographs cannot supply. The asset worker explicitly refreshes the
+  // colour half once when a logo lands, which upgrades the palette from
   // photo-derived to logo-derived.
   //
   // Non-fatal by construction: `extractBrandIdentity` never throws for ordinary
@@ -614,7 +615,7 @@ export async function enrichHandler(payload: JobPayload): Promise<void> {
     gaps: result.gaps.length,
   });
 
-  // Stage 5 + 6 run next; the audit worker chains into scoring.
+  // Stage 5 + 6 are one durable generation; the barrier alone owns scoring.
   const stillCurrent = await businessTransitions.normal({
     businessId,
     expectedStatus: 'enriching',
@@ -622,10 +623,10 @@ export async function enrichHandler(payload: JobPayload): Promise<void> {
     actor: 'enrich-worker',
   });
   if (!canContinueAfterTransition(stillCurrent, { businessId, actor: 'enrich-worker' })) return;
-  await enqueue('collect-assets', {
+  const barrier = await getEnrichmentBarrier();
+  await barrier.start({
     businessId,
     campaignId: biz.campaignId,
     imageUrls: [...mined.imageOffers, ...pageImages] as unknown as Record<string, unknown>[],
   });
-  await enqueue('audit-website', { businessId, campaignId: biz.campaignId });
 }

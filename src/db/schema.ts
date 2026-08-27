@@ -385,6 +385,37 @@ export const workflowReconciliationEvents = pgTable('workflow_reconciliation_eve
   index('workflow_reconciliation_created_idx').on(t.createdAt),
 ]);
 
+// ─── Enrichment fan-out barrier ─────────────────────────────────────────────
+
+/**
+ * One evidence generation fans out into assets + website audit. Scoring may
+ * start only after both branches have durably succeeded for the current run.
+ */
+export const enrichmentRuns = pgTable('enrichment_runs', {
+  id: uuid('id').primaryKey(),
+  businessId: text('business_id').notNull().references(() => businesses.id),
+  campaignId: text('campaign_id').notNull().references(() => campaigns.id),
+  generation: integer('generation').notNull(),
+  // native | legacy (bounded compatibility for pre-0017 live branch jobs)
+  source: text('source').notNull().default('native'),
+  // running | score_enqueued | completed | blocked | superseded
+  status: text('status').notNull().default('running'),
+  // pending | succeeded | failed | blocked
+  assetsStatus: text('assets_status').notNull().default('pending'),
+  auditStatus: text('audit_status').notNull().default('pending'),
+  blockingReason: text('blocking_reason'),
+  scoreEnqueuedAt: timestamp('score_enqueued_at'),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+  updatedAt: timestamp('updated_at').notNull().defaultNow(),
+  completedAt: timestamp('completed_at'),
+}, (t) => [
+  uniqueIndex('enrichment_runs_business_generation_idx').on(t.businessId, t.generation),
+  uniqueIndex('enrichment_runs_current_business_idx')
+    .on(t.businessId)
+    .where(sql`${t.status} in ('running', 'score_enqueued')`),
+  index('enrichment_runs_status_idx').on(t.status),
+]);
+
 // ─── Settings (phase E) ──────────────────────────────────────────────────────
 
 /**

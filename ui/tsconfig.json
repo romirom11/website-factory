@@ -19,7 +19,8 @@
       "@factory/schema": ["./factory/schema.ts"],
       "@factory/buildPolicy": ["./factory/buildPolicy.ts"],
       "@factory/settings": ["./factory/settings.ts"],
-      "@factory/models": ["./factory/models.ts"]
+      "@factory/models": ["./factory/models.ts"],
+      "@factory/jobDefinitions": ["./factory/jobDefinitions.ts"]
     }
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],

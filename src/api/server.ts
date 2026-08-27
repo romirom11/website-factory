@@ -32,8 +32,12 @@ import {
   startSession, submitCode, telegramChats,
 } from './accounts.js';
 import { reloadSettings } from '../lib/settingsStore.js';
+import { ensureQueues } from '../orchestrator/queue.js';
 
 export async function startApi(): Promise<void> {
+  // Queue creation is part of readiness. In API-only mode there may be no
+  // worker process to prepare build/agent queues on our behalf.
+  await ensureQueues();
   const app = new Hono();
 
   app.get('/health', (c) => c.json({ ok: true, mode: config.mode }));

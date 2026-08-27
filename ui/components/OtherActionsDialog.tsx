@@ -29,12 +29,7 @@ import { ActionForm } from './ActionForm';
 import { forceStatusAction, markDoNotContact, reenqueueStage } from '@/lib/actions';
 import { humanStatus } from '@/lib/humanStatus';
 import { stageName } from '@/lib/stageNames';
-
-/** The stages a single business can be pushed through again by hand. */
-const STAGES = [
-  'enrich', 'enrich-socials', 'refresh-brand', 'collect-assets', 'audit-website', 'score-and-qa', 'readiness-gate',
-  'content-and-design', 'build-site', 'visual-qa', 'deploy-demo', 'request-approval',
-];
+import { MANUAL_REQUEUE_JOB_NAMES } from '@factory/jobDefinitions';
 
 export function OtherActionsDialog({ businessId, name, currentStatus, statuses }: {
   businessId: string;
@@ -135,7 +130,7 @@ export function OtherActionsDialog({ businessId, name, currentStatus, statuses }
             <label className="block">
               <span className="label">Який крок</span>
               <select id="job" name="job" defaultValue="request-approval">
-                {STAGES.map((s) => (
+                {MANUAL_REQUEUE_JOB_NAMES.map((s) => (
                   <option key={s} value={s}>{stageName(s)}</option>
                 ))}
               </select>

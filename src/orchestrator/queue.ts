@@ -5,13 +5,17 @@ import { db, schema } from '../db/client.js';
 import { log } from '../lib/logger.js';
 import { notifyJobProblem, notifySubscriptionPause } from '../telegram/notify.js';
 import { isRateLimitedError } from '../agents/types.js';
+import {
+  getJobDefinition,
+  validateJobPayload,
+  type JobName,
+} from './jobDefinitions.js';
+import {
+  ensureRequiredQueues,
+  type QueueCreator,
+} from './queueReadiness.js';
 
-export type JobName =
-  | 'discover' | 'normalize' | 'fast-qualify' | 'enrich' | 'enrich-socials'
-  | 'collect-assets' | 'refresh-brand'
-  | 'audit-website' | 'score-and-qa' | 'readiness-gate' | 'content-and-design'
-  | 'build-site' | 'visual-qa' | 'deploy-demo' | 'request-approval'
-  | 'send-outreach' | 'send-followup' | 'poll-replies' | 'daily-summary';
+export type { JobName } from './jobDefinitions.js';
 
 export interface JobPayload {
   campaignId?: string;
@@ -32,50 +36,32 @@ export async function getBoss(): Promise<PgBoss> {
   return boss;
 }
 
-/**
- * Job types that consume the AI subscription. They run one-at-a-time
- * (teamSize/batchSize 1) so the 5-hour window is never burned in parallel;
- * `src/agents/semaphore.ts` enforces the same cap inside the process.
- */
-const AGENT_JOBS: ReadonlySet<JobName> = new Set<JobName>([
-  'enrich', 'score-and-qa', 'content-and-design', 'build-site', 'visual-qa', 'request-approval',
-  // Since the agent-led social finder (SOCIAL_FINDER), this job can spend the
-  // subscription window too: the engines are blocked on the server, so the
-  // fallback fires routinely rather than rarely. Running it wide would park the
-  // extra workers on the agent semaphore while their 30-minute expiry ran down.
-  'enrich-socials',
-]);
+export type { QueueCreator } from './queueReadiness.js';
 
-const RETRY: Partial<Record<JobName, { limit: number; delay: number }>> = {
-  'discover': { limit: 2, delay: 60 },
-  'enrich': { limit: 3, delay: 120 },
-  // Browser + public SERPs: a second full pass costs minutes and hardens the
-  // rate limits that caused the first failure. One retry, then it stays failed
-  // and Roman re-runs it from the card when he wants to.
-  'enrich-socials': { limit: 1, delay: 120 },
-  // Mines stored evidence only — no page captures, no agent call. A retry is
-  // cheap and the usual failure is a transient MinIO or CDN hiccup.
-  'refresh-brand': { limit: 2, delay: 30 },
-  'audit-website': { limit: 3, delay: 60 },
-  'build-site': { limit: 1, delay: 0 },
-  'send-outreach': { limit: 0, delay: 0 }, // NEVER auto-retry sends
-};
+/** Create every current and target queue before any HTTP readiness is exposed. */
+export async function ensureQueues(queueCreator?: QueueCreator): Promise<void> {
+  const target = queueCreator ?? await getBoss();
+  await ensureRequiredQueues(target);
+}
 
 export async function enqueue(
   name: JobName,
   payload: JobPayload,
   opts: { startAfterSeconds?: number; priority?: number } = {},
 ): Promise<string | null> {
+  const definition = getJobDefinition(name);
+  const payloadValidation = validateJobPayload(name, payload);
+  if (!payloadValidation.ok) {
+    throw new Error(`invalid ${name} payload: ${payloadValidation.issues.join('; ')}`);
+  }
   const b = await getBoss();
-  const retry = RETRY[name] ?? { limit: 3, delay: 60 };
   const singletonKey = payload.idempotencyKey
     ?? (payload.businessId ? `${name}:${payload.businessId}` : `${name}:${payload.campaignId ?? 'global'}`);
   const jobId = await b.send(name, payload, {
-    retryLimit: retry.limit,
-    retryDelay: retry.delay,
+    retryLimit: definition.retry.limit,
+    retryDelay: definition.retry.delaySeconds,
     retryBackoff: true,
-    // Agent jobs can legitimately run for an hour (site build + pnpm build).
-    expireInSeconds: AGENT_JOBS.has(name) ? 60 * 90 : 60 * 30,
+    expireInSeconds: definition.expireInSeconds,
     singletonKey, // idempotency: same key won't double-queue while active
     // Higher runs first (pg-boss default 0). The build policy uses it so leads
     // with no site at all are built before ones that already have some presence.
@@ -94,15 +80,16 @@ export async function enqueue(
 
 /** Wrap a handler with job-journal + error routing. One business failing never stops the campaign. */
 export async function register(name: JobName, handler: Handler): Promise<void> {
+  const definition = getJobDefinition(name);
   const b = await getBoss();
-  await b.createQueue(name).catch(() => { /* exists */ });
+  await b.createQueue(name);
   // Agent jobs share one finite subscription window (SPEC §2.3а), so they are
   // capped rather than run wide. The cap follows AGENT_CONCURRENCY instead of
   // being pinned to 1: `src/agents/semaphore.ts` enforces the same number
   // in-process, so pulling more jobs than that would only park them on the
   // semaphore, while pulling fewer leaves configured capacity unused.
   const agentTeam = Math.max(1, config.agents.concurrency);
-  const workOpts = AGENT_JOBS.has(name)
+  const workOpts = definition.agentCapability === 'subscription'
     ? { batchSize: 1, teamSize: agentTeam, teamConcurrency: agentTeam }
     : { batchSize: 1 };
   await b.work(name, workOpts, async (jobs) => {
@@ -151,7 +138,7 @@ export async function register(name: JobName, handler: Handler): Promise<void> {
           }).catch(() => {});
           continue; // resolved for pg-boss: no failure, no auto-retry storm
         }
-        const isFinalAttempt = attempt > (RETRY[name]?.limit ?? 3);
+        const isFinalAttempt = attempt > definition.retry.limit;
         const needsHuman = err?.code === 'NEEDS_HUMAN';
         await db.update(schema.workflowJobs)
           .set({

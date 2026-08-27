@@ -17,7 +17,12 @@
  * override `AGENT_CONCURRENCY` when the process runs exactly that group.
  */
 import { inArray } from 'drizzle-orm';
-import { register, getBoss, type JobName } from '../orchestrator/queue.js';
+import { ensureQueues, register, getBoss, type JobName } from '../orchestrator/queue.js';
+import {
+  JOB_DEFINITIONS,
+  WORKER_GROUP_NAMES,
+  type WorkerGroup,
+} from '../orchestrator/jobDefinitions.js';
 import { reconcileOnStartup, requeueOrphanedBuildJobs } from '../orchestrator/reconcile.js';
 import { db, schema } from '../db/client.js';
 import { notifyBuildInterrupted } from '../telegram/notify.js';
@@ -44,26 +49,18 @@ import { setAgentConcurrency } from '../agents/semaphore.js';
 import { config } from '../config.js';
 import { log } from '../lib/logger.js';
 
-export type WorkerGroup = 'core' | 'enrich' | 'build';
+export type { WorkerGroup } from '../orchestrator/jobDefinitions.js';
 
-export const WORKER_GROUPS: Record<WorkerGroup, JobName[]> = {
-  /** Deterministic + light-agent stages, plus the schedules and the outreach path. */
-  core: [
-    'discover', 'normalize', 'fast-qualify', 'collect-assets', 'audit-website',
-    'readiness-gate', 'deploy-demo', 'request-approval',
-    'send-outreach', 'send-followup', 'poll-replies', 'daily-summary',
-  ],
-  /**
-   * Evidence extraction: many medium-length agent calls, plus `enrich-socials`,
-   * which is agent-free but Playwright-bound — these containers already run the
-   * browser, and it must not sit behind a 40-minute build session.
-   */
-  enrich: ['enrich', 'enrich-socials', 'refresh-brand', 'score-and-qa'],
-  /** Site production: few very long agent sessions (a build can run 40+ min). */
-  build: ['content-and-design', 'build-site', 'visual-qa'],
-};
+/** Logical jobs per process topology, derived from the shared policy registry. */
+export const WORKER_GROUPS = Object.fromEntries(
+  WORKER_GROUP_NAMES.map((group) => [
+    group,
+    JOB_DEFINITIONS.filter((definition) => definition.workerGroup === group)
+      .map((definition) => definition.name),
+  ]),
+) as Record<WorkerGroup, JobName[]>;
 
-const HANDLERS: Record<JobName, Parameters<typeof register>[1]> = {
+export const HANDLERS: Record<JobName, Parameters<typeof register>[1]> = {
   'discover': discoverHandler,
   'normalize': normalizeHandler,
   'fast-qualify': fastQualifyHandler,
@@ -164,6 +161,7 @@ async function notifyInterruptedBuilds(
 
 export async function startWorkers(explicit?: WorkerGroup[]): Promise<void> {
   await ensureBuckets();
+  await ensureQueues();
 
   const groups = resolveGroups(explicit);
 

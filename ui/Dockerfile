@@ -25,7 +25,7 @@ COPY ui/ ./
 # `ui/factory/schema.ts` arrives as the dev symlink (-> ../../src/db/schema.ts),
 # which dangles here because the copy is rooted at /app. Remove it first, then
 # copy the real file: a plain COPY would otherwise write THROUGH the symlink.
-RUN rm -f ./factory/schema.ts ./factory/buildPolicy.ts ./factory/settings.ts ./factory/models.ts
+RUN rm -f ./factory/schema.ts ./factory/buildPolicy.ts ./factory/settings.ts ./factory/models.ts ./factory/jobDefinitions.ts
 COPY src/db/schema.ts ./factory/schema.ts
 # Same reasoning as the schema: the build policy (who gets a demo built, in what
 # order) is ONE file shared with the workers, so the router and the UI's
@@ -41,6 +41,9 @@ COPY src/lib/settings.ts ./factory/settings.ts
 # the workers pass these ids to their CLIs and the settings page renders the
 # same rule as field fallbacks. Import-free by design (see its docblock).
 COPY src/agents/modelPolicy.ts ./factory/models.ts
+# Fifth shared file: queue policy and human-readable job metadata are one
+# import-free registry consumed by both factory and UI.
+COPY src/orchestrator/jobDefinitions.ts ./factory/jobDefinitions.ts
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN pnpm build
 

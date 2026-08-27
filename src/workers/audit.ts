@@ -25,7 +25,11 @@ import { chromium } from 'playwright';
 import { eq } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { putRaw } from '../lib/storage.js';
-import { transition } from '../orchestrator/statuses.js';
+import {
+  businessTransitions,
+  canContinueAfterTransition,
+  requireBusinessStatus,
+} from '../orchestrator/statuses.js';
 import { enqueue, type JobPayload } from '../orchestrator/queue.js';
 import { log } from '../lib/logger.js';
 import { classifySocialUrl, cleanProfileUrl } from '../enrichment/messengers.js';
@@ -358,6 +362,7 @@ export async function auditHandler(payload: JobPayload): Promise<void> {
   const businessId = payload.businessId!;
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   if (!biz) throw new Error(`business not found: ${businessId}`);
+  const expectedStatus = requireBusinessStatus(biz.status, `business ${businessId}`);
 
   let verdict: Verdict = 'no_website';
   let matrix: EndpointResult[] = [];
@@ -531,8 +536,22 @@ export async function auditHandler(payload: JobPayload): Promise<void> {
   log.info('audit done', { businessId, verdict, bestEndpoint, contradictions: contradictions.length });
 
   if (contradictions.length) {
-    await transition(businessId, 'needs_review', 'audit-worker', `contradiction: ${contradictions.join('; ')}`.slice(0, 300));
+    const transitioned = await businessTransitions.normal({
+      businessId,
+      expectedStatus,
+      to: 'needs_review',
+      actor: 'audit-worker',
+      reason: `contradiction: ${contradictions.join('; ')}`.slice(0, 300),
+    });
+    canContinueAfterTransition(transitioned, { businessId, actor: 'audit-worker' });
     return;
   }
+  const stillCurrent = await businessTransitions.normal({
+    businessId,
+    expectedStatus,
+    to: expectedStatus,
+    actor: 'audit-worker',
+  });
+  if (!canContinueAfterTransition(stillCurrent, { businessId, actor: 'audit-worker' })) return;
   await enqueue('score-and-qa', { businessId, campaignId: biz.campaignId });
 }

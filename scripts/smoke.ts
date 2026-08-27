@@ -121,9 +121,16 @@ let biz = (await pool.query(`select * from businesses where id = $1`, [businessI
 check('fast-qualify -> prequalified', biz.status === 'prequalified', biz.status);
 
 // illegal transition guard
-const { transition } = await import('../src/orchestrator/statuses.js');
+const { businessTransitions } = await import('../src/orchestrator/statuses.js');
 let threw = false;
-try { await transition(businessId, 'contacted', 'smoke-worker'); } catch { threw = true; }
+try {
+  await businessTransitions.normal({
+    businessId,
+    expectedStatus: 'prequalified',
+    to: 'contacted',
+    actor: 'smoke-worker',
+  });
+} catch { threw = true; }
 check('illegal transition blocked', threw);
 
 // ── website audit (domain=localhost won't parse; set domain manually) ──
@@ -134,7 +141,13 @@ check('audit produced verdict', !!audit?.verdict, audit?.verdict);
 check('audit took screenshots', !!audit?.desktop_screenshot_key && !!audit?.mobile_screenshot_key);
 
 // ── readiness gate: no facts/assets yet -> must record gaps, not pass ──
-await pool.query(`update businesses set status = 'qualified' where id = $1`, [businessId]);
+await businessTransitions.override({
+  businessId,
+  expectedStatus: 'prequalified',
+  to: 'qualified',
+  actor: 'smoke-test',
+  reason: 'exercise readiness gate',
+});
 await readinessHandler({ businessId });
 const gaps = await pool.query(`select gap from production_gaps where business_id = $1 and resolved = false`, [businessId]);
 check('readiness gate blocks incomplete package', gaps.rowCount! >= 3, gaps.rows.map((g: any) => g.gap).join(','));

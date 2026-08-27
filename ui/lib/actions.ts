@@ -28,6 +28,8 @@ import { stageName } from './stageNames';
 import type { ActionResult } from './types';
 import { retryFailedJob, stopFailedBuild } from './buildFailureDecision';
 import { isJobName } from '@factory/jobDefinitions';
+import { isBusinessStatus } from '@factory/businessStatus';
+import { operatorTransition } from './businessTransitions';
 
 // ─── Approvals ───────────────────────────────────────────────────────────────
 
@@ -176,22 +178,35 @@ export async function confirmManualSent(input: { approvalId: number }): Promise<
 export async function transitionBusiness(
   businessId: string, to: string, reason: string,
 ): Promise<ActionResult> {
+  if (!isBusinessStatus(to)) return { ok: false, message: `Невідомий статус: ${to}` };
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   if (!biz) return { ok: false, message: 'Бізнес не знайдено' };
-  if (biz.status === to) return { ok: true, message: `Вже в статусі ${to}` };
+  if (!isBusinessStatus(biz.status)) {
+    return { ok: false, message: `У бізнесу некоректний поточний статус: ${biz.status}` };
+  }
 
-  await db.transaction(async (tx) => {
-    await tx.update(schema.businesses)
-      .set({ status: to, statusReason: reason, updatedAt: new Date() })
-      .where(eq(schema.businesses.id, businessId));
-    await tx.insert(schema.statusHistory).values({
-      businessId, fromStatus: biz.status, toStatus: to, reason, actor: 'roman',
-    });
+  const response = await operatorTransition({
+    businessId,
+    expectedStatus: biz.status,
+    to,
+    reason: reason.trim() || 'ручна зміна статусу Романом',
   });
 
   revalidatePath(`/businesses/${businessId}`);
   revalidatePath('/businesses');
-  return { ok: true, message: `${biz.status} → ${to}` };
+  if (response.result?.kind === 'moved') {
+    return { ok: true, message: `${response.result.from} → ${response.result.to}` };
+  }
+  if (response.result?.kind === 'already_at_target') {
+    return { ok: true, message: `Вже в статусі ${response.result.status}` };
+  }
+  if (response.result?.kind === 'conflict') {
+    return {
+      ok: false,
+      message: `Стан уже змінився: очікували ${response.result.expectedStatus}, зараз ${response.result.currentStatus}.`,
+    };
+  }
+  return { ok: false, message: response.message || 'Фабрика не підтвердила зміну статусу.' };
 }
 
 /**
@@ -207,26 +222,28 @@ async function transitionBusinessFrom(
   to: string,
   reason: string,
 ): Promise<ActionResult> {
-  const moved = await db.transaction(async (tx) => {
-    const changed = await tx.update(schema.businesses)
-      .set({ status: to, statusReason: reason, updatedAt: new Date() })
-      .where(and(
-        eq(schema.businesses.id, businessId),
-        eq(schema.businesses.status, from),
-      ))
-      .returning({ id: schema.businesses.id });
-    if (!changed.length) return false;
-    await tx.insert(schema.statusHistory).values({
-      businessId, fromStatus: from, toStatus: to, reason, actor: 'roman',
-    });
-    return true;
+  if (!isBusinessStatus(from) || !isBusinessStatus(to)) {
+    return { ok: false, message: 'Некоректний статус у рішенні оператора.' };
+  }
+  const response = await operatorTransition({
+    businessId,
+    expectedStatus: from,
+    to,
+    reason,
   });
 
   revalidatePath(`/businesses/${businessId}`);
   revalidatePath('/businesses');
-  return moved
-    ? { ok: true, message: `${from} → ${to}` }
-    : { ok: false, message: 'Це рішення щойно вже прийняли в іншій вкладці.' };
+  if (response.result?.kind === 'moved') {
+    return { ok: true, message: `${response.result.from} → ${response.result.to}` };
+  }
+  if (response.result?.kind === 'already_at_target') {
+    return { ok: true, message: `Вже в статусі ${response.result.status}` };
+  }
+  if (response.result?.kind === 'conflict') {
+    return { ok: false, message: 'Це рішення щойно вже прийняли в іншій вкладці.' };
+  }
+  return { ok: false, message: response.message || 'Фабрика не підтвердила рішення.' };
 }
 
 /**

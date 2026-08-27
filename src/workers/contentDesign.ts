@@ -24,7 +24,11 @@ import { and, desc, eq, inArray, ne } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { getObject, putRaw } from '../lib/storage.js';
 import { runAgent } from '../agents/agent.js';
-import { transition } from '../orchestrator/statuses.js';
+import {
+  businessTransitions,
+  canContinueAfterTransition,
+  requireBusinessStatus,
+} from '../orchestrator/statuses.js';
 import { enqueue, NeedsHumanError, type JobPayload } from '../orchestrator/queue.js';
 import { buildSnapshot, primaryContact, realPhotos, type BuildSnapshot } from '../build/snapshot.js';
 import {
@@ -795,7 +799,14 @@ export async function contentDesignHandler(payload: JobPayload): Promise<void> {
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   if (!biz) throw new Error(`business not found: ${businessId}`);
 
-  await transition(businessId, 'site_in_progress', 'content-design-worker');
+  const expectedStatus = requireBusinessStatus(biz.status, `business ${businessId}`);
+  const transitioned = await businessTransitions.normal({
+    businessId,
+    expectedStatus,
+    to: 'site_in_progress',
+    actor: 'content-design-worker',
+  });
+  if (!canContinueAfterTransition(transitioned, { businessId, actor: 'content-design-worker' })) return;
 
   const snapshot = await buildSnapshot(businessId);
   const designAttempt = (payload.designAttempt as number | undefined) ?? 1;

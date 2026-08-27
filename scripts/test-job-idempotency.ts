@@ -114,6 +114,54 @@ await withDisposableFactoryDatabase(async ({ pool, db: testDb, boss }) => {
     assert.equal(await count(`select count(*) from pgboss.job where id = $1`, [insertedBossId]), 0);
   });
 
+  await check('a domain mutation commits with its workflow run and pg-boss job', async () => {
+    const key = `domain-success:${randomUUID()}`;
+    const campaignId = `campaign-${randomUUID()}`;
+    const result = await store.enqueue(command(key), async (tx) => {
+      await tx.insert(schema.campaigns).values({
+        id: campaignId,
+        country: 'GR',
+        city: 'Patras',
+        niche: 'test',
+        language: 'el',
+        queries: ['test'],
+        geofence: { lat: 38.2, lng: 21.7, radiusKm: 1 },
+      });
+    });
+    assert.equal(result.kind, 'accepted');
+    assert.equal(await count(`select count(*) from campaigns where id = $1`, [campaignId]), 1);
+    assert.equal(await count(`select count(*) from workflow_job_runs where id = $1`, [result.runId]), 1);
+    assert.equal(await count(`select count(*) from pgboss.job where id = $1`, [result.bossJobId]), 1);
+  });
+
+  await check('a pg-boss failure rolls back the related domain mutation too', async () => {
+    const key = `domain-rollback:${randomUUID()}`;
+    const campaignId = `campaign-${randomUUID()}`;
+    const failingBoss: BossSender = {
+      send: async (name, payload, options) => {
+        await boss.send(name, payload, options);
+        throw new Error('domain mutation rollback proof');
+      },
+    };
+    const failingStore = new WorkflowRunStore(pool, failingBoss);
+    await assert.rejects(
+      failingStore.enqueue(command(key), async (tx) => {
+        await tx.insert(schema.campaigns).values({
+          id: campaignId,
+          country: 'GR',
+          city: 'Patras',
+          niche: 'test',
+          language: 'el',
+          queries: ['test'],
+          geofence: { lat: 38.2, lng: 21.7, radiusKm: 1 },
+        });
+      }),
+      /domain mutation rollback proof/,
+    );
+    assert.equal(await count(`select count(*) from campaigns where id = $1`, [campaignId]), 0);
+    assert.equal(await count(`select count(*) from workflow_job_runs where idempotency_key = $1`, [key]), 0);
+  });
+
   await check('a terminal run permits a new logical run with the same key', async () => {
     const key = `terminal:${randomUUID()}`;
     const first = await store.enqueue(command(key));

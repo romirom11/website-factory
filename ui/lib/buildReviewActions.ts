@@ -13,16 +13,41 @@
  * or DROP IT. Each one is a state change with an audit trail naming him.
  */
 
-import { and, eq } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 import { revalidatePath } from 'next/cache';
 import { db, schema } from './db';
-import { enqueueJob } from './jobs';
 import { factoryFetch } from './factoryApi';
-import { transitionBusiness } from './actions';
 import type { ActionResult } from './types';
-import { closeVisualQaVerdict } from './visualQaDecision';
 
 type SiteProject = typeof schema.siteProjects.$inferSelect;
+type BuildReviewDecision = 'deploy_as_is' | 'another_iteration' | 'reject';
+
+async function claimDecision(
+  projectId: number,
+  decision: BuildReviewDecision,
+  reason: string,
+  instruction?: string,
+): Promise<ActionResult & { businessId?: string; campaignId?: string }> {
+  const response = await factoryFetch(`/internal/build-reviews/${projectId}/decisions`, {
+    method: 'POST',
+    body: { decision, reason, instruction },
+  });
+  const result = response.body?.result as Record<string, unknown> | undefined;
+  if (!response.ok) return { ok: false, message: response.message };
+  if (
+    result?.kind !== 'claimed'
+    || typeof result.businessId !== 'string'
+    || typeof result.campaignId !== 'string'
+  ) {
+    return { ok: false, message: 'Фабрика повернула некоректне підтвердження рішення.' };
+  }
+  return {
+    ok: true,
+    message: response.message,
+    businessId: result.businessId,
+    campaignId: result.campaignId,
+  };
+}
 
 /**
  * Load the project, or explain why it cannot be acted on.
@@ -78,53 +103,16 @@ export async function openBuildPreview(projectId: number): Promise<ActionResult 
 export async function deployBuildAsIs(projectId: number): Promise<ActionResult> {
   const found = await loadReviewable(projectId);
   if ('error' in found) return { ok: false, message: found.error };
-  const { project } = found;
-
-  const [biz] = await db.select().from(schema.businesses)
-    .where(eq(schema.businesses.id, project.businessId));
-  if (!biz) return { ok: false, message: 'Бізнес не знайдено' };
-
-  // `deploy-demo` refuses any state other than ready/deployed, so this update is
-  // the gate, not a formality. Conditional on the state we read, so two clicks
-  // cannot both pass.
-  const updated = await db.update(schema.siteProjects)
-    .set({ state: 'ready' })
-    .where(and(
-      eq(schema.siteProjects.id, projectId),
-      eq(schema.siteProjects.state, 'needs_human_review'),
-    ))
-    .returning();
-  if (!updated.length) {
-    return { ok: false, message: 'Цю збірку щойно вже відправили — другий деплой не створено.' };
-  }
-  await closeVisualQaVerdict(projectId, 'задеплоїти як є');
-
-  // The business is in `needs_review`; the deploy worker will move it to
-  // site_ready itself. Recording the human decision here keeps the audit trail
-  // honest about WHO overruled the critic.
-  await db.insert(schema.statusHistory).values({
-    businessId: project.businessId,
-    fromStatus: biz.status,
-    toStatus: biz.status,
-    reason: `Роман прийняв збірку попри вердикт критика (${project.qaIterations} QA-ітерацій)`,
-    actor: 'roman',
-  });
-
-  const result = await enqueueJob({
-    name: 'deploy-demo',
-    businessId: project.businessId,
-    campaignId: biz.campaignId,
-    idempotencyKey: `deploy-demo:${project.businessId}:${projectId}`,
-    data: { projectId },
-  });
+  const decision = await claimDecision(
+    projectId,
+    'deploy_as_is',
+    'Роман прийняв збірку попри вердикт критика',
+  );
+  if (!decision.ok || !decision.businessId || !decision.campaignId) return decision;
 
   revalidatePath('/inbox');
-  revalidatePath(`/businesses/${project.businessId}`);
-
-  if (result.kind === 'duplicate') {
-    return { ok: false, message: 'Деплой уже стоїть у черзі для цієї збірки.' };
-  }
-  return { ok: true, message: 'Деплой поставлено в чергу. Коли демо опублікується, воно з’явиться у Вхідних на підтвердження.' };
+  revalidatePath(`/businesses/${decision.businessId}`);
+  return { ok: true, message: decision.message };
 }
 
 /**
@@ -147,11 +135,6 @@ export async function requestAnotherIteration(input: {
 
   const found = await loadReviewable(input.projectId);
   if ('error' in found) return { ok: false, message: found.error };
-  const { project } = found;
-
-  const [biz] = await db.select().from(schema.businesses)
-    .where(eq(schema.businesses.id, project.businessId));
-  if (!biz) return { ok: false, message: 'Бізнес не знайдено' };
 
   // Ask the factory to write the note into the workspace. It owns the files;
   // the UI container does not necessarily see the same paths.
@@ -166,51 +149,17 @@ export async function requestAnotherIteration(input: {
     };
   }
 
-  const updated = await db.update(schema.siteProjects)
-    .set({ state: 'building', qaIterations: 0 })
-    .where(and(
-      eq(schema.siteProjects.id, input.projectId),
-      eq(schema.siteProjects.state, 'needs_human_review'),
-    ))
-    .returning();
-  if (!updated.length) {
-    return { ok: false, message: 'Цю збірку щойно вже відправили в роботу.' };
-  }
-  await closeVisualQaVerdict(input.projectId, 'ще одна ітерація');
-
-  // The business goes BACK to `site_in_progress`, not just into the audit log.
-  // Leaving it in `needs_review` kept the «Потрібна твоя увага» badge and the
-  // stale «критик не прийняв за 3 спроби» header lit for the whole hour-long
-  // rebuild (Roman, 2026-08-23: «Де тут мені шо робить?» — ніде, збірка йшла).
-  // transitionBusiness also rewrites status_reason, so the header now says
-  // what is actually happening. When the new run's QA fails again, visual-qa
-  // moves it back to needs_review with a fresh reason, exactly as before.
-  await transitionBusiness(
-    project.businessId,
-    'site_in_progress',
+  const decision = await claimDecision(
+    input.projectId,
+    'another_iteration',
     `Роман замовив ще одну ітерацію: ${note.slice(0, 200)}`,
+    note,
   );
-
-  // `iteration: 1` marks this as a FIX run, so the builder edits the existing
-  // workspace instead of wiping it and rebuilding from the design contract —
-  // which would throw away everything the previous three iterations got right.
-  const result = await enqueueJob({
-    name: 'build-site',
-    businessId: project.businessId,
-    campaignId: biz.campaignId,
-    idempotencyKey: `build-site:${project.businessId}:${input.projectId}:roman:${Date.now()}`,
-    data: {
-      projectId: input.projectId,
-      iteration: 1,
-      issues: [`[high/roman] ${note}`],
-    },
-  });
+  if (!decision.ok || !decision.businessId || !decision.campaignId) return decision;
 
   revalidatePath('/inbox');
-  revalidatePath(`/businesses/${project.businessId}`);
-
-  if (result.kind === 'duplicate') return { ok: false, message: 'Збірка вже стоїть у черзі.' };
-  return { ok: true, message: 'Ітерацію поставлено в чергу. Коли збірка пройде QA, вона повернеться у Вхідні.' };
+  revalidatePath(`/businesses/${decision.businessId}`);
+  return { ok: true, message: decision.message };
 }
 
 /** Drop this lead: the demo is not worth more work. */
@@ -220,18 +169,11 @@ export async function rejectBuild(input: {
 }): Promise<ActionResult> {
   const found = await loadReviewable(input.projectId);
   if ('error' in found) return { ok: false, message: found.error };
-  const { project } = found;
 
   const reason = input.reason.trim() || 'Роман відхилив демо після рев’ю';
-
-  await db.update(schema.siteProjects)
-    .set({ state: 'failed' })
-    .where(eq(schema.siteProjects.id, input.projectId));
-  await closeVisualQaVerdict(input.projectId, 'відхилити бізнес');
-
-  const moved = await transitionBusiness(project.businessId, 'rejected', reason);
+  const moved = await claimDecision(input.projectId, 'reject', reason);
   revalidatePath('/inbox');
-  revalidatePath(`/businesses/${project.businessId}`);
+  if (moved.businessId) revalidatePath(`/businesses/${moved.businessId}`);
   if (!moved.ok) return moved;
   return { ok: true, message: 'Бізнес відхилено. Evidence лишається в базі.' };
 }

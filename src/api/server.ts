@@ -35,6 +35,11 @@ import { ensureQueues } from '../orchestrator/queue.js';
 import { enqueue } from '../orchestrator/queue.js';
 import { createInternalAuth } from './internalAuth.js';
 import { registerJobCommandRoute } from './jobCommands.js';
+import { registerBusinessTransitionCommandRoute } from './businessTransitionCommands.js';
+import { businessTransitions } from '../orchestrator/statuses.js';
+import { registerBuildFailureCommandRoute } from './buildFailureCommands.js';
+import { stopFailedBuild } from '../orchestrator/buildFailureDecision.js';
+import { registerBuildReviewCommandRoute } from './buildReviewCommands.js';
 
 export async function startApi(): Promise<void> {
   // Queue creation is part of readiness. In API-only mode there may be no
@@ -58,6 +63,13 @@ export async function startApi(): Promise<void> {
   // refuse everything rather than opening up.
   const internalAuth = createInternalAuth();
   registerJobCommandRoute(app, internalAuth, enqueue);
+  registerBusinessTransitionCommandRoute(
+    app,
+    internalAuth,
+    (command) => businessTransitions.override(command),
+  );
+  registerBuildFailureCommandRoute(app, internalAuth, stopFailedBuild);
+  registerBuildReviewCommandRoute(app, internalAuth);
 
   /**
    * Run one connectivity check and report the REAL result (never a throw).

@@ -7,7 +7,8 @@ import { pool } from '../src/db/client.js';
 import { randomUUID } from 'node:crypto';
 import { sql, sqlOne } from './e2e/harness.js';
 import { loadInbox } from '../ui/lib/inbox.js';
-import { retryFailedJob, stopFailedBuild } from '../ui/lib/buildFailureDecision.js';
+import { retryFailedJob } from '../ui/lib/buildFailureDecision.js';
+import { stopFailedBuild } from '../src/orchestrator/buildFailureDecision.js';
 
 let failures = 0;
 function check(label: string, condition: boolean, detail?: unknown): void {

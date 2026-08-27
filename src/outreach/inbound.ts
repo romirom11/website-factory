@@ -15,7 +15,8 @@
  */
 import { and, eq } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
-import { transition } from '../orchestrator/statuses.js';
+import { businessTransitions, requireBusinessStatus } from '../orchestrator/statuses.js';
+import { enforceDoNotContact } from '../orchestrator/safetyTransitions.js';
 import { getBoss } from '../orchestrator/queue.js';
 import { notifyReply } from '../telegram/notify.js';
 import { log } from '../lib/logger.js';
@@ -100,8 +101,11 @@ export async function recordOptOut(input: {
     detail: { channel: input.channel, phrase: input.phrase, from: input.fromAddress },
   });
   await cancelFollowups(input.businessId, 'opt-out');
-  await transition(input.businessId, 'do_not_contact', 'replies-worker',
-    `opt-out via ${input.channel}`, { force: true });
+  await enforceDoNotContact(
+    input.businessId,
+    'replies-worker',
+    `opt-out via ${input.channel}`,
+  );
   log.info('opt-out recorded', { businessId: input.businessId, channel: input.channel, phrase: input.phrase });
 }
 
@@ -139,20 +143,52 @@ export async function recordReply(
   await db.insert(schema.outreachEvents).values({
     businessId, messageId, event: 'replied', detail,
   });
-  // The deal row may not exist for a manual channel confirmed out of band.
-  await db.insert(schema.deals).values({ businessId, state: 'replied' })
-    .onConflictDoUpdate({
-      target: schema.deals.businessId,
-      set: { state: 'replied', updatedAt: new Date() },
-    });
   await cancelFollowups(businessId, 'reply');
-  await transition(businessId, 'replied', 'replies-worker', `reply via ${channel}`, { force: true });
+  const finalStatus = await recordReplyStatus(businessId, channel);
+  if (finalStatus === 'replied') {
+    // The deal row may not exist for a manual channel confirmed out of band.
+    await db.insert(schema.deals).values({ businessId, state: 'replied' })
+      .onConflictDoUpdate({
+        target: schema.deals.businessId,
+        set: { state: 'replied', updatedAt: new Date() },
+      });
+  }
 
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   await notifyReply({
     businessId, name: biz?.name, channel, preview: String(detail.preview ?? ''),
   }).catch((err) => log.warn('reply notification failed', { businessId, err: String(err) }));
   log.info('reply recorded', { businessId, channel });
+}
+
+const REPLY_STATES_TO_PRESERVE = new Set([
+  'meeting', 'proposal', 'won', 'lost', 'closed', 'do_not_contact',
+]);
+
+/** Apply a real inbound reply without regressing a deal that already advanced. */
+async function recordReplyStatus(businessId: string, channel: string) {
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const [business] = await db.select({ status: schema.businesses.status })
+      .from(schema.businesses)
+      .where(eq(schema.businesses.id, businessId));
+    if (!business) throw new Error(`business not found: ${businessId}`);
+    const expectedStatus = requireBusinessStatus(business.status, `business ${businessId}`);
+    if (expectedStatus === 'replied' || REPLY_STATES_TO_PRESERVE.has(expectedStatus)) {
+      return expectedStatus;
+    }
+
+    const reason = `reply via ${channel}`;
+    const result = expectedStatus === 'contacted'
+      ? await businessTransitions.normal({
+          businessId, expectedStatus, to: 'replied', actor: 'replies-worker', reason,
+        })
+      : await businessTransitions.override({
+          businessId, expectedStatus, to: 'replied', actor: 'replies-worker',
+          reason: `${reason}; reply arrived outside the expected contacted state`,
+        });
+    if (result.kind !== 'conflict') return 'replied' as const;
+  }
+  throw new Error(`could not record reply after repeated concurrent transitions: ${businessId}`);
 }
 
 /**

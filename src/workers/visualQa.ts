@@ -28,7 +28,7 @@ import { getObject, putRaw } from '../lib/storage.js';
 import { serveDir } from '../lib/serveDir.js';
 import { config } from '../config.js';
 import { runAgent } from '../agents/agent.js';
-import { transition } from '../orchestrator/statuses.js';
+import { parkBuildForHumanReview } from '../orchestrator/buildReviewDecision.js';
 import { enqueue, NeedsHumanError, type JobPayload } from '../orchestrator/queue.js';
 import { buildSnapshot, type BuildSnapshot } from '../build/snapshot.js';
 import { VisualCritiqueSchema, type QaIssue } from '../build/schemas.js';
@@ -1226,10 +1226,18 @@ export async function visualQaHandler(payload: JobPayload): Promise<void> {
       `Ліміт ${iterationCap} ітерацій вичерпано, ${blocking.length} проблем лишилось — чекає на Романа`,
       'visual-qa',
     );
-    await db.update(schema.siteProjects).set({ state: 'needs_human_review' })
-      .where(eq(schema.siteProjects.id, projectId));
-    await transition(businessId, 'needs_review', 'visual-qa',
-      `QA limit (${iterationCap}) reached with ${blocking.length} open issues`);
+    const parked = await parkBuildForHumanReview({
+      projectId,
+      businessId,
+      reason: `QA limit (${iterationCap}) reached with ${blocking.length} open issues`,
+    });
+    if (!parked) {
+      log.info('stale visual QA verdict ignored: project or business already advanced', {
+        businessId,
+        projectId,
+      });
+      return;
+    }
     // Decision #9: every Telegram push links into the control UI; Telegram has
     // no controls of its own.
     await notifyTelegram(

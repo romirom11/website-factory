@@ -17,7 +17,11 @@ import { customAlphabet } from 'nanoid';
 import { eq } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { config } from '../config.js';
-import { transition } from '../orchestrator/statuses.js';
+import {
+  businessTransitions,
+  canContinueAfterTransition,
+  requireBusinessStatus,
+} from '../orchestrator/statuses.js';
 import { advance } from '../orchestrator/router.js';
 import type { JobPayload } from '../orchestrator/queue.js';
 import { collectWorkspaceGarbage, outputDir } from '../build/workspace.js';
@@ -119,6 +123,14 @@ export async function deployHandler(payload: JobPayload): Promise<void> {
   }
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   if (!biz) throw new Error(`business not found: ${businessId}`);
+  const expectedStatus = requireBusinessStatus(biz.status, `business ${businessId}`);
+  if (!['site_in_progress', 'site_ready'].includes(expectedStatus)) {
+    log.info('deploy skipped: business no longer belongs to the build flow', {
+      businessId,
+      status: expectedStatus,
+    });
+    return;
+  }
 
   const source = outputDir(project.dir);
   if (!existsSync(path.join(source, 'index.html'))) {
@@ -165,6 +177,9 @@ export async function deployHandler(payload: JobPayload): Promise<void> {
   // build artefacts in the workspace are dead weight. Never fails the deploy.
   await collectWorkspaceGarbage(project.dir, 'deployed').catch(() => {});
 
-  await transition(businessId, 'site_ready', 'deploy-worker', deployUrl);
+  const transitioned = await businessTransitions.normal({
+    businessId, expectedStatus, to: 'site_ready', actor: 'deploy-worker', reason: deployUrl,
+  });
+  if (!canContinueAfterTransition(transitioned, { businessId, actor: 'deploy-worker' })) return;
   await advance(businessId); // -> request-approval (phase D)
 }

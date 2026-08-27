@@ -9,6 +9,10 @@
  */
 import { eq, and, inArray, ne, sql } from 'drizzle-orm';
 import { db, schema } from '../src/db/client.js';
+import {
+  businessTransitions,
+  requireBusinessStatus,
+} from '../src/orchestrator/statuses.js';
 import { enqueue } from '../src/orchestrator/queue.js';
 
 const args = process.argv.slice(2);
@@ -58,12 +62,18 @@ for (const id of affected) {
     await db.insert(schema.businessContacts)
       .values({ businessId: id, channel: 'phone', value: biz.phone, sourceId: src?.id ?? null, verified: true });
   }
-  await db.update(schema.businesses)
-    .set({ status: 'prequalified', statusReason: 're-enrich after detector fix', score: null, scoreBreakdown: null, updatedAt: new Date() })
-    .where(eq(schema.businesses.id, id));
-  await db.insert(schema.statusHistory).values({
-    businessId: id, toStatus: 'prequalified', actor: 'phaseB-reenrich', reason: 'detector fix: platform-owned contacts',
+  if (!biz) continue;
+  const result = await businessTransitions.recover({
+    businessId: id,
+    expectedStatus: requireBusinessStatus(biz.status, `business ${id}`),
+    to: 'prequalified',
+    actor: 'phaseB-reenrich',
+    reason: 'detector fix: platform-owned contacts',
   });
+  if (result.kind === 'conflict') continue;
+  await db.update(schema.businesses)
+    .set({ score: null, scoreBreakdown: null, updatedAt: new Date() })
+    .where(and(eq(schema.businesses.id, id), eq(schema.businesses.status, 'prequalified')));
   await enqueue('enrich', { businessId: id, campaignId });
 }
 console.log(`\nre-queued ${affected.length} enrich job(s)`);

@@ -22,6 +22,7 @@
  */
 import 'dotenv/config';
 import { pool } from '../src/db/client.js';
+import { businessTransitions } from '../src/orchestrator/statuses.js';
 
 const APPLY = process.argv.includes('--apply');
 
@@ -43,29 +44,18 @@ if (!rows.length) {
   if (!APPLY) {
     console.log('\ndry run — pass --apply to move them back to production_ready');
   } else {
-    const ids = rows.map((r) => r.id);
-    const client = await pool.connect();
-    try {
-      await client.query('begin');
-      await client.query(
-        `insert into status_history (business_id, from_status, to_status, actor, reason)
-         select id, 'site_in_progress', 'production_ready', 'integration-repair',
-                'content-and-design could not run (container was root; Claude Code refuses --dangerously-skip-permissions). No site_project was created.'
-           from businesses where id = any($1::text[])`,
-        [ids],
-      );
-      const upd = await client.query(
-        `update businesses set status = 'production_ready' where id = any($1::text[])`,
-        [ids],
-      );
-      await client.query('commit');
-      console.log(`\n✅ restored ${upd.rowCount} business(es) to production_ready`);
-    } catch (err) {
-      await client.query('rollback');
-      throw err;
-    } finally {
-      client.release();
+    let restored = 0;
+    for (const row of rows) {
+      const result = await businessTransitions.recover({
+        businessId: row.id,
+        expectedStatus: 'site_in_progress',
+        to: 'production_ready',
+        actor: 'integration-repair',
+        reason: 'content-and-design could not run (container was root; Claude Code refuses --dangerously-skip-permissions). No site_project was created.',
+      });
+      if (result.kind === 'moved') restored++;
     }
+    console.log(`\n✅ restored ${restored} business(es) to production_ready`);
   }
 }
 

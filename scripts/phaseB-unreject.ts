@@ -8,6 +8,7 @@
  */
 import { eq, and, like, sql } from 'drizzle-orm';
 import { db, schema } from '../src/db/client.js';
+import { businessTransitions } from '../src/orchestrator/statuses.js';
 
 const campaignId = process.argv[2] ?? 'gr-patras-beauty';
 
@@ -20,13 +21,14 @@ const rows = await db.select().from(schema.businesses).where(and(
 if (rows.length === 0) { console.log('no stage-7 rejections to reverse'); process.exit(0); }
 
 for (const b of rows) {
-  await db.update(schema.businesses)
-    .set({ status: 'needs_review', statusReason: `not qualified: ${b.statusReason}`, updatedAt: new Date() })
-    .where(eq(schema.businesses.id, b.id));
-  await db.insert(schema.statusHistory).values({
-    businessId: b.id, fromStatus: 'rejected', toStatus: 'needs_review',
-    actor: 'phaseB-unreject', reason: 'stage 7 no longer hard-rejects; decision is reversible',
+  const result = await businessTransitions.recover({
+    businessId: b.id,
+    expectedStatus: 'rejected',
+    to: 'needs_review',
+    actor: 'phaseB-unreject',
+    reason: 'stage 7 no longer hard-rejects; decision is reversible',
   });
+  if (result.kind === 'conflict') continue;
   console.log(`  ${b.id}: rejected -> needs_review (${b.statusReason})`);
 }
 console.log(`\nreversed ${rows.length} stage-7 rejection(s)`);

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import type PgBoss from 'pg-boss';
 import { and, desc, eq, inArray } from 'drizzle-orm';
-import { drizzle } from 'drizzle-orm/node-postgres';
+import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
 import * as schema from '../db/schema.js';
 import {
   getJobDefinition,
@@ -65,6 +65,9 @@ export interface BossSender {
 }
 
 type ConnectionPool = Pick<pg.Pool, 'connect'>;
+type WorkflowDatabase = NodePgDatabase<typeof schema>;
+export type WorkflowRunTransaction = Parameters<Parameters<WorkflowDatabase['transaction']>[0]>[0];
+export type EnqueueMutation = (transaction: WorkflowRunTransaction) => Promise<void>;
 
 function clientDb(client: pg.PoolClient): PgBoss.Db {
   return {
@@ -114,7 +117,10 @@ export class WorkflowRunStore {
     private readonly boss: BossSender,
   ) {}
 
-  async enqueue(command: EnqueueCommand): Promise<EnqueueResult> {
+  async enqueue(
+    command: EnqueueCommand,
+    mutation?: EnqueueMutation,
+  ): Promise<EnqueueResult> {
     const validation = validateJobPayload(command.name, command.payload);
     if (!validation.ok) {
       throw new Error(`invalid ${command.name} payload: ${validation.issues.join('; ')}`);
@@ -128,6 +134,7 @@ export class WorkflowRunStore {
 
     try {
       return await database.transaction(async (tx) => {
+        await mutation?.(tx);
         const insertedRuns = await tx.insert(schema.workflowJobRuns).values({
           id: runId,
           jobType: command.name,

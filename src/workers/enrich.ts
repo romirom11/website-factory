@@ -21,7 +21,11 @@ import { eq, and } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { getObject } from '../lib/storage.js';
 import { runAgent, z } from '../agents/agent.js';
-import { transition } from '../orchestrator/statuses.js';
+import {
+  businessTransitions,
+  canContinueAfterTransition,
+  requireBusinessStatus,
+} from '../orchestrator/statuses.js';
 import { enqueue, type JobPayload } from '../orchestrator/queue.js';
 import { log } from '../lib/logger.js';
 import { config } from '../config.js';
@@ -220,11 +224,18 @@ export async function enrichHandler(payload: JobPayload): Promise<void> {
   const businessId = payload.businessId!;
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   if (!biz) throw new Error(`business not found: ${businessId}`);
-  if (!ENRICHABLE.has(biz.status)) {
+  const expectedStatus = requireBusinessStatus(biz.status, `business ${businessId}`);
+  if (!ENRICHABLE.has(expectedStatus)) {
     log.info('enrichment skipped: business has already moved past this stage', { businessId, status: biz.status });
     return;
   }
-  await transition(businessId, 'enriching', 'enrich-worker');
+  const started = await businessTransitions.normal({
+    businessId,
+    expectedStatus,
+    to: 'enriching',
+    actor: 'enrich-worker',
+  });
+  if (!canContinueAfterTransition(started, { businessId, actor: 'enrich-worker' })) return;
 
   // Re-running enrichment must not duplicate rows (jobs retry, spec §7).
   await db.delete(schema.businessFacts).where(eq(schema.businessFacts.businessId, businessId));
@@ -295,7 +306,14 @@ export async function enrichHandler(payload: JobPayload): Promise<void> {
   }
 
   if (!gosom && captured.length === 0) {
-    await transition(businessId, 'needs_review', 'enrich-worker', 'no evidence available (no gosom record, no page capturable)');
+    const transitioned = await businessTransitions.normal({
+      businessId,
+      expectedStatus: 'enriching',
+      to: 'needs_review',
+      actor: 'enrich-worker',
+      reason: 'no evidence available (no gosom record, no page capturable)',
+    });
+    canContinueAfterTransition(transitioned, { businessId, actor: 'enrich-worker' });
     return;
   }
 
@@ -597,6 +615,13 @@ export async function enrichHandler(payload: JobPayload): Promise<void> {
   });
 
   // Stage 5 + 6 run next; the audit worker chains into scoring.
+  const stillCurrent = await businessTransitions.normal({
+    businessId,
+    expectedStatus: 'enriching',
+    to: 'enriching',
+    actor: 'enrich-worker',
+  });
+  if (!canContinueAfterTransition(stillCurrent, { businessId, actor: 'enrich-worker' })) return;
   await enqueue('collect-assets', {
     businessId,
     campaignId: biz.campaignId,

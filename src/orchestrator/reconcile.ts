@@ -58,6 +58,12 @@ import {
   LegacyJobReconciler,
   type LegacyReconciliationReport,
 } from './legacyJobReconciler.js';
+import {
+  BusinessTransitionService,
+  canContinueAfterTransition,
+  requireBusinessStatus,
+  type BusinessStatus,
+} from './statuses.js';
 
 type ReconciliationDatabase = NodePgDatabase<typeof schema>;
 
@@ -155,7 +161,7 @@ async function markStaleJobs(database: ReconciliationDatabase): Promise<number> 
 async function lastStableStatus(
   database: ReconciliationDatabase,
   businessId: string,
-): Promise<string | null> {
+): Promise<BusinessStatus | null> {
   const [row] = await database.select({ to: schema.statusHistory.toStatus })
     .from(schema.statusHistory)
     .where(and(
@@ -164,7 +170,7 @@ async function lastStableStatus(
     ))
     .orderBy(desc(schema.statusHistory.at))
     .limit(1);
-  return row?.to ?? null;
+  return row ? requireBusinessStatus(row.to, `status history for ${businessId}`) : null;
 }
 
 /**
@@ -181,6 +187,7 @@ async function lastStableStatus(
 async function revertStrandedBusinesses(
   database: ReconciliationDatabase,
 ): Promise<ReconcileReport['revertedBusinesses']> {
+  const transitions = new BusinessTransitionService(database);
   const stranded = await database.execute(sql`
     select b.id, b.status
     from businesses b
@@ -197,34 +204,31 @@ async function revertStrandedBusinesses(
 
   const out: ReconcileReport['revertedBusinesses'] = [];
   for (const r of stranded.rows as Array<{ id: string; status: string }>) {
+    const from = requireBusinessStatus(r.status, `business ${r.id}`);
     // Fall back to `needs_review` rather than guessing: a business with no
     // stable history at all is exactly the case a human should look at, and
     // `needs_review` is the status the inbox already surfaces.
     const to = (await lastStableStatus(database, r.id)) ?? 'needs_review';
-    if (to === r.status) continue;
+    if (to === from) continue;
 
-    const reason = r.status === 'site_in_progress'
+    const reason = from === 'site_in_progress'
       ? 'Збірку демо перервано перезапуском фабрики: живої задачі й site_project немає. '
         + 'Статус повернуто, демо можна зібрати заново.'
       : 'Збір даних перервано перезапуском фабрики: живої задачі немає. '
         + 'Статус повернуто, крок можна перезапустити.';
 
-    // Deliberately NOT via transition(): these are recovery moves that the
-    // forward-only transition table has no edge for (site_in_progress ->
-    // production_ready is a step BACK), and forcing them through with
-    // force:true would log actor 'reconciler' making a legal-looking move.
-    // Writing both rows here keeps businesses.status and status_history in
-    // lockstep — the invariant the audit verified — and names the actor
-    // honestly.
-    await database.transaction(async (tx) => {
-      await tx.update(schema.businesses)
-        .set({ status: to, statusReason: reason, updatedAt: new Date() })
-        .where(eq(schema.businesses.id, r.id));
-      await tx.insert(schema.statusHistory).values({
-        businessId: r.id, fromStatus: r.status, toStatus: to, reason, actor: 'reconciler',
-      });
+    const result = await transitions.recover({
+      businessId: r.id,
+      expectedStatus: from,
+      to,
+      reason,
+      actor: 'reconciler',
     });
-    out.push({ businessId: r.id, from: r.status, to });
+    if (result.kind === 'moved') {
+      out.push({ businessId: r.id, from, to });
+    } else {
+      canContinueAfterTransition(result, { businessId: r.id, actor: 'reconciler' });
+    }
   }
   return out;
 }

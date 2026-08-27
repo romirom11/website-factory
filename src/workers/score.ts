@@ -13,7 +13,11 @@
 import { eq, desc } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { runAgent, z } from '../agents/agent.js';
-import { transition } from '../orchestrator/statuses.js';
+import {
+  businessTransitions,
+  canContinueAfterTransition,
+  requireBusinessStatus,
+} from '../orchestrator/statuses.js';
 import { advance } from '../orchestrator/router.js';
 import type { JobPayload } from '../orchestrator/queue.js';
 import { log } from '../lib/logger.js';
@@ -66,6 +70,7 @@ export async function scoreAndQaHandler(payload: JobPayload): Promise<void> {
   const businessId = payload.businessId!;
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   if (!biz) throw new Error(`business not found: ${businessId}`);
+  const expectedStatus = requireBusinessStatus(biz.status, `business ${businessId}`);
   if (!SCOREABLE.has(biz.status)) {
     log.info('scoring skipped: business is not in a scoreable status', { businessId, status: biz.status });
     return;
@@ -180,17 +185,32 @@ export async function scoreAndQaHandler(payload: JobPayload): Promise<void> {
   // So a stage-7 no goes to `needs_review` with the reason recorded, and the
   // decision stays reversible in the UI.
   if (!qualified) {
-    await transition(businessId, 'needs_review', 'score-worker', `not qualified: ${reasons.join(',')}`);
+    const transitioned = await businessTransitions.normal({
+      businessId, expectedStatus, to: 'needs_review', actor: 'score-worker',
+      reason: `not qualified: ${reasons.join(',')}`,
+    });
+    canContinueAfterTransition(transitioned, { businessId, actor: 'score-worker' });
     return;
   }
   if (qaPassed === false) {
-    await transition(businessId, 'needs_review', 'score-worker', `QA failed: ${qaNotes.slice(0, 250)}`);
+    const transitioned = await businessTransitions.normal({
+      businessId, expectedStatus, to: 'needs_review', actor: 'score-worker',
+      reason: `QA failed: ${qaNotes.slice(0, 250)}`,
+    });
+    canContinueAfterTransition(transitioned, { businessId, actor: 'score-worker' });
     return;
   }
   if (qaPassed === null) {
-    await transition(businessId, 'needs_review', 'score-worker', 'QA agent unavailable — package not independently verified');
+    const transitioned = await businessTransitions.normal({
+      businessId, expectedStatus, to: 'needs_review', actor: 'score-worker',
+      reason: 'QA agent unavailable — package not independently verified',
+    });
+    canContinueAfterTransition(transitioned, { businessId, actor: 'score-worker' });
     return;
   }
-  await transition(businessId, 'qualified', 'score-worker', `score=${score}`);
+  const transitioned = await businessTransitions.normal({
+    businessId, expectedStatus, to: 'qualified', actor: 'score-worker', reason: `score=${score}`,
+  });
+  if (!canContinueAfterTransition(transitioned, { businessId, actor: 'score-worker' })) return;
   await advance(businessId); // -> readiness-gate
 }

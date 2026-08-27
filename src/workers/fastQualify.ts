@@ -11,7 +11,11 @@
  */
 import { eq } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
-import { transition } from '../orchestrator/statuses.js';
+import {
+  businessTransitions,
+  canContinueAfterTransition,
+  requireBusinessStatus,
+} from '../orchestrator/statuses.js';
 import { advance } from '../orchestrator/router.js';
 import type { JobPayload } from '../orchestrator/queue.js';
 import { log } from '../lib/logger.js';
@@ -97,6 +101,14 @@ export async function fastQualifyHandler(payload: JobPayload): Promise<void> {
   const businessId = payload.businessId!;
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   if (!biz) throw new Error(`business not found: ${businessId}`);
+  const expectedStatus = requireBusinessStatus(biz.status, `business ${businessId}`);
+  if (expectedStatus !== 'discovered') {
+    log.info('fast qualification skipped: business already left discovery', {
+      businessId,
+      status: expectedStatus,
+    });
+    return;
+  }
 
   const contacts = await db.select().from(schema.businessContacts)
     .where(eq(schema.businessContacts.businessId, businessId));
@@ -121,7 +133,14 @@ export async function fastQualifyHandler(payload: JobPayload): Promise<void> {
   await db.insert(schema.qualifications).values({
     businessId, stage: 'fast', qualified: verdict === 'prequalified', reasons,
   });
-  await transition(businessId, verdict, 'fast-qualify-worker', reasons.join(',') || 'passed all fast checks');
+  const transitioned = await businessTransitions.normal({
+    businessId,
+    expectedStatus,
+    to: verdict,
+    actor: 'fast-qualify-worker',
+    reason: reasons.join(',') || 'passed all fast checks',
+  });
+  if (!canContinueAfterTransition(transitioned, { businessId, actor: 'fast-qualify-worker' })) return;
   log.info('fast qualification', { businessId, verdict, reasons });
 
   if (verdict === 'prequalified') await advance(businessId); // -> enrich

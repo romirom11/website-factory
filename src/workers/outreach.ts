@@ -20,7 +20,12 @@
 import { and, eq, desc, gte, inArray, sql } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { config } from '../config.js';
-import { transition } from '../orchestrator/statuses.js';
+import {
+  businessTransitions,
+  canContinueAfterTransition,
+  requireBusinessStatus,
+} from '../orchestrator/statuses.js';
+import { enforceDoNotContact } from '../orchestrator/safetyTransitions.js';
 import { enqueue, type JobPayload } from '../orchestrator/queue.js';
 import { adapterFor, deepLinkFor, isManualChannel, type OutreachChannel, type OutreachDraft } from '../channels/index.js';
 import { notifyManualFollowup } from '../telegram/notify.js';
@@ -85,6 +90,20 @@ export async function sendOutreachHandler(job: JobPayload): Promise<void> {
     .orderBy(desc(schema.approvals.decidedAt)).limit(1);
   if (!approval) throw new Error(`no recorded approval for ${businessId}; refusing to send`);
 
+  const [business] = await db.select({ status: schema.businesses.status })
+    .from(schema.businesses)
+    .where(eq(schema.businesses.id, businessId));
+  if (!business) throw new Error(`business not found: ${businessId}`);
+  const expectedStatus = requireBusinessStatus(business.status, `business ${businessId}`);
+  if (expectedStatus !== 'outreach_approved') {
+    log.info('outreach skipped: approval is stale for current business status', {
+      businessId,
+      status: expectedStatus,
+      approvalId: approval.id,
+    });
+    return;
+  }
+
   const expectedKey = sendIdempotencyKey(approval.id);
   if (job.idempotencyKey && job.idempotencyKey !== expectedKey) {
     throw new Error(
@@ -108,7 +127,11 @@ export async function sendOutreachHandler(job: JobPayload): Promise<void> {
   const dnc = await isDoNotContact(businessId, draft.toAddress);
   if (dnc) {
     log.warn('send blocked by do_not_contact', { businessId, dnc });
-    await transition(businessId, 'do_not_contact', 'outreach-worker', `dnc match at send time (${dnc})`, { force: true });
+    await enforceDoNotContact(
+      businessId,
+      'outreach-worker',
+      `dnc match at send time (${dnc})`,
+    );
     return;
   }
 
@@ -180,7 +203,14 @@ export async function sendOutreachHandler(job: JobPayload): Promise<void> {
 
   // Manual channels only become `contacted` once Roman confirms he sent it.
   if (state !== 'manual_pending') {
-    await transition(businessId, 'contacted', 'outreach-worker', `${draft.channel} ${state}`);
+    const transitioned = await businessTransitions.normal({
+      businessId,
+      expectedStatus: 'outreach_approved',
+      to: 'contacted',
+      actor: 'outreach-worker',
+      reason: `${draft.channel} ${state}`,
+    });
+    if (!canContinueAfterTransition(transitioned, { businessId, actor: 'outreach-worker' })) return;
     await db.insert(schema.deals).values({ businessId, state: 'contacted' }).onConflictDoNothing();
     await scheduleFollowups(approval.id, businessId, draft.channel);
   }
@@ -200,6 +230,20 @@ export async function confirmManualSend(businessId: string, approvalId: number):
   if (!msg) throw new Error(`no outreach message for approval #${approvalId}`);
   if (msg.state !== 'manual_pending') return 'already';
 
+  const [business] = await db.select({ status: schema.businesses.status })
+    .from(schema.businesses)
+    .where(eq(schema.businesses.id, businessId));
+  if (!business) throw new Error(`business not found: ${businessId}`);
+  const expectedStatus = requireBusinessStatus(business.status, `business ${businessId}`);
+  if (expectedStatus !== 'outreach_approved' && expectedStatus !== 'contacted') {
+    log.info('manual send confirmation skipped: business already changed state', {
+      businessId,
+      approvalId,
+      status: expectedStatus,
+    });
+    return 'already';
+  }
+
   await db.update(schema.outreachMessages)
     .set({ state: 'sent', sentAt: new Date() })
     .where(eq(schema.outreachMessages.id, msg.id));
@@ -207,7 +251,14 @@ export async function confirmManualSend(businessId: string, approvalId: number):
     businessId, messageId: msg.id, event: 'sent',
     detail: { channel: msg.channel, manualConfirmation: true, actor: 'roman' },
   });
-  await transition(businessId, 'contacted', 'roman', `${msg.channel} sent manually`, { force: true });
+  const transitioned = await businessTransitions.normal({
+    businessId,
+    expectedStatus,
+    to: 'contacted',
+    actor: 'roman',
+    reason: `${msg.channel} sent manually`,
+  });
+  if (!canContinueAfterTransition(transitioned, { businessId, actor: 'roman' })) return 'already';
   await db.insert(schema.deals).values({ businessId, state: 'contacted' }).onConflictDoNothing();
   await scheduleFollowups(approvalId, businessId, msg.channel);
   log.info('manual send confirmed', { businessId, approvalId, channel: msg.channel });

@@ -20,6 +20,7 @@ import {
 import {
   WorkflowRunStore,
   type EnqueueResult,
+  type EnqueueMutation,
 } from './workflowRunStore.js';
 
 export type { JobName } from './jobDefinitions.js';
@@ -61,6 +62,27 @@ export async function enqueue(
   const b = await getBoss();
   const result = await new WorkflowRunStore(pool, b).enqueue({ name, payload, options: opts });
   log.info(result.kind === 'accepted' ? 'job enqueued' : 'duplicate job suppressed', {
+    name,
+    runId: result.runId,
+    bossJobId: result.bossJobId,
+    ...payload,
+  });
+  return result;
+}
+
+/** Enqueue a job and a related domain mutation on the same Postgres client. */
+export async function enqueueWithMutation(
+  name: JobName,
+  payload: JobPayload,
+  opts: { startAfterSeconds?: number; priority?: number },
+  mutation: EnqueueMutation,
+): Promise<EnqueueResult> {
+  const b = await getBoss();
+  const result = await new WorkflowRunStore(pool, b).enqueue(
+    { name, payload, options: opts },
+    mutation,
+  );
+  log.info(result.kind === 'accepted' ? 'job and domain mutation committed' : 'domain mutation committed with existing job', {
     name,
     runId: result.runId,
     bossJobId: result.bossJobId,

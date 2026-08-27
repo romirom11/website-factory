@@ -5,7 +5,6 @@
  */
 import { and, eq, or, isNotNull } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
-import { transition } from '../orchestrator/statuses.js';
 import { advance } from '../orchestrator/router.js';
 import type { JobPayload } from '../orchestrator/queue.js';
 import type { RawCandidate } from './discovery.js';

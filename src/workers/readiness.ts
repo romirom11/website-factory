@@ -11,7 +11,11 @@
  */
 import { eq, and } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
-import { transition } from '../orchestrator/statuses.js';
+import {
+  businessTransitions,
+  canContinueAfterTransition,
+  requireBusinessStatus,
+} from '../orchestrator/statuses.js';
 import { advance } from '../orchestrator/router.js';
 import type { JobPayload } from '../orchestrator/queue.js';
 import { log } from '../lib/logger.js';
@@ -72,16 +76,17 @@ export function evaluateReadiness(input: {
 }
 
 /** Statuses from which the gate can still move a business forward. */
-const GATEABLE = new Set(['qualified', 'needs_review', 'enriching']);
+const GATEABLE = new Set(['qualified', 'needs_review']);
 
 export async function readinessHandler(payload: JobPayload): Promise<void> {
   const businessId = payload.businessId!;
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   if (!biz) throw new Error(`business not found: ${businessId}`);
+  const expectedStatus = requireBusinessStatus(biz.status, `business ${businessId}`);
   // A terminal business (rejected/duplicate/...) can still have a stale gate job
   // queued from an earlier run. Re-gating it would attempt an illegal transition,
   // so the job succeeds as a no-op instead of failing the queue.
-  if (!GATEABLE.has(biz.status)) {
+  if (!GATEABLE.has(expectedStatus)) {
     log.info('readiness gate skipped: business is not in a gateable status', { businessId, status: biz.status });
     return;
   }
@@ -106,11 +111,19 @@ export async function readinessHandler(payload: JobPayload): Promise<void> {
       await db.insert(schema.productionGaps).values({ businessId, gap, blockerLevel: 'hard' });
     }
     log.info('not production ready', { businessId, ...report });
-    await transition(businessId, 'needs_review', 'readiness-gate', `gaps: ${report.gaps.join(',')}`);
+    const transitioned = await businessTransitions.normal({
+      businessId, expectedStatus, to: 'needs_review', actor: 'readiness-gate',
+      reason: `gaps: ${report.gaps.join(',')}`,
+    });
+    canContinueAfterTransition(transitioned, { businessId, actor: 'readiness-gate' });
     return;
   }
 
   log.info('production ready', { businessId, ...report.counts });
-  await transition(businessId, 'production_ready', 'readiness-gate', `all gates passed (${report.counts.services} services, ${report.counts.assets} assets)`);
+  const transitioned = await businessTransitions.normal({
+    businessId, expectedStatus, to: 'production_ready', actor: 'readiness-gate',
+    reason: `all gates passed (${report.counts.services} services, ${report.counts.assets} assets)`,
+  });
+  if (!canContinueAfterTransition(transitioned, { businessId, actor: 'readiness-gate' })) return;
   await advance(businessId); // -> content-and-design (phase C)
 }

@@ -8,7 +8,7 @@
  */
 import { pool } from '../src/db/client.js';
 import { loadInbox } from '../ui/lib/inbox.js';
-import { closeVisualQaVerdict } from '../ui/lib/visualQaDecision.js';
+import { claimBuildReviewDecision } from '../src/orchestrator/buildReviewDecision.js';
 
 const suffix = `${Date.now()}-${process.pid}`;
 const campaignId = `e2e-vqa-decision-${suffix}`;
@@ -63,8 +63,12 @@ try {
   // This is the state after «Ще ітерація»: the decision was already given and
   // a new build owns the business, but the old QA journal row used to remain
   // `needs_human` and reappear as the screenshot's fake decision card.
-  await closeVisualQaVerdict(projectId, 'ще одна ітерація');
-  await pool.query(`update site_projects set state = 'building' where id = $1`, [projectId]);
+  const claimed = await claimBuildReviewDecision({
+    projectId,
+    decision: 'another_iteration',
+    reason: 'Роман замовив ще одну ітерацію',
+  });
+  check('operator decision atomically claims the parked build', claimed.kind === 'claimed', claimed);
   const afterDecision = await loadInbox();
   const staleReview = afterDecision.buildReviews.find((item) => item.businessId === businessId);
   const staleJob = afterDecision.jobs.find((item) => item.businessId === businessId);

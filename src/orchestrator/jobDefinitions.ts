@@ -199,6 +199,33 @@ export function jobDisplayTitle(name: unknown): string {
   return label ? `${label[0]!.toLocaleUpperCase('uk-UA')}${label.slice(1)}` : label;
 }
 
+const SCHEDULING_CLASS_BASE: Readonly<Record<SchedulingClass, number>> = {
+  upstream: 0,
+  continuation: 10_000,
+  delivery: 20_000,
+  scheduled: 30_000,
+};
+
+/** Keep caller priority inside its class so it can never outrank a continuation. */
+export function jobQueuePriority(name: JobName, withinClass = 0): number {
+  const bounded = Number.isFinite(withinClass)
+    ? Math.max(0, Math.min(9_999, Math.floor(withinClass)))
+    : 0;
+  return SCHEDULING_CLASS_BASE[getJobDefinition(name).schedulingClass] + bounded;
+}
+
+export const LOGICAL_JOB_FIELD = '__factoryJobName' as const;
+
+export function physicalJobData(
+  name: JobName,
+  payload: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  const definition = getJobDefinition(name);
+  return definition.physicalQueue === name
+    ? { ...payload }
+    : { ...payload, [LOGICAL_JOB_FIELD]: name };
+}
+
 function validValue(value: unknown, type: PayloadValueType): boolean {
   switch (type) {
     case 'nonEmptyString': return typeof value === 'string' && value.trim().length > 0;

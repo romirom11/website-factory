@@ -231,6 +231,47 @@ export interface HeartbeatView {
    */
   ageLabel: string | null;
   pid: number | null;
+  capacity: Array<{
+    group: string;
+    active: number;
+    waiting: number;
+    limit: number;
+    consumerHandles: number | null;
+    consumerTarget: number | null;
+  }>;
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function heartbeatCapacity(value: unknown): HeartbeatView['capacity'] {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return [];
+  const out: HeartbeatView['capacity'] = [];
+  for (const [group, raw] of Object.entries(value)) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) continue;
+    const item = raw as Record<string, unknown>;
+    const slots = item.slots;
+    const consumers = item.consumers;
+    if (typeof slots !== 'object' || slots === null || Array.isArray(slots)) continue;
+    const slot = slots as Record<string, unknown>;
+    const active = finiteNumber(slot.active);
+    const waiting = finiteNumber(slot.waiting);
+    const limit = finiteNumber(slot.limit);
+    if (active === null || waiting === null || limit === null) continue;
+    const consumer = typeof consumers === 'object' && consumers !== null && !Array.isArray(consumers)
+      ? consumers as Record<string, unknown>
+      : null;
+    out.push({
+      group,
+      active,
+      waiting,
+      limit,
+      consumerHandles: finiteNumber(consumer?.handles),
+      consumerTarget: finiteNumber(consumer?.target),
+    });
+  }
+  return out.sort((a, b) => a.group.localeCompare(b.group));
 }
 
 /** Clock time of the beat. Depends only on the stored value, never on `now`. */
@@ -244,7 +285,7 @@ export async function loadHeartbeats(): Promise<HeartbeatView[]> {
     .from(schema.settings).where(sql`${schema.settings.key} like ${`${HEARTBEAT_PREFIX}%`}`);
   const now = Date.now();
   return rows.map((r) => {
-    let parsed: { at?: string; pid?: number } | null = null;
+    let parsed: { at?: string; pid?: number; capacity?: unknown } | null = null;
     try { parsed = JSON.parse(r.value); } catch { parsed = null; }
     const at = parsed?.at ? new Date(parsed.at) : null;
     return {
@@ -253,6 +294,7 @@ export async function loadHeartbeats(): Promise<HeartbeatView[]> {
       ageLabel: at ? beatLabel(at) : null,
       stale: at === null || now - at.getTime() > 120_000,
       pid: typeof parsed?.pid === 'number' ? parsed.pid : null,
+      capacity: heartbeatCapacity(parsed?.capacity),
     };
   }).sort((a, b) => a.group.localeCompare(b.group));
 }
@@ -288,10 +330,12 @@ export async function loadPendingJobs(): Promise<PendingJobs | null> {
   try {
     const res = await db.execute(sql`
       select
-        count(*) filter (where status = 'queued')::int as queued,
-        count(*) filter (where status = 'running')::int as active,
-        count(*) filter (where status in ('failed', 'needs_human'))::int as failed
-      from workflow_jobs
+        count(*) filter (where coalesce(r.status, w.status) = 'queued')::int as queued,
+        count(*) filter (where coalesce(r.status, w.status) = 'running')::int as active,
+        count(*) filter (where coalesce(r.status, w.status) in ('failed', 'needs_human'))::int as failed
+      from workflow_jobs w
+      left join workflow_job_runs r on r.id = w.run_id
+      where w.run_id is null or w.attempt_sequence = r.current_attempt_sequence
     `);
     const r = (res.rows as Array<{ queued: number; active: number; failed: number }>)[0];
     return r ? { queued: Number(r.queued), active: Number(r.active), failed: Number(r.failed) } : null;

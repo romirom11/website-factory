@@ -10,6 +10,7 @@ import { ensureRequiredQueues } from '../../src/orchestrator/queueReadiness.js';
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 
 export interface DisposableFactoryDatabase {
+  connectionString: string;
   pool: pg.Pool;
   db: NodePgDatabase<typeof schema>;
   boss: PgBoss;
@@ -40,10 +41,19 @@ export async function withDisposableFactoryDatabase<T>(
   const admin = new pg.Pool({ connectionString: adminUrl.toString() });
   let pool: pg.Pool | null = null;
   let boss: PgBoss | null = null;
+  let tearingDown = false;
 
   try {
     await admin.query(`create database "${databaseName}"`);
     pool = new pg.Pool({ connectionString: testUrl.toString(), max: 30 });
+    pool.on('error', (error: Error & { code?: string }) => {
+      // pg_terminate_backend is the final safety net for a disposable database.
+      // Its expected shutdown signal must not turn a successful test red.
+      if (!(tearingDown && error.code === '57P01')) {
+        console.error('disposable database pool error', error);
+        process.exitCode = 1;
+      }
+    });
     const db = drizzle(pool, { schema });
     await migrate(db, { migrationsFolder: './drizzle' });
 
@@ -52,10 +62,14 @@ export async function withDisposableFactoryDatabase<T>(
     await boss.start();
     await ensureRequiredQueues(boss);
 
-    return await run({ pool, db, boss });
+    return await run({ connectionString: testUrl.toString(), pool, db, boss });
   } finally {
-    if (boss) await boss.stop({ graceful: false }).catch(() => {});
-    if (pool) await pool.end().catch(() => {});
+    tearingDown = true;
+    // Let pg-boss drain and close its owned pool before the database is dropped.
+    // A forced stop can resolve while its manager still has a finishing worker,
+    // leaving Postgres to terminate that connection during DROP DATABASE.
+    if (boss) await boss.stop({ close: true, graceful: true, wait: true, timeout: 5_000 });
+    if (pool) await pool.end();
     await admin.query(
       `select pg_terminate_backend(pid) from pg_stat_activity where datname = $1 and pid <> pg_backend_pid()`,
       [databaseName],

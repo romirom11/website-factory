@@ -1,62 +1,121 @@
-/**
- * In-process semaphore around agent calls.
- *
- * SPEC §2.3(а): subscription windows are a shared, finite resource, so the
- * number of concurrent agentic calls is capped (default 1). pg-boss is also
- * configured with teamSize/batchSize 1 for agent job types; this semaphore is
- * the second belt — it holds even if several agent calls happen inside one job.
- */
-import { config } from '../config.js';
+/** Live, per-worker-group capacity for subscription-backed agent calls. */
+import { AsyncLocalStorage } from 'node:async_hooks';
+import type { WorkerGroup } from '../orchestrator/jobDefinitions.js';
 import { log } from '../lib/logger.js';
 
-let active = 0;
-const waiting: Array<() => void> = [];
-
-/**
- * Set by the worker process at startup (`src/workers/main.ts`). A process hosting
- * only the `build` or `enrich` group uses that group's own cap; null = the global
- * `AGENT_CONCURRENCY`. The split exists because this semaphore is per-process:
- * once groups run in separate processes they no longer share a slot.
- */
-let override: number | null = null;
-
-/** Called once at worker startup; safe to call again (last value wins). */
-export function setAgentConcurrency(value: number): void {
-  override = Number.isFinite(value) && value > 0 ? Math.floor(value) : null;
-  log.info('agent concurrency set', { limit: limit(), override });
+export interface SemaphoreStats {
+  active: number;
+  waiting: number;
+  limit: number;
 }
 
-function limit(): number {
-  return Math.max(1, override ?? config.agents.concurrency);
+interface Waiter {
+  label: string;
+  resolve: () => void;
 }
 
-async function acquire(label: string): Promise<void> {
-  if (active < limit()) {
-    active++;
-    return;
+/** A semaphore whose cap may change without cancelling work already in flight. */
+export class ResizableSemaphore {
+  private active = 0;
+  private limit: number;
+  private readonly waiting: Waiter[] = [];
+
+  constructor(initialLimit: number) {
+    this.limit = ResizableSemaphore.normalize(initialLimit);
   }
-  log.info('agent call queued (concurrency limit)', { label, active, limit: limit(), waiting: waiting.length });
-  await new Promise<void>((resolve) => waiting.push(resolve));
-  active++;
-}
 
-function release(): void {
-  active--;
-  const next = waiting.shift();
-  if (next) next();
-}
+  resize(nextLimit: number): void {
+    this.limit = ResizableSemaphore.normalize(nextLimit);
+    this.drain();
+  }
 
-/** Run `fn` holding one agent-concurrency slot. */
-export async function withAgentSlot<T>(label: string, fn: () => Promise<T>): Promise<T> {
-  await acquire(label);
-  try {
-    return await fn();
-  } finally {
-    release();
+  stats(): SemaphoreStats {
+    return { active: this.active, waiting: this.waiting.length, limit: this.limit };
+  }
+
+  async run<T>(label: string, operation: () => Promise<T>): Promise<T> {
+    await this.acquire(label);
+    try {
+      return await operation();
+    } finally {
+      this.release();
+    }
+  }
+
+  private static normalize(value: number): number {
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 1;
+  }
+
+  private async acquire(label: string): Promise<void> {
+    if (this.active < this.limit) {
+      this.active++;
+      return;
+    }
+    log.info('agent call queued (concurrency limit)', {
+      label, active: this.active, limit: this.limit, waiting: this.waiting.length,
+    });
+    await new Promise<void>((resolve) => this.waiting.push({ label, resolve }));
+  }
+
+  private release(): void {
+    this.active = Math.max(0, this.active - 1);
+    this.drain();
+  }
+
+  private drain(): void {
+    while (this.active < this.limit && this.waiting.length) {
+      const waiter = this.waiting.shift()!;
+      this.active++;
+      waiter.resolve();
+    }
   }
 }
 
-/** Introspection for the dashboard / tests. */
-export function agentSlotStats(): { active: number; waiting: number; limit: number } {
-  return { active, waiting: waiting.length, limit: limit() };
+export class AgentCapacityManager {
+  private readonly groups = new Map<WorkerGroup, ResizableSemaphore>();
+
+  resize(group: WorkerGroup, limit: number): void {
+    const semaphore = this.forGroup(group);
+    semaphore.resize(limit);
+    log.info('agent concurrency set', { group, ...semaphore.stats() });
+  }
+
+  stats(group: WorkerGroup): SemaphoreStats {
+    return this.forGroup(group).stats();
+  }
+
+  run<T>(group: WorkerGroup, label: string, operation: () => Promise<T>): Promise<T> {
+    return this.forGroup(group).run(label, operation);
+  }
+
+  private forGroup(group: WorkerGroup): ResizableSemaphore {
+    let semaphore = this.groups.get(group);
+    if (!semaphore) {
+      semaphore = new ResizableSemaphore(1);
+      this.groups.set(group, semaphore);
+    }
+    return semaphore;
+  }
+}
+
+const workerGroupContext = new AsyncLocalStorage<WorkerGroup>();
+export const agentCapacityManager = new AgentCapacityManager();
+
+/** Bind all nested runtime calls to the capacity of the worker's own group. */
+export function withAgentWorkerGroup<T>(
+  group: WorkerGroup,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return workerGroupContext.run(group, operation);
+}
+
+/** Run one agent call under the current worker-group slot. */
+export function withAgentSlot<T>(label: string, operation: () => Promise<T>): Promise<T> {
+  const group = workerGroupContext.getStore() ?? 'core';
+  return agentCapacityManager.run(group, label, operation);
+}
+
+/** Introspection for heartbeats, the dashboard and tests. */
+export function agentSlotStats(group?: WorkerGroup): SemaphoreStats {
+  return agentCapacityManager.stats(group ?? workerGroupContext.getStore() ?? 'core');
 }

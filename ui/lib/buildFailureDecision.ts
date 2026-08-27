@@ -1,18 +1,19 @@
 import { and, desc, eq, inArray } from 'drizzle-orm';
 import { db, schema } from './db';
-import { enqueueJob, type EnqueueInput, type JobName } from './queue';
+import { enqueueJob, type EnqueueInput, type EnqueueResult, type JobName } from './jobs';
 import type { ActionResult } from './types';
+import { transitionCurrentRun } from './workflowLedger';
 
 type StopFailedBuildResult = ActionResult & { businessId?: string };
 export type RetryFailedJobOutcome = 'queued' | 'already_queued' | 'missing' | 'resolved';
-type JobEnqueuer = (input: EnqueueInput) => Promise<string | null>;
+type JobEnqueuer = (input: EnqueueInput) => Promise<EnqueueResult>;
 
 /**
  * Re-run a failed attempt verbatim while competing safely with Stop.
  *
  * The conditional UPDATE is the decision lock: exactly one action can move the
  * row out of failed/needs_human. The injected enqueuer keeps this domain
- * decision independently testable without starting pg-boss or an agent.
+ * decision independently testable without starting the factory or an agent.
  */
 export async function retryFailedJob(
   jobId: number,
@@ -22,19 +23,31 @@ export async function retryFailedJob(
   if (!row) return 'missing';
 
   const claimDetail = `Роман перезапускає цей крок (claim:${jobId})`;
-  const claimed = await db.update(schema.workflowJobs)
-    .set({ status: 'cancelled', finishedAt: new Date(), errorDetail: claimDetail })
-    .where(and(
-      eq(schema.workflowJobs.id, jobId),
-      inArray(schema.workflowJobs.status, ['failed', 'needs_human']),
-    ))
-    .returning({ id: schema.workflowJobs.id });
-  if (!claimed.length) return 'resolved';
+  const claimedAt = new Date();
+  const claimed = await db.transaction(async (tx) => {
+    const [attempt] = await tx.update(schema.workflowJobs)
+      .set({ status: 'cancelled', finishedAt: claimedAt, errorDetail: claimDetail })
+      .where(and(
+        eq(schema.workflowJobs.id, jobId),
+        inArray(schema.workflowJobs.status, ['failed', 'needs_human']),
+      ))
+      .returning({
+        id: schema.workflowJobs.id,
+        runId: schema.workflowJobs.runId,
+        attemptSequence: schema.workflowJobs.attemptSequence,
+      });
+    if (!attempt) return false;
+    await transitionCurrentRun(
+      tx, attempt, ['failed', 'needs_human'], 'cancelled', claimedAt,
+    );
+    return true;
+  });
+  if (!claimed) return 'resolved';
 
   const stored = (row.payload ?? {}) as Record<string, unknown>;
   const { businessId: _b, campaignId: _c, idempotencyKey: _k, ...rest } = stored;
 
-  let enqueued: string | null;
+  let enqueued: EnqueueResult;
   try {
     enqueued = await enqueue({
       name: row.jobType as JobName,
@@ -47,19 +60,28 @@ export async function retryFailedJob(
   } catch (error) {
     // The decision did not complete. Put the original attempt back exactly as
     // it was so it remains visible and retryable instead of disappearing.
-    await db.update(schema.workflowJobs)
-      .set({ status: row.status, finishedAt: row.finishedAt, errorDetail: row.errorDetail })
-      .where(and(
-        eq(schema.workflowJobs.id, jobId),
-        eq(schema.workflowJobs.status, 'cancelled'),
-        eq(schema.workflowJobs.errorDetail, claimDetail),
-      ));
+    await db.transaction(async (tx) => {
+      const [restored] = await tx.update(schema.workflowJobs)
+        .set({ status: row.status, finishedAt: row.finishedAt, errorDetail: row.errorDetail })
+        .where(and(
+          eq(schema.workflowJobs.id, jobId),
+          eq(schema.workflowJobs.status, 'cancelled'),
+          eq(schema.workflowJobs.errorDetail, claimDetail),
+        ))
+        .returning({
+          runId: schema.workflowJobs.runId,
+          attemptSequence: schema.workflowJobs.attemptSequence,
+        });
+      if (restored) {
+        await transitionCurrentRun(tx, restored, ['cancelled'], row.status, row.finishedAt);
+      }
+    });
     throw error;
   }
 
   await db.update(schema.workflowJobs)
     .set({
-      errorDetail: enqueued
+      errorDetail: enqueued.kind === 'accepted'
         ? 'Роман перезапустив цей крок — далі працює нова спроба'
         : 'Роман перезапустив цей крок; він уже стояв у черзі',
     })
@@ -69,7 +91,7 @@ export async function retryFailedJob(
       eq(schema.workflowJobs.errorDetail, claimDetail),
     ));
 
-  return enqueued ? 'queued' : 'already_queued';
+  return enqueued.kind === 'accepted' ? 'queued' : 'already_queued';
 }
 
 /**
@@ -87,6 +109,8 @@ export async function stopFailedBuild(jobId: number): Promise<StopFailedBuildRes
     businessId: schema.workflowJobs.businessId,
     payload: schema.workflowJobs.payload,
     status: schema.workflowJobs.status,
+    runId: schema.workflowJobs.runId,
+    attemptSequence: schema.workflowJobs.attemptSequence,
   }).from(schema.workflowJobs)
     .where(eq(schema.workflowJobs.id, jobId));
   if (!job) return { ok: false, message: 'Цей крок уже не знайти.' };
@@ -137,6 +161,9 @@ export async function stopFailedBuild(jobId: number): Promise<StopFailedBuildRes
       ))
       .returning({ id: schema.workflowJobs.id });
     if (!closed.length) return false;
+    await transitionCurrentRun(
+      tx, job, ['failed', 'needs_human'], 'cancelled', new Date(),
+    );
 
     if (projectId) {
       await tx.update(schema.siteProjects)

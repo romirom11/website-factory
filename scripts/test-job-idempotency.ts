@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { and, eq, inArray } from 'drizzle-orm';
 import * as schema from '../src/db/schema.js';
+import { getJobDefinition } from '../src/orchestrator/jobDefinitions.js';
 import {
   WorkflowRunStore,
   type BossSender,
@@ -135,16 +136,32 @@ await withDisposableFactoryDatabase(async ({ pool, db: testDb, boss }) => {
     const key = `retry:${randomUUID()}`;
     const enqueued = await store.enqueue(command(key, 'build-site'));
     assert.equal(enqueued.kind, 'accepted');
+    const physical = await pool.query<{
+      name: string;
+      logical_name: string | null;
+    }>(
+      `select name, data->>'__factoryJobName' as logical_name
+       from pgboss.job where id = $1`,
+      [enqueued.bossJobId],
+    );
+    assert.deepEqual(physical.rows[0], {
+      name: 'agent-build',
+      logical_name: 'build-site',
+    });
 
     const seenIds: string[] = [];
     let calls = 0;
-    const workerId = await boss.work('build-site', { batchSize: 1, pollingIntervalSeconds: 1 }, async (jobs) => {
+    const workerId = await boss.work(
+      getJobDefinition('build-site').physicalQueue,
+      { batchSize: 1, pollingIntervalSeconds: 1 },
+      async (jobs) => {
       for (const job of jobs) {
         seenIds.push(job.id);
         calls++;
         if (calls === 1) throw new Error('retry once');
       }
-    });
+      },
+    );
     await waitUntil(() => calls >= 2);
     await boss.offWork({ id: workerId });
 

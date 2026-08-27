@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { desc, eq, inArray, sql, type SQL, and } from 'drizzle-orm';
+import { and, desc, eq, getTableColumns, inArray, isNull, or, sql, type SQL } from 'drizzle-orm';
 import { db, schema } from '@/lib/db';
 import { Status } from '@/components/Status';
 import { SystemStatusPanel } from '@/components/SystemStatusPanel';
@@ -54,22 +54,39 @@ export default async function SystemPage({
 
   const [status_, counts] = await Promise.all([
     loadSystemStatus(),
-    db.execute(sql`select status, count(*)::int as n from workflow_jobs group by status`),
+    db.execute(sql`
+      select coalesce(r.status, w.status) as status, count(*)::int as n
+      from workflow_jobs w
+      left join workflow_job_runs r on r.id = w.run_id
+      where w.run_id is null or w.attempt_sequence = r.current_attempt_sequence
+      group by coalesce(r.status, w.status)
+    `),
   ]);
   const byStatus = new Map(
     (counts.rows as Array<{ status: string; n: number }>).map((r) => [r.status, r.n]),
   );
 
   const where: SQL[] = [];
-  if (status) where.push(eq(schema.workflowJobs.status, status));
+  const logicalStatus = sql<string>`coalesce(${schema.workflowJobRuns.status}, ${schema.workflowJobs.status})`;
+  where.push(or(
+    isNull(schema.workflowJobs.runId),
+    eq(schema.workflowJobs.attemptSequence, schema.workflowJobRuns.currentAttemptSequence),
+  )!);
+  if (status) where.push(sql`${logicalStatus} = ${status}`);
   if (type) where.push(eq(schema.workflowJobs.jobType, type));
 
   // 40, not 200: at 200 this page is a 40,000px scroll of mostly-succeeded rows
   // that nobody reads to the end. The filters above are how you find an older
   // one; the list itself is "what happened lately".
   const PAGE = 40;
-  const jobs = await db.select().from(schema.workflowJobs)
-    .where(where.length ? and(...where) : undefined)
+  const jobs = await db.select({
+    ...getTableColumns(schema.workflowJobs),
+    logicalRunId: schema.workflowJobRuns.id,
+    logicalStatus,
+    currentAttemptSequence: schema.workflowJobRuns.currentAttemptSequence,
+  }).from(schema.workflowJobs)
+    .leftJoin(schema.workflowJobRuns, eq(schema.workflowJobs.runId, schema.workflowJobRuns.id))
+    .where(and(...where))
     .orderBy(desc(schema.workflowJobs.createdAt))
     .limit(PAGE);
 
@@ -124,14 +141,14 @@ export default async function SystemPage({
 
           <ul>
             {jobs.map((j) => {
-              const human = humanJobStatus(j.status);
+              const human = humanJobStatus(j.logicalStatus);
               return (
                 <li key={j.id} className="row grid-cols-[minmax(0,1fr)_auto]">
                   <div className="min-w-0">
                     <span className="text-sm font-medium first-letter:uppercase">{stageName(j.jobType)}</span>
                     <div className="mt-0.5">
-                      <Status tone={human.tone} title={j.status}>
-                        {humanJobLine(j.status, fmtTime(j.nextAttemptAt))}
+                      <Status tone={human.tone} title={j.logicalStatus}>
+                        {humanJobLine(j.logicalStatus, fmtTime(j.nextAttemptAt))}
                       </Status>
                     </div>
                     <div className="text-sm text-ink-mute mt-0.5 truncate">
@@ -144,7 +161,16 @@ export default async function SystemPage({
                       )}
                       {' · '}{fmtDate(j.createdAt)}
                       {j.attempts > 1 && <> · спроб {j.attempts}</>}
+                      {j.logicalRunId && (
+                        <> · run <span className="font-mono">{j.logicalRunId.slice(0, 8)}</span>
+                          {' · '}attempt {j.attemptSequence ?? j.currentAttemptSequence} · ledger #{j.id}</>
+                      )}
                     </div>
+                    {j.status !== j.logicalStatus && (
+                      <p className="mt-0.5 text-xs text-ink-mute">
+                        Фізична attempt: {humanJobLine(j.status, fmtTime(j.nextAttemptAt))}
+                      </p>
+                    )}
                     {j.errorCode && (
                       <details className="mt-1">
                         <summary className="disclosure text-dot-stop hover:text-dot-stop">
@@ -156,7 +182,7 @@ export default async function SystemPage({
                       </details>
                     )}
                   </div>
-                  {['failed', 'needs_human'].includes(j.status) && (
+                  {['failed', 'needs_human'].includes(j.logicalStatus) && ['failed', 'needs_human'].includes(j.status) && (
                     <ActionForm action={retryJob}>
                       <input type="hidden" name="jobId" value={j.id} />
                       <button type="submit" className="btn-outline btn-sm">Повторити</button>

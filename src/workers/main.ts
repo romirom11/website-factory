@@ -17,13 +17,23 @@
  * override `AGENT_CONCURRENCY` when the process runs exactly that group.
  */
 import { inArray } from 'drizzle-orm';
-import { ensureQueues, register, getBoss, type JobName } from '../orchestrator/queue.js';
+import {
+  createAgentQueueHandler,
+  ensureQueues,
+  register,
+  getBoss,
+  type JobName,
+} from '../orchestrator/queue.js';
 import {
   JOB_DEFINITIONS,
   WORKER_GROUP_NAMES,
   type WorkerGroup,
 } from '../orchestrator/jobDefinitions.js';
-import { reconcileOnStartup, requeueOrphanedBuildJobs } from '../orchestrator/reconcile.js';
+import {
+  reconcileLegacyJobs,
+  reconcileOnStartup,
+  requeueOrphanedBuildJobs,
+} from '../orchestrator/reconcile.js';
 import { db, schema } from '../db/client.js';
 import { notifyBuildInterrupted } from '../telegram/notify.js';
 import { ensureBuckets } from '../lib/storage.js';
@@ -45,7 +55,9 @@ import { requestApprovalHandler } from './approval.js';
 import { sendOutreachHandler, sendFollowupHandler } from './outreach.js';
 import { pollRepliesHandler } from './replies.js';
 import { dailySummaryHandler } from './summary.js';
-import { setAgentConcurrency } from '../agents/semaphore.js';
+import { agentCapacityManager, agentSlotStats } from '../agents/semaphore.js';
+import { WorkerConsumerPool } from '../orchestrator/workerConsumerPool.js';
+import { subscribeSettingsChanges } from '../lib/settingsStore.js';
 import { config } from '../config.js';
 import { log } from '../lib/logger.js';
 
@@ -115,10 +127,49 @@ export function resolveGroups(explicit?: WorkerGroup[]): WorkerGroup[] {
  * concurrency. Mixed processes fall back to the global value, because the whole
  * point of the split is that groups no longer share a slot.
  */
-function concurrencyFor(groups: WorkerGroup[]): number {
-  if (groups.length === 1 && groups[0] === 'build') return config.agents.concurrencyBuild;
-  if (groups.length === 1 && groups[0] === 'enrich') return config.agents.concurrencyEnrich;
+function concurrencyForGroup(group: WorkerGroup): number {
+  if (group === 'build') return config.agents.concurrencyBuild;
+  if (group === 'enrich') return config.agents.concurrencyEnrich;
   return config.agents.concurrency;
+}
+
+const consumerPools = new Map<WorkerGroup, WorkerConsumerPool>();
+let activeGroups: WorkerGroup[] = [];
+let settingsSubscriptionInstalled = false;
+
+async function syncLiveCapacity(groups: WorkerGroup[]): Promise<void> {
+  for (const group of groups) {
+    const target = concurrencyForGroup(group);
+    agentCapacityManager.resize(group, target);
+    const poolForGroup = consumerPools.get(group);
+    if (poolForGroup) await poolForGroup.resize(target);
+  }
+}
+
+/** Current runtime capacity, embedded in heartbeats for the System page. */
+export function workerRuntimeStats(): Record<string, unknown> {
+  return {
+    groups: activeGroups,
+    capacity: Object.fromEntries(activeGroups.map((group) => [group, {
+      slots: agentSlotStats(group),
+      consumers: consumerPools.get(group)?.stats() ?? null,
+    }])),
+  };
+}
+
+/** Stop a legacy logical-queue consumer once it has drained all pre-cutover jobs. */
+function retireWhenDrained(boss: Awaited<ReturnType<typeof getBoss>>, name: JobName, id: string): void {
+  const timer = setInterval(() => {
+    void boss.getQueueSize(name).then(async (size) => {
+      if (size > 0) return;
+      clearInterval(timer);
+      await boss.offWork({ id });
+      log.info('legacy logical queue drained', { name, workerId: id });
+    }).catch((err) => {
+      log.warn('legacy queue drain check failed', { name, err: String(err).slice(0, 200) });
+    });
+  }, 15_000);
+  timer.unref?.();
 }
 
 /**
@@ -164,6 +215,12 @@ export async function startWorkers(explicit?: WorkerGroup[]): Promise<void> {
   await ensureQueues();
 
   const groups = resolveGroups(explicit);
+  activeGroups = groups;
+
+  // Every process waits for the same advisory-locked adoption pass before it
+  // registers consumers. This closes the cross-container startup race where a
+  // build worker could claim a legacy row while the core process reconciled it.
+  const legacyReport = await reconcileLegacyJobs();
 
   /**
    * Close out work stranded by the previous process BEFORE any handler is
@@ -177,7 +234,7 @@ export async function startWorkers(explicit?: WorkerGroup[]): Promise<void> {
    * recovery rows.
    */
   if (groups.includes(SCHEDULE_GROUP)) {
-    const report = await reconcileOnStartup();
+    const report = await reconcileOnStartup(db, legacyReport);
     // A killed build is the one thing the reconciler closes that a person has
     // to act on: the card offers «Спробувати ще раз», but nothing would have
     // told Roman to go and look.
@@ -196,25 +253,42 @@ export async function startWorkers(explicit?: WorkerGroup[]): Promise<void> {
     }
   }
 
-  const concurrency = concurrencyFor(groups);
-  setAgentConcurrency(concurrency);
-
+  const boss = await getBoss();
   const registered: JobName[] = [];
   for (const group of groups) {
+    consumerPools.set(group, new WorkerConsumerPool(
+      group,
+      boss,
+      createAgentQueueHandler(group, HANDLERS, boss),
+    ));
     for (const jobName of WORKER_GROUPS[group]) {
-      await register(jobName, HANDLERS[jobName]);
+      const definition = JOB_DEFINITIONS.find((item) => item.name === jobName)!;
+      if (definition.agentCapability === 'subscription') {
+        const legacyHandle = await register(jobName, HANDLERS[jobName]);
+        retireWhenDrained(boss, jobName, legacyHandle);
+      } else {
+        await register(jobName, HANDLERS[jobName]);
+      }
       registered.push(jobName);
     }
   }
+  await syncLiveCapacity(groups);
+  if (!settingsSubscriptionInstalled) {
+    subscribeSettingsChanges(() => {
+      void syncLiveCapacity(activeGroups).catch((err) => {
+        log.error('failed to apply live worker capacity', { err: String(err).slice(0, 300) });
+      });
+    });
+    settingsSubscriptionInstalled = true;
+  }
 
   if (groups.includes(SCHEDULE_GROUP)) {
-    const boss = await getBoss();
     await boss.schedule('poll-replies', '*/10 * * * *', {}, {});
     await boss.schedule('daily-summary', '0 8 * * *', {}, {});
   }
 
   log.info('workers registered', {
-    groups, jobs: registered.length, agentConcurrency: concurrency,
+    groups, jobs: registered.length, runtime: workerRuntimeStats(),
     schedules: groups.includes(SCHEDULE_GROUP),
   });
 }
@@ -229,8 +303,6 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     const { initSettings, startHeartbeat } = await import('../lib/settingsStore.js');
     await initSettings();
     await startWorkers();
-    startHeartbeat(process.env.WORKER_GROUPS ?? 'workers', () => ({
-      groups: process.env.WORKER_GROUPS ?? 'all',
-    }));
+    startHeartbeat(process.env.WORKER_GROUPS ?? 'workers', workerRuntimeStats);
   })().catch((err) => { console.error(err); process.exit(1); });
 }

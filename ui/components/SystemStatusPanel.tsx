@@ -35,16 +35,31 @@ export function SystemStatusPanel({ status }: { status: SystemStatus }) {
         ) : (
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {status.heartbeats.map((h) => (
-              <div key={h.group} className="flex items-center justify-between gap-2 rounded-md border border-line bg-paper-sunk px-3 py-2">
-                <span className="text-sm text-ink">{h.group}</span>
-                <span className="flex items-center gap-2">
-                  <span className="text-xs text-ink-mute">
-                    {h.ageLabel ?? '—'}{h.pid ? ` · pid ${h.pid}` : ''}
+              <div key={h.group} className="rounded-md border border-line bg-paper-sunk px-3 py-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-sm text-ink">{h.group}</span>
+                  <span className="flex items-center gap-2">
+                    <span className="text-xs text-ink-mute">
+                      {h.ageLabel ?? '—'}{h.pid ? ` · pid ${h.pid}` : ''}
+                    </span>
+                    <Badge tone={h.stale ? 'bad' : 'ok'}>
+                      {h.stale ? 'застій' : 'живий'}
+                    </Badge>
                   </span>
-                  <Badge tone={h.stale ? 'bad' : 'ok'}>
-                    {h.stale ? 'застій' : 'живий'}
-                  </Badge>
-                </span>
+                </div>
+                {h.capacity.length > 0 && (
+                  <div className="mt-2 space-y-1 border-t border-line pt-2">
+                    {h.capacity.map((capacity) => (
+                      <p key={capacity.group} className="text-xs text-ink-mute tabular-nums">
+                        {capacity.group}: агенти {capacity.active}/{capacity.limit}
+                        {capacity.waiting > 0 ? ` · чекає ${capacity.waiting}` : ''}
+                        {capacity.consumerHandles !== null
+                          ? ` · consumers ${capacity.consumerHandles}/${capacity.consumerTarget}`
+                          : ''}
+                      </p>
+                    ))}
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -60,7 +75,7 @@ export function SystemStatusPanel({ status }: { status: SystemStatus }) {
             <Badge tone={status.jobs.failed > 0 ? 'bad' : 'idle'}>failed: {status.jobs.failed}</Badge>
           </div>
         ) : (
-          <p className="text-sm text-ink-mute">pg-boss ще не ініціалізований.</p>
+          <p className="text-sm text-ink-mute">Ledger черги ще не ініціалізований.</p>
         )}
       </div>
     </section>

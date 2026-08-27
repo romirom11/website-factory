@@ -16,7 +16,7 @@
 import { and, eq } from 'drizzle-orm';
 import { revalidatePath } from 'next/cache';
 import { db, schema } from './db';
-import { enqueueJob } from './queue';
+import { enqueueJob } from './jobs';
 import { factoryFetch } from './factoryApi';
 import { transitionBusiness } from './actions';
 import type { ActionResult } from './types';
@@ -110,7 +110,7 @@ export async function deployBuildAsIs(projectId: number): Promise<ActionResult> 
     actor: 'roman',
   });
 
-  const jobId = await enqueueJob({
+  const result = await enqueueJob({
     name: 'deploy-demo',
     businessId: project.businessId,
     campaignId: biz.campaignId,
@@ -121,7 +121,7 @@ export async function deployBuildAsIs(projectId: number): Promise<ActionResult> 
   revalidatePath('/inbox');
   revalidatePath(`/businesses/${project.businessId}`);
 
-  if (!jobId) {
+  if (result.kind === 'duplicate') {
     return { ok: false, message: 'Деплой уже стоїть у черзі для цієї збірки.' };
   }
   return { ok: true, message: 'Деплой поставлено в чергу. Коли демо опублікується, воно з’явиться у Вхідних на підтвердження.' };
@@ -194,7 +194,7 @@ export async function requestAnotherIteration(input: {
   // `iteration: 1` marks this as a FIX run, so the builder edits the existing
   // workspace instead of wiping it and rebuilding from the design contract —
   // which would throw away everything the previous three iterations got right.
-  const jobId = await enqueueJob({
+  const result = await enqueueJob({
     name: 'build-site',
     businessId: project.businessId,
     campaignId: biz.campaignId,
@@ -209,7 +209,7 @@ export async function requestAnotherIteration(input: {
   revalidatePath('/inbox');
   revalidatePath(`/businesses/${project.businessId}`);
 
-  if (!jobId) return { ok: false, message: 'Збірка вже стоїть у черзі.' };
+  if (result.kind === 'duplicate') return { ok: false, message: 'Збірка вже стоїть у черзі.' };
   return { ok: true, message: 'Ітерацію поставлено в чергу. Коли збірка пройде QA, вона повернеться у Вхідні.' };
 }
 

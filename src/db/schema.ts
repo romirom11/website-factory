@@ -369,6 +369,22 @@ export const workflowJobs = pgTable('workflow_jobs', {
     .where(sql`${t.runId} is not null`),
 ]);
 
+/** Durable audit trail for one-time startup repairs of pre-run job rows. */
+export const workflowReconciliationEvents = pgTable('workflow_reconciliation_events', {
+  id: serial('id').primaryKey(),
+  eventType: text('event_type').notNull(),
+  jobType: text('job_type').notNull(),
+  idempotencyKey: text('idempotency_key'),
+  runId: uuid('run_id').references(() => workflowJobRuns.id),
+  attemptId: integer('attempt_id').references(() => workflowJobs.id),
+  bossJobId: text('boss_job_id'),
+  detail: jsonb('detail').$type<Record<string, unknown>>(),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+}, (t) => [
+  index('workflow_reconciliation_run_idx').on(t.runId),
+  index('workflow_reconciliation_created_idx').on(t.createdAt),
+]);
+
 // ─── Settings (phase E) ──────────────────────────────────────────────────────
 
 /**

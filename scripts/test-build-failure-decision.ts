@@ -1,8 +1,10 @@
 /** Regression: a failed build has two endings — retry, or stop without reject. */
 import {
   createBusiness, createCampaign, createFailedJob, createSiteProject, destroyFixtures,
+  FIXTURE_CAMPAIGN,
 } from './e2e/fixtures.js';
 import { pool } from '../src/db/client.js';
+import { randomUUID } from 'node:crypto';
 import { sql, sqlOne } from './e2e/harness.js';
 import { loadInbox } from '../ui/lib/inbox.js';
 import { retryFailedJob, stopFailedBuild } from '../ui/lib/buildFailureDecision.js';
@@ -52,6 +54,17 @@ try {
   });
   const raceProject = await createSiteProject(raceBiz, 'building');
   const raceJobId = await createFailedJob(raceBiz, 'build-site');
+  const raceRunId = randomUUID();
+  await sql(
+    `insert into workflow_job_runs
+       (id, job_type, idempotency_key, business_id, campaign_id, status, current_attempt_sequence, finished_at)
+     values ($1, 'build-site', $2, $3, $4, 'failed', 1, now())`,
+    [raceRunId, `e2e-job:${raceBiz.id}:linked`, raceBiz.id, FIXTURE_CAMPAIGN],
+  );
+  await sql(
+    `update workflow_jobs set run_id = $1, attempt_sequence = 1 where id = $2`,
+    [raceRunId, raceJobId],
+  );
   await sql(`update workflow_jobs set payload = $1::jsonb where id = $2`, [
     JSON.stringify({ businessId: raceBiz.id, projectId: raceProject.projectId, iteration: 2 }),
     raceJobId,
@@ -64,13 +77,23 @@ try {
   const retry = retryFailedJob(raceJobId, async () => {
     retryClaimed();
     await enqueueGate;
-    return 'fake-successor';
+    return {
+      kind: 'accepted' as const,
+      runId: 'fake-run',
+      runStatus: 'queued' as const,
+      attemptId: 1,
+      attemptSequence: 1,
+      bossJobId: 'fake-successor',
+    };
   });
   await claimSeen;
   const losingStop = await stopFailedBuild(raceJobId);
   check('Stop cannot override a retry that already claimed the failed attempt', !losingStop.ok);
   releaseEnqueue();
   check('the winning retry completes', await retry === 'queued');
+  const linkedRun = await sqlOne<{ status: string }>(
+    `select status from workflow_job_runs where id = $1`, [raceRunId]);
+  check('retry closes the previous logical run with its attempt', linkedRun?.status === 'cancelled');
 
   const raceBusiness = await sqlOne<{ status: string }>(
     `select status from businesses where id = $1`, [raceBiz.id]);

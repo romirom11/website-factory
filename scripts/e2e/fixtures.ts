@@ -264,6 +264,10 @@ export async function destroyFixtures(): Promise<void> {
     await rm(path.join(ROOT, 'sites', assertFixtureId(w.id)), { recursive: true, force: true });
   }
 
+  await sql(`delete from workflow_reconciliation_events
+    where attempt_id in (select id from workflow_jobs where business_id like $1)
+       or run_id in (select id from workflow_job_runs where business_id like $1)`, [like]).catch(() => {});
+
   const byBusiness = [
     'outreach_events', 'outreach_messages', 'approvals', 'deals', 'do_not_contact',
     'site_projects', 'production_gaps', 'qualifications', 'website_audits',
@@ -277,6 +281,7 @@ export async function destroyFixtures(): Promise<void> {
   // do_not_contact also keys on match_type='business_id'
   await sql(`delete from do_not_contact where value like $1`, [like]).catch(() => {});
   await sql(`delete from workflow_jobs where idempotency_key like $1`, [like]).catch(() => {});
+  await sql(`delete from workflow_job_runs where business_id like $1 or idempotency_key like $1`, [like]).catch(() => {});
   await sql(`delete from businesses where id like $1`, [like]);
   await sql(`delete from campaigns where id like $1`, [like]);
 
@@ -296,6 +301,7 @@ export async function leftoverFixtures(): Promise<string[]> {
     ['businesses', 'id', like],
     ['campaigns', 'id', like],
     ['workflow_jobs', 'business_id', like],
+    ['workflow_job_runs', 'business_id', like],
     ['production_gaps', 'business_id', like],
     ['approvals', 'business_id', like],
     ['outreach_messages', 'business_id', like],

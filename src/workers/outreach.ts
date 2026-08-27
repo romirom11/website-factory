@@ -21,7 +21,7 @@ import { and, eq, desc, gte, inArray, sql } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { config } from '../config.js';
 import { transition } from '../orchestrator/statuses.js';
-import { getBoss, type JobPayload } from '../orchestrator/queue.js';
+import { enqueue, type JobPayload } from '../orchestrator/queue.js';
 import { adapterFor, deepLinkFor, isManualChannel, type OutreachChannel, type OutreachDraft } from '../channels/index.js';
 import { notifyManualFollowup } from '../telegram/notify.js';
 import { log } from '../lib/logger.js';
@@ -61,13 +61,12 @@ async function isDoNotContact(businessId: string, toAddress: string): Promise<st
 }
 
 export async function scheduleFollowups(approvalId: number, businessId: string, channel: string): Promise<void> {
-  const boss = await getBoss();
   for (let i = 0; i < config.followupDays.length; i++) {
     const key = followupIdempotencyKey(approvalId, i + 1);
-    await boss.send(
+    await enqueue(
       'send-followup',
       { businessId, followupIndex: i + 1, approvalId, channel, idempotencyKey: key },
-      { startAfter: config.followupDays[i] * 24 * 3600, singletonKey: key },
+      { startAfterSeconds: config.followupDays[i] * 24 * 3600 },
     );
   }
   log.info('followups scheduled', { businessId, approvalId, days: config.followupDays });

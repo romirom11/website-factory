@@ -7,6 +7,8 @@ import * as schema from '../db/schema.js';
 import {
   getJobDefinition,
   isJobName,
+  jobQueuePriority,
+  physicalJobData,
   validateJobPayload,
   type JobName,
 } from './jobDefinitions.js';
@@ -55,7 +57,8 @@ export type RateLimitContinuationResult =
       attemptSequence: number;
       bossJobId: string;
     }
-  | { kind: 'legacy'; bossJobId: string };
+  | { kind: 'legacy'; bossJobId: string }
+  | { kind: 'stale'; runId: string | null; bossJobId: string };
 
 export interface BossSender {
   send(name: string, data: object, options: PgBoss.SendOptions): Promise<string | null>;
@@ -94,7 +97,7 @@ function sendOptions(
     retryBackoff: true,
     expireInSeconds: definition.expireInSeconds,
     singletonKey: key,
-    ...(command.options?.priority !== undefined ? { priority: command.options.priority } : {}),
+    priority: jobQueuePriority(command.name, command.options?.priority),
     ...(command.options?.startAfterSeconds !== undefined
       ? { startAfter: command.options.startAfterSeconds }
       : {}),
@@ -173,9 +176,10 @@ export class WorkflowRunStore {
         }).returning({ id: schema.workflowJobs.id });
         if (!attempt) throw new Error(`failed to create first attempt for workflow run ${runId}`);
 
+        const definition = getJobDefinition(command.name);
         const sentId = await this.boss.send(
-          command.name,
-          command.payload,
+          definition.physicalQueue,
+          physicalJobData(command.name, command.payload),
           sendOptions(command, bossJobId, key, clientDb(client)),
         );
         if (sentId !== bossJobId) {
@@ -212,13 +216,25 @@ export class WorkflowRunStore {
           .where(eq(schema.workflowJobs.bossJobId, input.bossJobId))
           .limit(1)
           .for('update');
+        if (!current) {
+          return {
+            kind: 'stale',
+            runId: null,
+            bossJobId: input.bossJobId,
+          };
+        }
         if (!current?.runId || !current.attemptSequence) {
-          return { kind: 'legacy', bossJobId: input.bossJobId };
+          return current.status === 'running'
+            ? { kind: 'legacy', bossJobId: input.bossJobId }
+            : { kind: 'stale', runId: null, bossJobId: input.bossJobId };
         }
         if (!isJobName(current.jobType)) {
           throw new Error(`unknown job type on attempt ${current.id}: ${current.jobType}`);
         }
-
+        const [run] = await tx.select().from(schema.workflowJobRuns)
+          .where(eq(schema.workflowJobRuns.id, current.runId))
+          .limit(1)
+          .for('update');
         const nextSequence = current.attemptSequence + 1;
         const [existing] = await tx.select().from(schema.workflowJobs)
           .where(and(
@@ -227,6 +243,11 @@ export class WorkflowRunStore {
           ))
           .limit(1);
         if (existing?.bossJobId) {
+          if (
+            !run
+            || run.currentAttemptSequence !== nextSequence
+            || !ACTIVE_WORKFLOW_RUN_STATUSES.includes(run.status as ActiveWorkflowRunStatus)
+          ) return { kind: 'stale', runId: current.runId, bossJobId: input.bossJobId };
           return {
             kind: 'existing',
             runId: current.runId,
@@ -234,6 +255,14 @@ export class WorkflowRunStore {
             attemptSequence: nextSequence,
             bossJobId: existing.bossJobId,
           };
+        }
+        if (
+          current.status !== 'running'
+          || !run
+          || run.status !== 'running'
+          || run.currentAttemptSequence !== current.attemptSequence
+        ) {
+          return { kind: 'stale', runId: current.runId, bossJobId: input.bossJobId };
         }
 
         const payload = (current.payload ?? {}) as WorkflowJobPayload;
@@ -261,12 +290,14 @@ export class WorkflowRunStore {
           runId: current.runId,
           attemptSequence: nextSequence,
           status: 'queued',
+          nextAttemptAt: input.nextAttemptAt,
         }).returning({ id: schema.workflowJobs.id });
         if (!successor) throw new Error(`failed to create successor for workflow run ${current.runId}`);
 
+        const definition = getJobDefinition(command.name);
         const sentId = await this.boss.send(
-          command.name,
-          command.payload,
+          definition.physicalQueue,
+          physicalJobData(command.name, command.payload),
           sendOptions(command, successorBossId, key, clientDb(client)),
         );
         if (sentId !== successorBossId) {

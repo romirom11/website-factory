@@ -78,6 +78,7 @@ await withDisposableFactoryDatabase(async ({ pool, db, boss }) => {
     assert.equal(attempts[0]?.errorCode, 'RATE_LIMITED');
     assert.equal(attempts[1]?.status, 'queued');
     assert.equal(attempts[1]?.attempts, 0);
+    assert.equal(attempts[1]?.nextAttemptAt?.getTime(), nextAttemptAt.getTime());
     assert.equal(attempts.some((attempt) => attempt.status === 'failed'), false);
   });
 
@@ -88,6 +89,35 @@ await withDisposableFactoryDatabase(async ({ pool, db, boss }) => {
       [ids],
     );
     assert.equal(result.rows.length, 2);
+  });
+
+  await check('a late rate-limit result cannot create work for a cancelled run', async () => {
+    const staleKey = `stale-rate-limit:${randomUUID()}`;
+    const stale = await store.enqueue({
+      name: 'build-site',
+      payload: {
+        businessId: `e2e-${randomUUID()}`,
+        projectId: 2,
+        idempotencyKey: staleKey,
+      },
+    });
+    assert.equal(stale.kind, 'accepted');
+    await db.update(schema.workflowJobs)
+      .set({ status: 'cancelled', finishedAt: new Date() })
+      .where(eq(schema.workflowJobs.id, stale.attemptId));
+    await db.update(schema.workflowJobRuns)
+      .set({ status: 'cancelled', finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(schema.workflowJobRuns.id, stale.runId));
+    const before = await db.select().from(schema.workflowJobs)
+      .where(eq(schema.workflowJobs.runId, stale.runId));
+    const result = await store.continueAfterRateLimit({
+      ...continuationInput,
+      bossJobId: stale.bossJobId,
+    });
+    const after = await db.select().from(schema.workflowJobs)
+      .where(eq(schema.workflowJobs.runId, stale.runId));
+    assert.equal(result.kind, 'stale');
+    assert.equal(after.length, before.length);
   });
 
   console.log(`\n🧪 RATE-LIMIT REQUEUE TEST PASSED (${passed})`);

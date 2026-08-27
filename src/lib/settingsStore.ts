@@ -88,12 +88,27 @@ export async function writeSetting(
 let cache = new Map<string, string>();
 let timer: NodeJS.Timeout | null = null;
 let inFlight: Promise<void> | null = null;
+const snapshotListeners = new Set<() => void>();
+
+/** Subscribe to successful live snapshot refreshes without exposing secret values. */
+export function subscribeSettingsChanges(listener: () => void): () => void {
+  snapshotListeners.add(listener);
+  return () => snapshotListeners.delete(listener);
+}
 
 /** Kick a background re-read; failures keep the previous snapshot. */
 function refresh(): Promise<void> {
   if (inFlight) return inFlight;
   inFlight = loadSettingsFromDb()
-    .then((values) => { cache = values; primeSettings(values); })
+    .then((values) => {
+      cache = values;
+      primeSettings(values);
+      for (const listener of snapshotListeners) {
+        try { listener(); } catch (err) {
+          log.warn('settings listener failed', { err: String(err).slice(0, 200) });
+        }
+      }
+    })
     .catch((err) => {
       log.warn('settings refresh failed, keeping last snapshot', { err: String(err).slice(0, 200) });
       // Re-prime the old snapshot so its timestamp advances and we do not

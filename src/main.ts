@@ -7,7 +7,7 @@
  * (`ui/`, its own container). `pnpm telegram:setup` runs the one-time
  * chat-id discovery helper.
  */
-import { startWorkers } from './workers/main.js';
+import { startWorkers, workerRuntimeStats } from './workers/main.js';
 import { startApi } from './api/server.js';
 import { initSettings, startHeartbeat } from './lib/settingsStore.js';
 import { config } from './config.js';
@@ -22,6 +22,6 @@ await startApi();
 
 // Liveness for the UI's "Стан системи" panel: a row every 30s. Without it the
 // console cannot tell "the factory is down" from "there is simply no work".
-startHeartbeat('core', () => ({ groups: process.env.WORKER_GROUPS ?? 'all', mode: config.mode }));
+startHeartbeat('core', () => ({ ...workerRuntimeStats(), mode: config.mode }));
 
 log.info('factory up', { mode: config.mode });

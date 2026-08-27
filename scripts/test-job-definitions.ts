@@ -8,6 +8,7 @@ import {
   REQUIRED_QUEUE_NAMES,
   getJobDefinition,
   isJobName,
+  jobQueuePriority,
   validateJobDefinitions,
   validateJobPayload,
   type JobDefinition,
@@ -60,6 +61,12 @@ await check('every retry, expiry and scheduling policy is explicit', () => {
   assert.deepEqual(getJobDefinition('audit-website').retry, { limit: 3, delaySeconds: 60 });
   assert.deepEqual(getJobDefinition('build-site').retry, { limit: 1, delaySeconds: 0 });
   assert.deepEqual(getJobDefinition('send-outreach').retry, { limit: 0, delaySeconds: 0 });
+});
+
+await check('scheduling classes dominate caller priority', () => {
+  assert.ok(jobQueuePriority('score-and-qa', 0) > jobQueuePriority('enrich', 999_999));
+  assert.ok(jobQueuePriority('build-site', 90) > jobQueuePriority('build-site', 20));
+  assert.ok(jobQueuePriority('content-and-design', 0) > jobQueuePriority('enrich-socials', 9_999));
 });
 
 await check('payload schemas accept valid scope and reject missing identifiers', () => {

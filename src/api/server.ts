@@ -8,7 +8,6 @@
  *  2. Demo static server (demoPort): serves built demo sites with noindex.
  *     The UI's approval preview iframes DEMO_BASE_URL, which points here.
  */
-import { timingSafeEqual } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -33,6 +32,9 @@ import {
 } from './accounts.js';
 import { reloadSettings } from '../lib/settingsStore.js';
 import { ensureQueues } from '../orchestrator/queue.js';
+import { enqueue } from '../orchestrator/queue.js';
+import { createInternalAuth } from './internalAuth.js';
+import { registerJobCommandRoute } from './jobCommands.js';
 
 export async function startApi(): Promise<void> {
   // Queue creation is part of readiness. In API-only mode there may be no
@@ -54,18 +56,8 @@ export async function startApi(): Promise<void> {
   // Secret: INTERNAL_API_KEY, falling back to UI_SESSION_SECRET / UI_PASSWORD,
   // so a working setup needs no extra .env line. Empty secret = the endpoints
   // refuse everything rather than opening up.
-  const internalAuth = async (c: any, next: any) => {
-    const expected = config.ui.internalApiKey;
-    if (!expected) return c.json({ ok: false, error: 'internal api disabled (no secret configured)' }, 503);
-    const given = c.req.header('x-internal-key') ?? '';
-    const a = Buffer.from(given);
-    const b = Buffer.from(expected);
-    if (a.length !== b.length || !timingSafeEqual(a, b)) {
-      log.warn('internal api rejected', { path: c.req.path });
-      return c.json({ ok: false, error: 'unauthorized' }, 401);
-    }
-    await next();
-  };
+  const internalAuth = createInternalAuth();
+  registerJobCommandRoute(app, internalAuth, enqueue);
 
   /**
    * Run one connectivity check and report the REAL result (never a throw).

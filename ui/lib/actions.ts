@@ -16,7 +16,7 @@
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { revalidatePath } from 'next/cache';
 import { db, schema } from './db';
-import { enqueueJob, type JobName } from './queue';
+import { enqueueJob, type JobName } from './jobs';
 import { sendIdempotencyKey, followupIdempotencyKey, isManualChannel, deepLinkFor } from './keys';
 import {
   BUILDABLE_STATUSES, BUILD_POLICY_LABELS, buildJobPriority, isActiveJobStatus,
@@ -27,6 +27,7 @@ import { humanStatus, reviewAsk } from './humanStatus';
 import { stageName } from './stageNames';
 import type { ActionResult } from './types';
 import { retryFailedJob, stopFailedBuild } from './buildFailureDecision';
+import { isJobName } from '@factory/jobDefinitions';
 
 // ─── Approvals ───────────────────────────────────────────────────────────────
 
@@ -285,20 +286,21 @@ export async function markDoNotContact(formData: FormData): Promise<ActionResult
 /** Re-run a pipeline stage for one business. */
 export async function reenqueueStage(formData: FormData): Promise<ActionResult> {
   const businessId = String(formData.get('businessId') ?? '');
-  const job = String(formData.get('job') ?? '') as JobName;
-  if (!businessId || !job) return { ok: false, message: 'Не вибрано крок' };
+  const requestedJob = String(formData.get('job') ?? '');
+  if (!businessId || !isJobName(requestedJob)) return { ok: false, message: 'Не вибрано коректний крок' };
+  const job: JobName = requestedJob;
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   if (!biz) return { ok: false, message: 'Бізнес не знайдено' };
   // A fresh key every time on purpose: this button means "run it again NOW",
   // and a stable key would make the second press a silent no-op.
-  const jobId = await enqueueJob({
+  const result = await enqueueJob({
     name: job, businessId, campaignId: biz.campaignId,
     idempotencyKey: `${job}:${businessId}:${Date.now()}`,
   });
   revalidatePath(`/businesses/${businessId}`);
   revalidatePath('/settings', 'layout');
 
-  if (!jobId) return { ok: false, message: `Крок «${stageName(job)}» уже стоїть у черзі` };
+  if (result.kind === 'duplicate') return { ok: false, message: `Крок «${stageName(job)}» уже стоїть у черзі` };
   return { ok: true, message: `Крок «${stageName(job)}» поставлено в чергу` };
 }
 
@@ -522,9 +524,9 @@ export async function startDemoBuild(businessId: string): Promise<ActionResult> 
 
   const verdict = await latestVerdict(businessId);
 
-  // Stable idempotency key: a second click while the job is active is a no-op
-  // in pg-boss (singletonKey), and the checks above already refused it earlier.
-  const jobId = await enqueueJob({
+  // Stable idempotency key: a second click resolves to the canonical active
+  // run, and the checks above already refuse it even earlier.
+  const result = await enqueueJob({
     name: 'content-and-design',
     businessId,
     campaignId: biz.campaignId,
@@ -536,7 +538,7 @@ export async function startDemoBuild(businessId: string): Promise<ActionResult> 
   revalidatePath(`/businesses/${businessId}`);
   revalidatePath('/settings', 'layout');
 
-  if (!jobId) {
+  if (result.kind === 'duplicate') {
     return { ok: false, message: `${biz.name}: такий job уже активний у черзі` };
   }
   return { ok: true, message: `${biz.name}: збірка демо поставлена в чергу` };
@@ -636,9 +638,9 @@ export async function resolveBusinessReviewAction(input: {
   );
   if (!moved.ok) return moved;
 
-  let jobId: string | null;
+  let result: Awaited<ReturnType<typeof enqueueJob>>;
   try {
-    jobId = await enqueueJob({
+    result = await enqueueJob({
       name: 'enrich',
       businessId: biz.id,
       campaignId: biz.campaignId,
@@ -655,7 +657,7 @@ export async function resolveBusinessReviewAction(input: {
   }
 
   revalidatePath('/inbox');
-  if (!jobId) return { ok: true, message: `${biz.name}: повторний збір уже стоїть у черзі` };
+  if (result.kind === 'duplicate') return { ok: true, message: `${biz.name}: повторний збір уже стоїть у черзі` };
   return { ok: true, message: `${biz.name}: заново збираю факти й джерела` };
 }
 
@@ -681,10 +683,9 @@ export async function setCampaignBuildPolicy(formData: FormData): Promise<Action
  * fact of a business whose demo may be building right now. This job only adds
  * sources and contacts, and never touches the status.
  *
- * The idempotency key is stable per business, so a second click while the job
- * is in flight is a no-op in pg-boss — the same lock the build button relies
- * on, and the reason `enqueueJob` returning null is reported rather than
- * silently treated as success.
+ * The idempotency key is stable per business, so a second click resolves to the
+ * canonical active run — the same durable lock the build button relies on —
+ * and is reported rather than silently treated as a new run.
  */
 export async function startSocialsDiscovery(businessId: string): Promise<ActionResult> {
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
@@ -709,7 +710,7 @@ export async function startSocialsDiscovery(businessId: string): Promise<ActionR
   });
   if (!state.enabled) return { ok: false, message: `${biz.name}: ${state.hint}` };
 
-  const jobId = await enqueueJob({
+  const result = await enqueueJob({
     name: 'enrich-socials',
     businessId,
     campaignId: biz.campaignId,
@@ -720,7 +721,7 @@ export async function startSocialsDiscovery(businessId: string): Promise<ActionR
   revalidatePath('/businesses');
   revalidatePath('/settings', 'layout');
 
-  if (!jobId) return { ok: false, message: `${biz.name}: такий job уже активний у черзі` };
+  if (result.kind === 'duplicate') return { ok: false, message: `${biz.name}: такий job уже активний у черзі` };
   return { ok: true, message: `${biz.name}: пошук соцмереж поставлено в чергу` };
 }
 
@@ -750,7 +751,7 @@ export async function refreshBrandIdentity(businessId: string): Promise<ActionRe
     return { ok: false, message: `${biz.name}: бізнес закритий (${biz.status})` };
   }
 
-  const jobId = await enqueueJob({
+  const result = await enqueueJob({
     name: 'refresh-brand',
     businessId,
     campaignId: biz.campaignId,
@@ -760,7 +761,7 @@ export async function refreshBrandIdentity(businessId: string): Promise<ActionRe
   revalidatePath(`/businesses/${businessId}`);
   revalidatePath('/businesses');
 
-  if (!jobId) return { ok: false, message: `${biz.name}: оновлення айдентики вже в черзі` };
+  if (result.kind === 'duplicate') return { ok: false, message: `${biz.name}: оновлення айдентики вже в черзі` };
   return { ok: true, message: `${biz.name}: оновлення айдентики поставлено в чергу` };
 }
 

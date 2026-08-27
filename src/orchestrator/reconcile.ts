@@ -51,15 +51,15 @@
  * — `idempotency_key` is the one the summary worker uses.
  */
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { db, schema } from '../db/client.js';
 import { log } from '../lib/logger.js';
+import {
+  LegacyJobReconciler,
+  type LegacyReconciliationReport,
+} from './legacyJobReconciler.js';
 
-/**
- * Mirror statuses that assert "pg-boss is holding this right now".
- * `retry_wait` is NOT here: it is parked by us, deliberately, with a
- * re-enqueue already made under the same idempotency key (SPEC §2.3б).
- */
-const LIVE_MIRROR_STATUSES = ['queued', 'running'] as const;
+type ReconciliationDatabase = NodePgDatabase<typeof schema>;
 
 /**
  * pg-boss states that still mean "this job will run": anything else (or no row
@@ -85,6 +85,7 @@ const STABLE_STATUSES = [
 ];
 
 export interface ReconcileReport {
+  legacy: LegacyReconciliationReport;
   staleJobs: number;
   revertedBusinesses: Array<{ businessId: string; from: string; to: string }>;
   /** Build projects whose worker died mid-flight; the card now offers a restart. */
@@ -108,31 +109,54 @@ export interface ReconcileReport {
  * a timer, is what says it is alive. Verified against a live `content-and-design`
  * run on 2026-08-20, and pinned by `scripts/test-reconcile.ts`.
  */
-async function markStaleJobs(): Promise<number> {
-  const rows = await db.execute(sql`
-    update workflow_jobs w set
-      status = 'stale',
-      error_code = coalesce(w.error_code, 'STALE'),
-      error_detail = coalesce(
-        w.error_detail,
-        'Робітник перезапустився, поки задача була в черзі — pg-boss її вже не тримає. '
-        || 'Задачу не втрачено назавжди: її можна перезапустити вручну.'
-      ),
-      finished_at = coalesce(w.finished_at, now())
-    where w.status in (${sql.join(LIVE_MIRROR_STATUSES.map((s) => sql`${s}`), sql`, `)})
-      and not exists (
-        select 1 from pgboss.job j
-        where j.id::text = w.boss_job_id
-          and j.state::text in (${sql.join(LIVE_BOSS_STATES.map((s) => sql`${s}`), sql`, `)})
-      )
-    returning w.id
+async function markStaleJobs(database: ReconciliationDatabase): Promise<number> {
+  const rows = await database.execute(sql`
+    with stale as (
+      update workflow_jobs w set
+        status = 'stale',
+        error_code = coalesce(w.error_code, 'STALE'),
+        error_detail = coalesce(
+          w.error_detail,
+          'Робітник перезапустився, поки задача була в черзі — pg-boss її вже не тримає. '
+          || 'Задачу не втрачено назавжди: її можна перезапустити вручну.'
+        ),
+        finished_at = coalesce(w.finished_at, now())
+      where w.status in ('queued', 'running', 'retry_wait')
+        and (
+          w.run_id is null
+          or exists (
+            select 1 from workflow_job_runs r
+            where r.id = w.run_id
+              and r.current_attempt_sequence = w.attempt_sequence
+              and r.status in ('queued', 'running', 'retry_wait')
+          )
+        )
+        and not exists (
+          select 1 from pgboss.job j
+          where j.id::text = w.boss_job_id
+            and j.state::text in (${sql.join(LIVE_BOSS_STATES.map((s) => sql`${s}`), sql`, `)})
+        )
+      returning w.id, w.run_id, w.attempt_sequence
+    ), closed_runs as (
+      update workflow_job_runs r
+      set status = 'failed', updated_at = now(), finished_at = coalesce(r.finished_at, now())
+      from stale s
+      where r.id = s.run_id
+        and r.current_attempt_sequence = s.attempt_sequence
+        and r.status in ('queued', 'running', 'retry_wait')
+      returning r.id
+    )
+    select id from stale
   `);
   return rows.rows.length;
 }
 
 /** The most recent status in `status_history` that is not itself transient. */
-async function lastStableStatus(businessId: string): Promise<string | null> {
-  const [row] = await db.select({ to: schema.statusHistory.toStatus })
+async function lastStableStatus(
+  database: ReconciliationDatabase,
+  businessId: string,
+): Promise<string | null> {
+  const [row] = await database.select({ to: schema.statusHistory.toStatus })
     .from(schema.statusHistory)
     .where(and(
       eq(schema.statusHistory.businessId, businessId),
@@ -154,8 +178,10 @@ async function lastStableStatus(businessId: string): Promise<string | null> {
  *     project is a real build, whatever the job table says, and reverting it
  *     would throw away the operator's view of a real artefact.
  */
-async function revertStrandedBusinesses(): Promise<ReconcileReport['revertedBusinesses']> {
-  const stranded = await db.execute(sql`
+async function revertStrandedBusinesses(
+  database: ReconciliationDatabase,
+): Promise<ReconcileReport['revertedBusinesses']> {
+  const stranded = await database.execute(sql`
     select b.id, b.status
     from businesses b
     where b.status in (${sql.join(TRANSIENT_STATUSES.map((s) => sql`${s}`), sql`, `)})
@@ -174,7 +200,7 @@ async function revertStrandedBusinesses(): Promise<ReconcileReport['revertedBusi
     // Fall back to `needs_review` rather than guessing: a business with no
     // stable history at all is exactly the case a human should look at, and
     // `needs_review` is the status the inbox already surfaces.
-    const to = (await lastStableStatus(r.id)) ?? 'needs_review';
+    const to = (await lastStableStatus(database, r.id)) ?? 'needs_review';
     if (to === r.status) continue;
 
     const reason = r.status === 'site_in_progress'
@@ -190,7 +216,7 @@ async function revertStrandedBusinesses(): Promise<ReconcileReport['revertedBusi
     // Writing both rows here keeps businesses.status and status_history in
     // lockstep — the invariant the audit verified — and names the actor
     // honestly.
-    await db.transaction(async (tx) => {
+    await database.transaction(async (tx) => {
       await tx.update(schema.businesses)
         .set({ status: to, statusReason: reason, updatedAt: new Date() })
         .where(eq(schema.businesses.id, r.id));
@@ -203,11 +229,7 @@ async function revertStrandedBusinesses(): Promise<ReconcileReport['revertedBusi
   return out;
 }
 
-/**
- * Run both passes. Never throws: a database hiccup here must not stop the
- * workers from booting — the factory being up matters more than the ledger
- * being tidy, and the next boot will reconcile again.
- */
+/** Run the repair passes before consumers; any failure aborts worker startup. */
 /**
  * Build projects frozen in a transient state with no live build-chain job.
  *
@@ -217,8 +239,10 @@ async function revertStrandedBusinesses(): Promise<ReconcileReport['revertedBusi
  * restart (observed on BEAUTIFY Laser, 2026-08-22, after a git-pull redeploy).
  * `failed` is the state the card already knows how to offer a restart for.
  */
-async function failInterruptedBuilds(): Promise<ReconcileReport['interruptedBuilds']> {
-  const rows = await db.execute(sql`
+async function failInterruptedBuilds(
+  database: ReconciliationDatabase,
+): Promise<ReconcileReport['interruptedBuilds']> {
+  const rows = await database.execute(sql`
     update site_projects p set state = 'failed'
     where p.state in ('pending', 'brief', 'building', 'qa')
       and not exists (
@@ -252,8 +276,11 @@ async function failInterruptedBuilds(): Promise<ReconcileReport['interruptedBuil
  * job at expiration — flipping it to `retry` with `start_after = now()` only
  * removes the artificial wait, and the retry budget is untouched.
  */
-export async function requeueOrphanedBuildJobs(ownedTypes: readonly string[]): Promise<number> {
-  const rows = await db.execute(sql`
+export async function requeueOrphanedBuildJobs(
+  ownedTypes: readonly string[],
+  database: ReconciliationDatabase = db,
+): Promise<number> {
+  const rows = await database.execute(sql`
     with orphans as (
       select w.id as mirror_id, j.id as boss_id
       from workflow_jobs w
@@ -268,26 +295,58 @@ export async function requeueOrphanedBuildJobs(ownedTypes: readonly string[]): P
       from orphans o
       where j.id = o.boss_id
       returning j.id
+    ),
+    requeued as (
+      update workflow_jobs w
+      set status = 'queued',
+          error_detail = 'Збірку перервано перезапуском контейнера — крок одразу повернено в чергу.'
+      from orphans o
+      where w.id = o.mirror_id
+      returning w.id, w.run_id, w.attempt_sequence
+    ), reset_runs as (
+      update workflow_job_runs r
+      set status = 'queued', updated_at = now(), finished_at = null
+      from requeued q
+      where r.id = q.run_id
+        and r.current_attempt_sequence = q.attempt_sequence
+        and r.status = 'running'
+      returning r.id
     )
-    update workflow_jobs w
-    set status = 'queued',
-        error_detail = 'Збірку перервано перезапуском контейнера — крок одразу повернено в чергу.'
-    from orphans o
-    where w.id = o.mirror_id
-    returning w.id
+    select id from requeued
   `);
   return rows.rows.length;
 }
 
-export async function reconcileOnStartup(): Promise<ReconcileReport> {
-  const report: ReconcileReport = { staleJobs: 0, revertedBusinesses: [], interruptedBuilds: [] };
+export async function reconcileLegacyJobs(
+  database: ReconciliationDatabase = db,
+): Promise<LegacyReconciliationReport> {
+  return new LegacyJobReconciler(database).reconcile();
+}
+
+export async function reconcileOnStartup(
+  database: ReconciliationDatabase = db,
+  legacy?: LegacyReconciliationReport,
+): Promise<ReconcileReport> {
+  const report: ReconcileReport = {
+    legacy: legacy ?? await reconcileLegacyJobs(database),
+    staleJobs: 0,
+    revertedBusinesses: [],
+    interruptedBuilds: [],
+  };
   try {
-    report.staleJobs = await markStaleJobs();
+    report.staleJobs = await markStaleJobs(database);
     // AFTER markStaleJobs: a ghost job must not count as proof of a live build.
-    report.interruptedBuilds = await failInterruptedBuilds();
-    report.revertedBusinesses = await revertStrandedBusinesses();
-    if (report.staleJobs || report.revertedBusinesses.length) {
+    report.interruptedBuilds = await failInterruptedBuilds(database);
+    report.revertedBusinesses = await revertStrandedBusinesses(database);
+    if (
+      report.legacy.adoptedRuns
+      || report.legacy.cancelledDuplicates
+      || report.legacy.parkedIncompatible
+      || report.staleJobs
+      || report.revertedBusinesses.length
+    ) {
       log.warn('startup reconciliation closed stranded work', {
+        legacy: report.legacy,
         staleJobs: report.staleJobs,
         reverted: report.revertedBusinesses,
       });
@@ -296,6 +355,7 @@ export async function reconcileOnStartup(): Promise<ReconcileReport> {
     }
   } catch (err) {
     log.error('startup reconciliation failed', { err: String(err).slice(0, 500) });
+    throw err;
   }
   return report;
 }

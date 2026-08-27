@@ -1,5 +1,3 @@
-import 'server-only';
-
 /**
  * Calling the factory's internal API from the console.
  *

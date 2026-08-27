@@ -1,6 +1,6 @@
-import { desc } from 'drizzle-orm';
+import { desc, sql } from 'drizzle-orm';
 import {
-  pgTable, text, integer, real, boolean, timestamp, jsonb, serial, uniqueIndex, index,
+  pgTable, text, integer, real, boolean, timestamp, jsonb, serial, uuid, uniqueIndex, index,
 } from 'drizzle-orm/pg-core';
 
 // ─── Campaigns ────────────────────────────────────────────────────────────────
@@ -315,7 +315,27 @@ export const doNotContact = pgTable('do_not_contact', {
   at: timestamp('at').notNull().defaultNow(),
 }, (t) => [uniqueIndex('dnc_idx').on(t.matchType, t.value)]);
 
-// ─── Jobs (mirror of pg-boss for reporting; pg-boss keeps its own schema) ────
+// ─── Jobs: logical commands + physical pg-boss attempts ─────────────────────
+
+export const workflowJobRuns = pgTable('workflow_job_runs', {
+  id: uuid('id').primaryKey(),
+  jobType: text('job_type').notNull(),
+  idempotencyKey: text('idempotency_key').notNull(),
+  businessId: text('business_id'),
+  campaignId: text('campaign_id'),
+  // queued | running | retry_wait | succeeded | failed | needs_human | cancelled
+  status: text('status').notNull().default('queued'),
+  currentAttemptSequence: integer('current_attempt_sequence').notNull().default(1),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+  updatedAt: timestamp('updated_at').notNull().defaultNow(),
+  finishedAt: timestamp('finished_at'),
+}, (t) => [
+  uniqueIndex('workflow_runs_active_idem_idx')
+    .on(t.jobType, t.idempotencyKey)
+    .where(sql`${t.status} in ('queued', 'running', 'retry_wait')`),
+  index('workflow_runs_status_idx').on(t.status),
+  index('workflow_runs_business_idx').on(t.businessId),
+]);
 
 export const workflowJobs = pgTable('workflow_jobs', {
   id: serial('id').primaryKey(),
@@ -324,6 +344,10 @@ export const workflowJobs = pgTable('workflow_jobs', {
   businessId: text('business_id'),
   campaignId: text('campaign_id'),
   idempotencyKey: text('idempotency_key'),
+  /** Nullable for rows created before workflow_job_runs was introduced. */
+  runId: uuid('run_id').references(() => workflowJobRuns.id),
+  /** Physical successor number within one logical run; nullable for legacy rows. */
+  attemptSequence: integer('attempt_sequence'),
   /** Full job payload as enqueued — so a UI retry re-runs the job VERBATIM
    * (projectId/iteration/issues survive), instead of a lossy reconstruction. */
   payload: jsonb('payload'),
@@ -337,7 +361,13 @@ export const workflowJobs = pgTable('workflow_jobs', {
   startedAt: timestamp('started_at'),
   finishedAt: timestamp('finished_at'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
-}, (t) => [index('job_biz_idx').on(t.businessId), index('job_status_idx').on(t.status)]);
+}, (t) => [
+  index('job_biz_idx').on(t.businessId),
+  index('job_status_idx').on(t.status),
+  index('job_run_idx').on(t.runId),
+  uniqueIndex('job_run_sequence_idx').on(t.runId, t.attemptSequence)
+    .where(sql`${t.runId} is not null`),
+]);
 
 // ─── Settings (phase E) ──────────────────────────────────────────────────────
 

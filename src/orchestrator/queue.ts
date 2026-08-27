@@ -1,21 +1,25 @@
 import PgBoss from 'pg-boss';
 import { eq } from 'drizzle-orm';
 import { config } from '../config.js';
-import { db, schema } from '../db/client.js';
+import { db, pool, schema } from '../db/client.js';
 import { log } from '../lib/logger.js';
 import { notifyJobProblem, notifySubscriptionPause } from '../telegram/notify.js';
 import { isRateLimitedError } from '../agents/types.js';
 import {
   getJobDefinition,
-  validateJobPayload,
   type JobName,
 } from './jobDefinitions.js';
 import {
   ensureRequiredQueues,
   type QueueCreator,
 } from './queueReadiness.js';
+import {
+  WorkflowRunStore,
+  type EnqueueResult,
+} from './workflowRunStore.js';
 
 export type { JobName } from './jobDefinitions.js';
+export type { EnqueueResult } from './workflowRunStore.js';
 
 export interface JobPayload {
   campaignId?: string;
@@ -48,34 +52,16 @@ export async function enqueue(
   name: JobName,
   payload: JobPayload,
   opts: { startAfterSeconds?: number; priority?: number } = {},
-): Promise<string | null> {
-  const definition = getJobDefinition(name);
-  const payloadValidation = validateJobPayload(name, payload);
-  if (!payloadValidation.ok) {
-    throw new Error(`invalid ${name} payload: ${payloadValidation.issues.join('; ')}`);
-  }
+): Promise<EnqueueResult> {
   const b = await getBoss();
-  const singletonKey = payload.idempotencyKey
-    ?? (payload.businessId ? `${name}:${payload.businessId}` : `${name}:${payload.campaignId ?? 'global'}`);
-  const jobId = await b.send(name, payload, {
-    retryLimit: definition.retry.limit,
-    retryDelay: definition.retry.delaySeconds,
-    retryBackoff: true,
-    expireInSeconds: definition.expireInSeconds,
-    singletonKey, // idempotency: same key won't double-queue while active
-    // Higher runs first (pg-boss default 0). The build policy uses it so leads
-    // with no site at all are built before ones that already have some presence.
-    ...(opts.priority !== undefined ? { priority: opts.priority } : {}),
-    ...(opts.startAfterSeconds ? { startAfter: opts.startAfterSeconds } : {}),
+  const result = await new WorkflowRunStore(pool, b).enqueue({ name, payload, options: opts });
+  log.info(result.kind === 'accepted' ? 'job enqueued' : 'duplicate job suppressed', {
+    name,
+    runId: result.runId,
+    bossJobId: result.bossJobId,
+    ...payload,
   });
-  await db.insert(schema.workflowJobs).values({
-    bossJobId: jobId, jobType: name,
-    businessId: payload.businessId ?? null, campaignId: payload.campaignId ?? null,
-    payload: payload as Record<string, unknown>,
-    idempotencyKey: singletonKey, status: 'queued',
-  });
-  log.info('job enqueued', { name, jobId, ...payload });
-  return jobId;
+  return result;
 }
 
 /** Wrap a handler with job-journal + error routing. One business failing never stops the campaign. */
@@ -98,14 +84,32 @@ export async function register(name: JobName, handler: Handler): Promise<void> {
       const [jobRow] = await db.select().from(schema.workflowJobs)
         .where(eq(schema.workflowJobs.bossJobId, job.id));
       const attempt = (jobRow?.attempts ?? 0) + 1;
-      await db.update(schema.workflowJobs)
-        .set({ status: 'running', attempts: attempt, startedAt: new Date() })
-        .where(eq(schema.workflowJobs.bossJobId, job.id));
+      await db.transaction(async (tx) => {
+        await tx.update(schema.workflowJobs)
+          .set({
+            status: 'running', attempts: attempt, startedAt: new Date(),
+            finishedAt: null, nextAttemptAt: null,
+          })
+          .where(eq(schema.workflowJobs.bossJobId, job.id));
+        if (jobRow?.runId) {
+          await tx.update(schema.workflowJobRuns)
+            .set({ status: 'running', updatedAt: new Date(), finishedAt: null })
+            .where(eq(schema.workflowJobRuns.id, jobRow.runId));
+        }
+      });
       try {
         await handler(payload);
-        await db.update(schema.workflowJobs)
-          .set({ status: 'succeeded', finishedAt: new Date() })
-          .where(eq(schema.workflowJobs.bossJobId, job.id));
+        await db.transaction(async (tx) => {
+          const finishedAt = new Date();
+          await tx.update(schema.workflowJobs)
+            .set({ status: 'succeeded', finishedAt })
+            .where(eq(schema.workflowJobs.bossJobId, job.id));
+          if (jobRow?.runId) {
+            await tx.update(schema.workflowJobRuns)
+              .set({ status: 'succeeded', updatedAt: finishedAt, finishedAt })
+              .where(eq(schema.workflowJobRuns.id, jobRow.runId));
+          }
+        });
       } catch (err: any) {
         const detail = String(err?.stack ?? err).slice(0, 4000);
 
@@ -115,21 +119,34 @@ export async function register(name: JobName, handler: Handler): Promise<void> {
         if (isRateLimitedError(err)) {
           const waitMs = err.retryAfterMs;
           const nextAttemptAt = new Date(Date.now() + waitMs);
-          await db.update(schema.workflowJobs)
-            .set({
-              status: 'retry_wait',
-              // do not count this against the failure limit
-              attempts: Math.max(0, attempt - 1),
-              nextAttemptAt,
-              errorCode: 'RATE_LIMITED',
-              errorDetail: `subscription limit (${err.rateLimitType ?? 'unknown'}); resumes ${nextAttemptAt.toISOString()}`,
-              finishedAt: new Date(),
-            })
-            .where(eq(schema.workflowJobs.bossJobId, job.id));
-          await enqueue(name, { ...payload, idempotencyKey: jobRow?.idempotencyKey ?? payload.idempotencyKey },
-            { startAfterSeconds: Math.ceil(waitMs / 1000) });
+          const errorDetail = `subscription limit (${err.rateLimitType ?? 'unknown'}); resumes ${nextAttemptAt.toISOString()}`;
+          const continuation = await new WorkflowRunStore(pool, b).continueAfterRateLimit({
+            bossJobId: job.id,
+            retryAfterMs: waitMs,
+            errorDetail,
+            nextAttemptAt,
+          });
+          // Bounded compatibility for an attempt created before migration. U3
+          // reconciliation adopts live legacy rows before handlers register.
+          if (continuation.kind === 'legacy') {
+            await db.update(schema.workflowJobs)
+              .set({
+                status: 'retry_wait', attempts: Math.max(0, attempt - 1),
+                nextAttemptAt, errorCode: 'RATE_LIMITED', errorDetail,
+                finishedAt: new Date(),
+              })
+              .where(eq(schema.workflowJobs.bossJobId, job.id));
+            await enqueue(
+              name,
+              { ...payload, idempotencyKey: jobRow?.idempotencyKey ?? payload.idempotencyKey },
+              { startAfterSeconds: Math.ceil(waitMs / 1000) },
+            );
+          }
           log.warn('job parked on subscription limit', {
-            name, jobId: job.id, waitMinutes: Math.round(waitMs / 60_000),
+            name, jobId: job.id,
+            runId: continuation.kind === 'legacy' ? null : continuation.runId,
+            successorJobId: continuation.kind === 'legacy' ? null : continuation.bossJobId,
+            waitMinutes: Math.round(waitMs / 60_000),
             resumesAt: nextAttemptAt.toISOString(),
           });
           await notifySubscriptionPause({
@@ -140,14 +157,28 @@ export async function register(name: JobName, handler: Handler): Promise<void> {
         }
         const isFinalAttempt = attempt > definition.retry.limit;
         const needsHuman = err?.code === 'NEEDS_HUMAN';
-        await db.update(schema.workflowJobs)
-          .set({
-            status: needsHuman ? 'needs_human' : (isFinalAttempt ? 'failed' : 'queued'),
-            errorCode: err?.code ?? 'ERR',
-            errorDetail: detail,
-            finishedAt: new Date(),
-          })
-          .where(eq(schema.workflowJobs.bossJobId, job.id));
+        await db.transaction(async (tx) => {
+          const attemptStatus = needsHuman ? 'needs_human' : (isFinalAttempt ? 'failed' : 'queued');
+          const terminal = needsHuman || isFinalAttempt;
+          const finishedAt = new Date();
+          await tx.update(schema.workflowJobs)
+            .set({
+              status: attemptStatus,
+              errorCode: err?.code ?? 'ERR',
+              errorDetail: detail,
+              finishedAt,
+            })
+            .where(eq(schema.workflowJobs.bossJobId, job.id));
+          if (jobRow?.runId) {
+            await tx.update(schema.workflowJobRuns)
+              .set({
+                status: attemptStatus,
+                updatedAt: finishedAt,
+                finishedAt: terminal ? finishedAt : null,
+              })
+              .where(eq(schema.workflowJobRuns.id, jobRow.runId));
+          }
+        });
         log.error('job failed', { name, jobId: job.id, attempt, err: detail.slice(0, 500) });
         if (needsHuman || isFinalAttempt) {
           await notifyJobProblem({

@@ -43,6 +43,7 @@ import {
 import {
   FIXTURE_CAMPAIGN, ROOT, createCampaign, createBusiness, createSiteProject,
   createApproval, createFailedJob, createNeedsHumanVisualQaJob,
+  createLogicalJobRun, createBlockedEnrichment,
   destroyFixtures, leftoverFixtures,
 } from './e2e/fixtures.js';
 
@@ -291,9 +292,17 @@ async function checkDataTruth(browser: import('playwright').Browser): Promise<vo
   await checking('Система: queue widget matches workflow_jobs', async () => {
     await page.goto(`${BASE}/settings/system`, { waitUntil: 'networkidle' });
     const text = await page.evaluate(() => document.body.innerText);
-    const queued = await count(`select count(*)::int n from workflow_jobs where status = 'queued'`);
-    const running = await count(`select count(*)::int n from workflow_jobs where status = 'running'`);
-    const failed = await count(`select count(*)::int n from workflow_jobs where status in ('failed','needs_human')`);
+    const logicalCount = (statuses: string[]) => count(
+      `select count(*)::int n
+       from workflow_jobs w
+       left join workflow_job_runs r on r.id = w.run_id
+       where (w.run_id is null or w.attempt_sequence = r.current_attempt_sequence)
+         and coalesce(r.status, w.status) = any($1::text[])`,
+      [statuses],
+    );
+    const queued = await logicalCount(['queued']);
+    const running = await logicalCount(['running']);
+    const failed = await logicalCount(['failed', 'needs_human']);
     // The bug was two widgets disagreeing. Any number the page prints for these
     // three concepts must be one of the true values, and the true values must
     // appear at all.
@@ -902,6 +911,20 @@ async function checkJobsUx(browser: import('playwright').Browser): Promise<void>
   });
   const jobId = await createFailedJob(jobBiz, 'enrich');
 
+  const stateBiz = await createBusiness({
+    id: 'e2e-fixture-job-states', name: 'E2E Job States Salon', status: 'needs_review',
+  });
+  await Promise.all([
+    createLogicalJobRun({ biz: stateBiz, status: 'queued', attemptStatuses: ['queued'], duplicateSuppressions: 3 }),
+    createLogicalJobRun({ biz: stateBiz, status: 'running', attemptStatuses: ['running'], jobType: 'collect-assets' }),
+    createLogicalJobRun({ biz: stateBiz, status: 'retry_wait', attemptStatuses: ['retry_wait'], jobType: 'audit-website' }),
+    createLogicalJobRun({ biz: stateBiz, status: 'succeeded', attemptStatuses: ['succeeded'], jobType: 'score-and-qa' }),
+    createLogicalJobRun({ biz: stateBiz, status: 'failed', attemptStatuses: ['cancelled', 'failed'], jobType: 'build-site' }),
+    createLogicalJobRun({ biz: stateBiz, status: 'needs_human', attemptStatuses: ['needs_human'], jobType: 'visual-qa' }),
+    createLogicalJobRun({ biz: stateBiz, status: 'cancelled', attemptStatuses: ['cancelled'], jobType: 'deploy-demo' }),
+  ]);
+  await createBlockedEnrichment(stateBiz);
+
   await checking('failed job shows in Система with a Ukrainian status', async () => {
     await page.goto(`${BASE}/settings/system`, { waitUntil: 'networkidle' });
     const text = await page.evaluate(() => document.body.innerText);
@@ -911,6 +934,35 @@ async function checkJobsUx(browser: import('playwright').Browser): Promise<void>
       throw new Error('job listed by raw id, not by business name');
     }
     return 'listed';
+  });
+
+  await checking('logical runs render attempts, duplicate suppression and blocked fan-in', async () => {
+    await page.goto(`${BASE}/settings/system`, { waitUntil: 'networkidle' });
+    const text = await page.evaluate(() => document.body.innerText);
+    for (const expected of [
+      stateBiz.name,
+      'дублів пригнічено: 3',
+      '2 спроби · поточна #2',
+      'Пауза: ліміт підписки',
+      'заблоковано:',
+      'collect-assets failed after durable evidence capture',
+      'Agent runner',
+    ]) {
+      if (!text.includes(expected)) throw new Error(`missing system state: ${expected}`);
+    }
+    if (!/Agent runner[\s\S]{0,180}(ok|degraded)/.test(text)) {
+      throw new Error('runner state is neither ok nor degraded');
+    }
+    return 'logical/attempt, duplicate, retry-wait, barrier and runner states rendered';
+  });
+
+  await checking('retry_wait filter keeps the parked logical run', async () => {
+    await page.goto(`${BASE}/settings/system?status=retry_wait`, { waitUntil: 'networkidle' });
+    const text = await page.evaluate(() => document.body.innerText);
+    if (!text.includes(stateBiz.name) || !text.includes('Пауза: ліміт підписки')) {
+      throw new Error('parked fixture run missing behind retry_wait filter');
+    }
+    return 'parked run visible';
   });
 
   /**

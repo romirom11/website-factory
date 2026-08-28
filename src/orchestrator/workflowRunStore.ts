@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import type PgBoss from 'pg-boss';
-import { and, desc, eq, inArray } from 'drizzle-orm';
+import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
 import * as schema from '../db/schema.js';
 import {
@@ -199,6 +199,11 @@ export class WorkflowRunStore {
       if (!existingRun) {
         throw new Error(`active workflow run conflict disappeared for ${command.name}:${key}`);
       }
+      await tx.update(schema.workflowJobRuns).set({
+        duplicateSuppressions: sql`${schema.workflowJobRuns.duplicateSuppressions} + 1`,
+        lastDuplicateAt: new Date(),
+        updatedAt: new Date(),
+      }).where(eq(schema.workflowJobRuns.id, existingRun.id));
       const [attempt] = await tx.select().from(schema.workflowJobs)
         .where(eq(schema.workflowJobs.runId, existingRun.id))
         .orderBy(desc(schema.workflowJobs.attemptSequence))

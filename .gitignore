@@ -2,6 +2,7 @@ node_modules/
 **/node_modules/
 dist/
 *.log
+.artifacts/
 
 # Secrets. `.env.example` is the committed template.
 .env

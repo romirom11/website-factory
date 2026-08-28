@@ -1,3 +1,4 @@
+import Link from 'next/link';
 import { Badge } from '@/components/Badge';
 import type { SystemStatus } from '@/lib/systemStatus';
 
@@ -19,7 +20,9 @@ export function SystemStatusPanel({ status }: { status: SystemStatus }) {
             <span className="text-sm text-ink">{s.label}</span>
             <span className="flex items-center gap-2">
               <span className="text-xs text-ink-mute truncate max-w-[10rem]" title={s.detail}>{s.detail}</span>
-              <Badge tone={s.ok ? 'ok' : 'bad'}>{s.ok ? 'ok' : 'down'}</Badge>
+              <Badge tone={s.ok ? 'ok' : s.degraded ? 'warn' : 'bad'}>
+                {s.ok ? 'ok' : s.degraded ? 'degraded' : 'down'}
+              </Badge>
             </span>
           </div>
         ))}
@@ -72,10 +75,41 @@ export function SystemStatusPanel({ status }: { status: SystemStatus }) {
           <div className="flex flex-wrap gap-2 text-sm">
             <Badge tone="info">в черзі: {status.jobs.queued}</Badge>
             <Badge tone={status.jobs.active > 0 ? 'ok' : 'idle'}>в роботі: {status.jobs.active}</Badge>
+            <Badge tone={status.jobs.retryWait > 0 ? 'warn' : 'idle'}>
+              пауза до retry: {status.jobs.retryWait}
+            </Badge>
             <Badge tone={status.jobs.failed > 0 ? 'bad' : 'idle'}>failed: {status.jobs.failed}</Badge>
           </div>
         ) : (
           <p className="text-sm text-ink-mute">Ledger черги ще не ініціалізований.</p>
+        )}
+      </div>
+
+      <div>
+        <h3 className="mb-2 text-xs uppercase tracking-wide text-ink-mute">Enrichment barrier</h3>
+        {status.enrichment ? (
+          <div className="space-y-2">
+            <div className="flex flex-wrap gap-2 text-sm">
+              <Badge tone={status.enrichment.waiting > 0 ? 'info' : 'idle'}>
+                чекають fan-in: {status.enrichment.waiting}
+              </Badge>
+              <Badge tone={status.enrichment.blocked > 0 ? 'bad' : 'idle'}>
+                заблоковано: {status.enrichment.blocked}
+              </Badge>
+            </div>
+            {status.enrichment.recentBlocked.length > 0 && (
+              <ul className="space-y-1 text-sm text-ink-mute">
+                {status.enrichment.recentBlocked.map((run) => (
+                  <li key={run.id}>
+                    <Link className="link" href={`/businesses/${run.id}`}>{run.name}</Link>
+                    {' · '}{run.reason}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        ) : (
+          <p className="text-sm text-ink-mute">Barrier ledger ще не ініціалізований.</p>
         )}
       </div>
     </section>

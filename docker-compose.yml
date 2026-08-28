@@ -397,6 +397,7 @@ services:
       # that owns each dependency (agent checks continue to the runner).
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
       FACTORY_API_URL: ${FACTORY_API_URL:-http://factory:8787}
+      RUNNER_GATEWAY_URL: http://agent-runner-gateway:8790
       # Read-only fallbacks for the status panel and the WAHA QR proxy; the
       # effective values still come from the settings table first.
       GOSOM_URL: http://gosom:8080

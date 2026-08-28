@@ -43,6 +43,23 @@ export function followupIdempotencyKey(approvalId: number, index: number): strin
 /** States that count as "this message exists, do not create another". */
 const LIVE_STATES = ['queued', 'sent', 'delivered', 'simulated', 'manual_pending'];
 
+/** Live delivery is a two-key switch: global factory AND campaign must opt in. */
+export function resolveOutreachMode(
+  factoryMode: string,
+  campaignMode: string | null | undefined,
+): 'dry_run' | 'live' {
+  return factoryMode === 'live' && campaignMode === 'live' ? 'live' : 'dry_run';
+}
+
+async function outreachModeForBusiness(businessId: string): Promise<'dry_run' | 'live'> {
+  const [row] = await db.select({ campaignMode: schema.campaigns.mode })
+    .from(schema.businesses)
+    .innerJoin(schema.campaigns, eq(schema.campaigns.id, schema.businesses.campaignId))
+    .where(eq(schema.businesses.id, businessId));
+  if (!row) throw new Error(`business or campaign not found: ${businessId}`);
+  return resolveOutreachMode(config.mode, row.campaignMode);
+}
+
 async function dailySendCount(): Promise<number> {
   const since = new Date(Date.now() - 24 * 3600 * 1000);
   const rows = await db.select({ n: sql<number>`count(*)` }).from(schema.outreachMessages)
@@ -90,11 +107,16 @@ export async function sendOutreachHandler(job: JobPayload): Promise<void> {
     .orderBy(desc(schema.approvals.decidedAt)).limit(1);
   if (!approval) throw new Error(`no recorded approval for ${businessId}; refusing to send`);
 
-  const [business] = await db.select({ status: schema.businesses.status })
+  const [business] = await db.select({
+    status: schema.businesses.status,
+    campaignMode: schema.campaigns.mode,
+  })
     .from(schema.businesses)
+    .innerJoin(schema.campaigns, eq(schema.campaigns.id, schema.businesses.campaignId))
     .where(eq(schema.businesses.id, businessId));
   if (!business) throw new Error(`business not found: ${businessId}`);
   const expectedStatus = requireBusinessStatus(business.status, `business ${businessId}`);
+  const outreachMode = resolveOutreachMode(config.mode, business.campaignMode);
   if (expectedStatus !== 'outreach_approved') {
     log.info('outreach skipped: approval is stale for current business status', {
       businessId,
@@ -175,7 +197,7 @@ export async function sendOutreachHandler(job: JobPayload): Promise<void> {
       log.info('manual channel: waiting for Roman to send from the UI', {
         businessId, channel: draft.channel, approvalId: approval.id,
       });
-    } else if (config.mode === 'dry_run') {
+    } else if (outreachMode === 'dry_run') {
       const res = await adapter.sendDryRun(draft, { idempotencyKey: expectedKey });
       state = res.state;
       providerMessageId = res.providerMessageId;
@@ -198,7 +220,7 @@ export async function sendOutreachHandler(job: JobPayload): Promise<void> {
   await db.insert(schema.outreachEvents).values({
     businessId, messageId: msg.id,
     event: state === 'manual_pending' ? 'queued_manual' : 'sent',
-    detail: { channel: draft.channel, state, mode: config.mode, approvalId: approval.id },
+    detail: { channel: draft.channel, state, mode: outreachMode, approvalId: approval.id },
   });
 
   // Manual channels only become `contacted` once Roman confirms he sent it.
@@ -309,6 +331,7 @@ export async function sendFollowupHandler(job: JobPayload): Promise<void> {
   const businessId = job.businessId!;
   const idx = job.followupIndex as number;
   const approvalId = job.approvalId as number | undefined;
+  const outreachMode = await outreachModeForBusiness(businessId);
 
   const [initial] = await db.select().from(schema.outreachMessages)
     .where(and(eq(schema.outreachMessages.businessId, businessId), eq(schema.outreachMessages.kind, 'initial')))
@@ -363,7 +386,7 @@ export async function sendFollowupHandler(job: JobPayload): Promise<void> {
         deepLink: deepLinkFor(draft),
         body,
       }).catch((err) => log.warn('manual followup notification failed', { businessId, err: String(err) }));
-    } else if (config.mode === 'dry_run') {
+    } else if (outreachMode === 'dry_run') {
       const res = await adapter.sendDryRun(draft, { idempotencyKey: key });
       state = res.state;
       providerMessageId = res.providerMessageId;
@@ -387,7 +410,7 @@ export async function sendFollowupHandler(job: JobPayload): Promise<void> {
     .where(eq(schema.outreachMessages.id, msg.id));
   await db.insert(schema.outreachEvents).values({
     businessId, messageId: msg.id, event: state === 'manual_pending' ? 'queued_manual' : 'sent',
-    detail: { kind: `followup_${idx}`, state, channel },
+    detail: { kind: `followup_${idx}`, state, channel, mode: outreachMode },
   });
   log.info('followup processed', { businessId, idx, state });
 }

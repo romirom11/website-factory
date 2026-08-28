@@ -326,6 +326,10 @@ export const workflowJobRuns = pgTable('workflow_job_runs', {
   // queued | running | retry_wait | succeeded | failed | needs_human | cancelled
   status: text('status').notNull().default('queued'),
   currentAttemptSequence: integer('current_attempt_sequence').notNull().default(1),
+  /** Number of enqueue commands intentionally collapsed into this active run. */
+  duplicateSuppressions: integer('duplicate_suppressions').notNull().default(0),
+  /** Lets the operator distinguish an old run from current duplicate traffic. */
+  lastDuplicateAt: timestamp('last_duplicate_at'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
   updatedAt: timestamp('updated_at').notNull().defaultNow(),
   finishedAt: timestamp('finished_at'),

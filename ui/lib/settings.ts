@@ -299,7 +299,7 @@ export async function loadHeartbeats(): Promise<HeartbeatView[]> {
   }).sort((a, b) => a.group.localeCompare(b.group));
 }
 
-export interface PendingJobs { queued: number; active: number; failed: number }
+export interface PendingJobs { queued: number; active: number; retryWait: number; failed: number }
 
 /**
  * Queue depth, read from `workflow_jobs` — the SAME table the filter chips
@@ -332,13 +332,24 @@ export async function loadPendingJobs(): Promise<PendingJobs | null> {
       select
         count(*) filter (where coalesce(r.status, w.status) = 'queued')::int as queued,
         count(*) filter (where coalesce(r.status, w.status) = 'running')::int as active,
+        count(*) filter (where coalesce(r.status, w.status) = 'retry_wait')::int as retry_wait,
         count(*) filter (where coalesce(r.status, w.status) in ('failed', 'needs_human'))::int as failed
       from workflow_jobs w
       left join workflow_job_runs r on r.id = w.run_id
       where w.run_id is null or w.attempt_sequence = r.current_attempt_sequence
     `);
-    const r = (res.rows as Array<{ queued: number; active: number; failed: number }>)[0];
-    return r ? { queued: Number(r.queued), active: Number(r.active), failed: Number(r.failed) } : null;
+    const r = (res.rows as Array<{
+      queued: number;
+      active: number;
+      retry_wait: number;
+      failed: number;
+    }>)[0];
+    return r ? {
+      queued: Number(r.queued),
+      active: Number(r.active),
+      retryWait: Number(r.retry_wait),
+      failed: Number(r.failed),
+    } : null;
   } catch {
     return null;
   }

@@ -1,7 +1,7 @@
 # Websites Factory – специфікація v2
 
-**Статус:** чернетка на затвердження Романом. Код за цією спекою НЕ будується, доки Роман не затвердить документ.
-**Дата:** 2026-08-16
+**Статус:** авторитетна затверджена специфікація реалізованої системи.
+**Дата:** 2026-08-16; операційно звірено 2026-08-28.
 **Замінює:** FACTORYFLOW.md (цільова спека v1) в частині архітектурних рішень; правила evidence, gates і меж автоматизації з v1 успадковуються повністю.
 **Контекст:** у репозиторії вже є прототип (v0, коміти cfc9e57 і 6abb713). Він вважається чернеткою реалізації: після затвердження цієї спеки він приводиться у відповідність до неї, розбіжності вирішуються на користь спеки.
 
@@ -19,12 +19,13 @@
 → персоналізований демосайт
 → автоматичний QA
 → приватний deploy
-→ Telegram-картка Роману
-→ [approve] → outreach каналом, який є у бізнеса
+→ Telegram-сповіщення з лінком у Web UI
+→ [approve у Web UI] → outreach каналом, який є у бізнеса
 → follow-ups → replies → won/lost
 ```
 
-Одна-єдина ручна дія в циклі: рішення Approve/Reject у Telegram. Все інше автоматичне.
+Одна-єдина ручна дія в циклі: рішення Approve/Reject у Web UI. Telegram лише
+сповіщає та відкриває потрібну картку; команд і approval-кнопок у боті немає.
 
 ---
 
@@ -61,7 +62,12 @@
 
 ### 2.3 Агентний шар: тільки через підписку, без API-білінгу
 
-**Оплата:** весь агентний шар працює через **Claude Code з авторизацією підпискою** (Pro/Max), НЕ через Anthropic API. Механіка: на сервері один раз виконується `claude setup-token` (OAuth-логін акаунтом Романа), отриманий токен живе в `.env` як `CLAUDE_CODE_OAUTH_TOKEN`. Agent SDK запускає той самий Claude Code, тому вся робота тарифікується підпискою. `ANTHROPIC_API_KEY` ніде не вимагається.
+**Оплата:** весь агентний шар працює через subscription CLI, НЕ через
+pay-per-token API. Account flow у `/settings/accounts` запускає login у
+ізольованому runner executor; Claude/Codex credentials живуть тільки в окремих
+runner volumes і невидимі factory/gateway. Agent SDK запускає той самий Claude
+Code, тому робота тарифікується підпискою. `ANTHROPIC_API_KEY` ніде не
+вимагається.
 
 | Режим | Де застосовується | Механіка |
 |---|---|---|
@@ -70,7 +76,11 @@
 
 **Ліміти підписки як частина дизайну:** у Pro/Max є 5-годинні вікна і тижневі стелі. Тому: (а) конкурентність агентних jobs обмежена (1-2 одночасно, конфіг); (б) вичерпане вікно = job переходить у `retry_wait` до відновлення ліміту, НЕ у failed; черга продовжує сама; (в) у UI видно, що пайплайн стоїть через ліміт підписки, а не через помилку.
 
-**Альтернативний runtime: Codex CLI** (авторизація підпискою ChatGPT, headless через `codex exec`). Реалізується тим самим інтерфейсом адаптера; runtime обирається конфігом глобально або на тип job (наприклад builder на Codex, решта на Claude Code). Hermes вирішено не інтегрувати.
+**Альтернативні runtimes:** Codex CLI (підписка ChatGPT) та OpenCode provider
+login реалізують той самий adapter interface. Runtime обирається глобально в
+UI для всіх agent stages. OpenCode tool-free structured path дозволений;
+tool-enabled builder у production fail-closed заборонений через відсутність
+enforceable OS sandbox у CLI.
 
 ### 2.4 Дизайн і моушн: проти ШІ-слоупу
 
@@ -192,7 +202,12 @@ Job: `queued → running → succeeded | retry_wait | failed | needs_human | can
 
 ## 9. Спостереження
 
-Telegram: пуші про failed jobs, needs_human, готові до approve демо, replies, daily summary, кожен з лінком у відповідне місце UI. UI: воронка, бізнеси, approval-черга, jobs, помилки. Логи структуровані JSON з campaign_id/business_id/job_id. Метрики: discovered, dedup rate, qualified rate, production-ready rate, build success rate, QA-ітерації, cost per demo (з агентних витрат), reply rate, win rate.
+Telegram: пуші про failed jobs, needs_human, готові до approve демо, replies,
+daily summary, кожен з лінком у відповідне місце UI. UI: воронка, бізнеси,
+approval-черга, logical jobs/attempts, runner health, blocked barriers і помилки.
+Логи — redacted JSON з `campaignId`, `businessId`, `runId`/`jobId`. Операційні
+метрики: discovered, dedup/suppression rate, qualified/production-ready rate,
+build success, QA-ітерації, wall time per demo, reply rate і win rate.
 
 ---
 
@@ -222,7 +237,10 @@ Telegram: пуші про failed jobs, needs_human, готові до approve д
 7. **Email-екстракція gosom**: ввімкнена з першої кампанії.
 8. **Пріоритет каналів outreach**: живі месенджери перед поштою. WhatsApp (авто через WAHA) → Instagram (ручна відправка з UI) → Viber (ручна відправка з UI) → email як fallback, коли месенджерів у бізнеса немає. Approval показує, який канал обраний і чому; канал можна змінити перед Approve.
 9. **Керування через веб-UI (Next.js), не через Telegram.** Telegram лишається тільки каналом сповіщень з лінками в UI. Approval-черга, редагування повідомлень, зміна каналу, ручні дії з бізнесами і кампаніями - все у веб-застосунку.
-10. **Агенти працюють по підписці, не по API.** Claude Code з `CLAUDE_CODE_OAUTH_TOKEN` (підписка Pro/Max) як основний runtime; Codex CLI (підписка ChatGPT) як альтернативний адаптер. Жодного pay-per-token білінгу; вичерпані ліміти підписки ставлять агентні jobs на паузу, а не валять їх.
+10. **Агенти працюють по підписці, не по API.** Claude Code (Pro/Max), Codex
+CLI (ChatGPT) або tool-free OpenCode provider login живуть в ізольованому
+runner. Жодного pay-per-token білінгу; вичерпані ліміти підписки ставлять
+agent jobs на паузу, а не валять їх.
 11. **Дизайн-стек:** готові компоненти (Aceternity + Magic UI в шаблоні) + офіційні GSAP skills + куровані референси на нішу. Кастомні дизайн-skills не пишемо. (Розділ 2.4.)
 12. **Відео: авто Ken Burns + ручний wow-кліп** (змінено 2026-08-22; було: FlowKit/Chrome-міст — видалено, бо кожен міст до Flow потребує живого Chrome поза датацентром, а на маку Роман нічого не тримає). Базово — ffmpeg Ken Burns з реального фото; wow — відео-бриф на картці бізнесу, Роман генерує і завантажує mp4, наступна збірка підхоплює. Без pay-per-use відео-API. (Розділ 2.5.)
 13. **Зображення через gen-image skill Романа** (Codex CLI, gpt-image-2, підписка ChatGPT): декор/фони/патерни/og-images з позначкою `ai_generated`; ніколи не замінюють реальні фото бізнесу. (Розділ 2.5.)
@@ -245,4 +263,8 @@ Telegram: пуші про failed jobs, needs_human, готові до approve д
 
 **3. Запуск кампанії** - форма в UI (CLI лишається для дебага).
 
-Одноразовий сетап при розгортанні: `claude setup-token` (логін підпискою, токен у `.env`), Gmail app password, Telegram token, пароль UI, відсканувати QR-код WAHA телефоном з номером для розсилки, створити Telegram-бота через BotFather. Після цього фабрика самодостатня: рестарти переживає, стан у Postgres, черга сама добирає незавершені jobs.
+Одноразовий сетап при розгортанні: provider login через `/settings/accounts`
+(credential тільки в runner volume), Gmail app password, Telegram token,
+пароль UI, QR-код WAHA окремим номером і Telegram-бот через BotFather. Після
+цього фабрика самодостатня: рестарти переживає, стан у Postgres, черга сама
+добирає незавершені jobs.

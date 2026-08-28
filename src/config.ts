@@ -182,7 +182,7 @@ export const config = {
      * nothing on the mac. Wow-video is uploaded from the business card instead.
      */
     get heroClipSeconds(): number { return Number(process.env.HERO_CLIP_DURATION_SECONDS ?? 8); },
-    /** ffmpeg is only needed for the mock/Ken Burns path; absence degrades, never crashes. */
+    /** ffmpeg renders the deterministic Ken Burns clip; absence degrades, never crashes. */
     get ffmpegBin(): string { return process.env.FFMPEG_BIN ?? 'ffmpeg'; },
     /**
      * Generate one decorative background per demo (phase C build prep).

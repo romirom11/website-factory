@@ -5,7 +5,7 @@
  * Proves the whole live outreach cycle WITHOUT Roman's Gmail app password and
  * without a single byte leaving the machine:
  *
- *   fixture business (campaign phaseE-fixture-*) with an email contact
+ *   fixture business (campaign e2e-phasee-*) with an email contact
  *     -> approvals row (decision=approved)
  *     -> send-outreach handler, FACTORY_MODE=live, real SMTP to GreenMail
  *     -> message verified INSIDE the mailbox over IMAP
@@ -14,7 +14,7 @@
  *     -> follow-up refuses to send
  *   plus the bounce path, the opt-out path, and the WAHA webhook path.
  *
- * Safety: every row this script creates lives under a `phaseE-fixture-*`
+ * Safety: every row this script creates lives under an `e2e-phasee-*`
  * campaign and is deleted at the end. It NEVER touches gr-patras-beauty — and
  * could not send to it anyway: a send is impossible without an approvals row,
  * and those businesses have none.
@@ -68,7 +68,8 @@ const { ping: wahaPing, sessionReady } = await import('../src/channels/waha.js')
 const { createHmac } = await import('node:crypto');
 
 const KEEP = process.argv.includes('--keep');
-const CAMPAIGN = `phaseE-fixture-${Date.now()}`;
+const { assertFixtureId } = await import('./e2e/safety.js');
+const CAMPAIGN = assertFixtureId(`e2e-phasee-${Date.now()}`, 'campaign');
 const BIZ_EMAIL = `${CAMPAIGN}-mail`;
 const BIZ_BOUNCE = `${CAMPAIGN}-bounce`;
 const BIZ_OPTOUT = `${CAMPAIGN}-optout`;
@@ -98,6 +99,7 @@ function section(title: string): void {
  * `outreach_approved -> contacted` transition rather than being forced.
  */
 async function makeBusiness(id: string, name: string): Promise<void> {
+  assertFixtureId(id, 'business');
   await db.insert(schema.businesses).values({
     id, campaignId: CAMPAIGN, name, normalizedName: name.toLowerCase(),
     status: 'outreach_approved', placeId: `${id}-place`,
@@ -105,6 +107,7 @@ async function makeBusiness(id: string, name: string): Promise<void> {
 }
 
 async function approve(businessId: string, channel: string, toAddress: string, subject: string | null, body: string) {
+  assertFixtureId(businessId, 'business');
   const [row] = await db.insert(schema.approvals).values({
     businessId, kind: 'outreach', decision: 'approved', decidedBy: 'phaseE-e2e',
     decidedAt: new Date(),
@@ -429,10 +432,11 @@ async function main(): Promise<void> {
 
   section('9. WAHA: recorded webhook payload -> reply event');
   const waApproval = await approve(BIZ_WA, 'whatsapp', WA_PHONE, null, 'Привіт! Зробив демо для вас.');
-  // dry_run for this one: a live WhatsApp send needs Roman's paired phone.
-  (config as any).mode = 'dry_run';
+  // Campaign-level dry_run is a hard delivery gate even though this process is
+  // globally live against GreenMail. A real WhatsApp send needs Roman's phone.
+  await db.update(schema.campaigns).set({ mode: 'dry_run' }).where(eq(schema.campaigns.id, CAMPAIGN));
   await sendOutreachHandler({ businessId: BIZ_WA, idempotencyKey: sendIdempotencyKey(waApproval.id) });
-  (config as any).mode = 'live';
+  await db.update(schema.campaigns).set({ mode: 'live' }).where(eq(schema.campaigns.id, CAMPAIGN));
   const [waMsg] = await db.select().from(schema.outreachMessages)
     .where(eq(schema.outreachMessages.businessId, BIZ_WA));
   check('whatsapp outreach simulated (dry_run)', waMsg?.state === 'simulated', waMsg?.state ?? '');

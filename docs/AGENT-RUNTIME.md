@@ -180,7 +180,14 @@ OpenCode 1.18 має permission rules, але не має enforceable OS sandbox
 
 ## Конкурентність
 
-Factory передає worker-group і її актуальний ліміт у кожному runner request. Executor відновлює окремі `core` / `enrich` / `build` семафори через `withAgentSlot`; attachable terminal додатково має окремий ліміт 1 через єдиний ttyd-порт. Другий пояс: агентні типи jobs (`enrich`, `score-and-qa`, `content-and-design`, `build-site`, `visual-qa`, `request-approval`) реєструються в pg-boss з `teamSize: 1, batchSize: 1`, і їм дається довший `expireInSeconds` (90 хв), бо збірка сайту з `pnpm build` довга.
+Factory передає worker-group і її актуальний ліміт у кожному runner request.
+Executor відновлює окремі `core` / `enrich` / `build` семафори через
+`withAgentSlot`; attachable terminal додатково має окремий ліміт 1 через єдиний
+ttyd-порт. На стороні черги `WorkerConsumerPool` підтримує потрібну кількість
+окремих pg-boss consumer handles для кожної групи (`batchSize: 1`, priority
+увімкнений). Отже, фактична capacity видима в heartbeat і змінюється без
+застарілого `teamSize` припущення. Агентні job definitions мають довший
+`expireInSeconds` (90 хв), бо збірка сайту з `pnpm build` довга.
 
 ## Docker
 

@@ -14,6 +14,7 @@
  * the fact that nothing else moved.
  */
 import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { assertFixtureId, sql, sqlOne, FIXTURE_PREFIX } from './harness.js';
 
@@ -216,6 +217,67 @@ export async function createFailedJob(biz: FixtureBusiness, jobType = 'enrich'):
   return row!.id;
 }
 
+/** A native logical run plus its append-only physical attempt history. */
+export async function createLogicalJobRun(input: {
+  biz: FixtureBusiness;
+  status: string;
+  attemptStatuses: string[];
+  jobType?: string;
+  duplicateSuppressions?: number;
+}): Promise<string> {
+  assertFixtureId(input.biz.id);
+  if (input.attemptStatuses.length === 0) throw new Error('logical fixture run needs at least one attempt');
+  const runId = randomUUID();
+  const jobType = input.jobType ?? 'enrich';
+  const currentAttemptSequence = input.attemptStatuses.length;
+  const idempotencyKey = `${FIXTURE_PREFIX}run:${input.biz.id}:${input.status}:${runId}`;
+  await sql(
+    `insert into workflow_job_runs
+       (id, job_type, idempotency_key, business_id, campaign_id, status,
+        current_attempt_sequence, duplicate_suppressions, last_duplicate_at,
+        created_at, updated_at, finished_at)
+     values ($1, $2, $3, $4, $5, $6, $7, $8,
+       case when $8::int > 0 then now() else null end,
+       now(), now(), case when $6 in ('queued','running','retry_wait') then null else now() end)`,
+    [runId, jobType, idempotencyKey, input.biz.id, FIXTURE_CAMPAIGN, input.status,
+      currentAttemptSequence, input.duplicateSuppressions ?? 0],
+  );
+  for (const [index, status] of input.attemptStatuses.entries()) {
+    const terminal = !['queued', 'running', 'retry_wait'].includes(status);
+    await sql(
+      `insert into workflow_jobs
+         (job_type, business_id, campaign_id, idempotency_key, run_id,
+          attempt_sequence, status, attempts, error_code, error_detail,
+          next_attempt_at, started_at, finished_at, created_at)
+       values ($1, $2, $3, $4, $5, $6, $7, $8,
+         case when $7 in ('failed','needs_human') then 'E2E_STATE' else null end,
+         case when $7 in ('failed','needs_human') then 'e2e fixture state detail' else null end,
+         case when $7 = 'retry_wait' then now() + interval '20 minutes' else null end,
+         case when $7 <> 'queued' then now() else null end,
+         case when $9::boolean then now() else null end,
+         now() - (($6::int - 1) * interval '1 minute'))`,
+      [jobType, input.biz.id, FIXTURE_CAMPAIGN, idempotencyKey, runId,
+        index + 1, status, index + 1, terminal],
+    );
+  }
+  return runId;
+}
+
+/** A durable fan-in failure for the operator's blocked-enrichment state. */
+export async function createBlockedEnrichment(biz: FixtureBusiness): Promise<string> {
+  assertFixtureId(biz.id);
+  const runId = randomUUID();
+  await sql(
+    `insert into enrichment_runs
+       (id, business_id, campaign_id, generation, source, status,
+        assets_status, audit_status, blocking_reason, created_at, updated_at, completed_at)
+     values ($1, $2, $3, 1, 'native', 'blocked', 'failed', 'succeeded',
+       'collect-assets failed after durable evidence capture', now(), now(), now())`,
+    [runId, biz.id, FIXTURE_CAMPAIGN],
+  );
+  return runId;
+}
+
 /** The workflow-journal half of a build waiting for Roman's QA decision. */
 export async function createNeedsHumanVisualQaJob(
   biz: FixtureBusiness,
@@ -272,7 +334,7 @@ export async function destroyFixtures(): Promise<void> {
     'outreach_events', 'outreach_messages', 'approvals', 'deals', 'do_not_contact',
     'site_projects', 'production_gaps', 'qualifications', 'website_audits',
     'business_facts', 'business_contacts', 'business_sources',
-    'status_history', 'workflow_jobs',
+    'status_history', 'workflow_jobs', 'enrichment_runs',
   ];
   for (const table of byBusiness) {
     const col = table === 'do_not_contact' ? 'value' : 'business_id';
@@ -302,6 +364,7 @@ export async function leftoverFixtures(): Promise<string[]> {
     ['campaigns', 'id', like],
     ['workflow_jobs', 'business_id', like],
     ['workflow_job_runs', 'business_id', like],
+    ['enrichment_runs', 'business_id', like],
     ['production_gaps', 'business_id', like],
     ['approvals', 'business_id', like],
     ['outreach_messages', 'business_id', like],

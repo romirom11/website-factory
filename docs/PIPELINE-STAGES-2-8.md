@@ -10,12 +10,23 @@ prequalified
    └─ enrich ──────────────► enriching
         ├─► collect-assets   (етап 5)
         └─► audit-website    (етап 6)
-                └─► score-and-qa   (етап 7) ──► qualified | needs_review | rejected
+                └─► durable fan-in barrier
+                         └─► score-and-qa   (етап 7) ──► qualified | needs_review
                         └─► readiness-gate (етап 8) ──► production_ready | needs_review
 ```
 
 Переходи статусів робить **тільки код** (`src/orchestrator/statuses.ts`).
 Агент ніколи не вирішує, куди йде бізнес — він лише витягує і пояснює.
+
+## Durable fan-in між етапами 4–7
+
+Один `enrichment_runs` generation володіє двома branch states: assets і audit.
+`score-and-qa` може enqueue-ити тільки barrier, рівно один раз і лише коли
+обидві гілки поточного generation записали `succeeded`. Failed/blocked branch
+переводить generation у `blocked` з причиною, яка видима в
+`/settings/system`; частковий evidence package не оцінюється. Повторний enrich
+створює новий generation і supersede-ить старий, тому пізній worker не може
+розблокувати застарілий пакет.
 
 ## Етап 3 — швидка кваліфікація (`fastQualify.ts`)
 
@@ -360,6 +371,7 @@ pnpm tsx scripts/test-social-match.ts       # 65 тестів: матчер со
 pnpm tsx scripts/phaseB-test-grounding.ts   # 42 тести: анти-галюцинації
 pnpm tsx scripts/phaseB-test-stages.ts <csv> # 37 тестів: етапи 3/5/8 + парсер gosom
 pnpm tsx scripts/phaseB-test-contradiction.ts # гілка суперечності аудиту (потребує БД)
+pnpm test:enrichment-barrier              # CAS/fan-in проти real Postgres
 pnpm tsx scripts/phaseB-scan-messengers.ts <campaign> # аудит сирих байтів на маркери месенджерів
 
 pnpm tsx scripts/phaseB-run.ts <campaign> --workers   # реальний прогін

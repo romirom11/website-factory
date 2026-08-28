@@ -242,7 +242,7 @@ health check б'є по ньому. Конфлікту немає в обидв�
 ## 7. Медіа (§2.5)
 
 ```text
-FlowKit/Veo кліп з РЕАЛЬНОГО фото → ffmpeg Ken Burns mp4 → CSS/GSAP Ken Burns
+Завантажений wow-кліп → ffmpeg Ken Burns MP4 з РЕАЛЬНОГО фото → CSS/GSAP Ken Burns
 ```
 
 Останній рівень не потребує нічого зовнішнього, тому пайплайн проходить end-to-end
@@ -292,7 +292,9 @@ pnpm phasec:deploy-check               # traversal, лістинг, noindex, hea
 pnpm phasec:workspace <bizId>          # workspace без жодного агента
 pnpm phasec:qa <outDir> <bizId> --shots <dir>   # детерміновані гейти на готовому export
 pnpm phasec:critic-check <shotsDir> "<name>"    # тільки мультимодальний критик
-pnpm phasec:fixture --seed             # чесний синтетичний бізнес
+pnpm phasec:fixture --seed             # лише seed fixture evidence
+docker compose exec factory pnpm tsx scripts/phaseC-fixture.ts --run
+                                          # F1 через central enqueue + живі workers/runner
 pnpm phasec:run <bizId> --all          # реальний прогін 9→12
 pnpm phasec:run <bizId> --stage 11     # тільки QA поточного export (без ребілду)
 pnpm phasec:fixture --clean            # прибрати фікстуру
@@ -300,7 +302,21 @@ pnpm test:tmux-agent                   # гард-паритет, ttyd argv, м�
 pnpm test:tmux-agent --live            # + одна СПРАВЖНЯ сесія claude у tmux (потрібен tmux і підписка)
 ```
 
-## 11. Відомі обмеження
+## 11. Logical run і physical attempts
+
+Stage 9–12 не викликаються acceptance-скриптом вручну. F1 створює один
+`content-and-design` command через центральний `enqueue`; далі production
+workers володіють усіма successor stages. Один `workflow_job_runs` рядок — це
+логічна команда, а `workflow_jobs` — append-only attempts. Rate-limit не
+перезапускає старий ledger row: він додає successor attempt під тим самим run.
+Concurrent duplicate command пригнічується active unique index, а count/time
+видно у System UI.
+
+Це прибирає колишню acceptance race, коли прямий виклик handler-а одночасно
+enqueue-ив successor, якого міг claim-нути живий worker у тому самому
+workspace.
+
+## 12. Операційні властивості
 
 **Групи воркерів — ВИРІШЕНО і реалізовано.** `AGENT_CONCURRENCY` + `withAgentSlot`
 — FIFO-черга **в межах процесу**. Коли один процес хостить усі типи jobs,
@@ -474,10 +490,11 @@ typeAsDesign 2, photoTreatment 1, microInteraction 1, performanceReducedMotion 3
    `wowVerdict()`: <9/18 або heroMotion 0 → high-severity issue категорії `wow`
    з текстом «дефолтний AI-шаблон» і конкретним фіксом.
 
-Старі детерміновані гейти лишились без змін: overflow, console/pageerror, failed
-requests, розтягнуті й биті картинки, `clippedText`, `inkPer1000px`,
-placeholders, контакти, noindex, reduced-motion invisible. Ліміт ітерацій той
-самий.
+Детерміновані гейти: overflow, console/pageerror, failed requests,
+розтягнуті й биті картинки, `clippedText`, placeholders, контакти,
+noindex, reduced-motion invisible, щільність контенту, співвідношення
+висоти до копірайту та частка площі реальних evidence-фото. Ліміт ітерацій
+той самий.
 
 ### Workspace
 
@@ -489,19 +506,17 @@ placeholders, контакти, noindex, reduced-motion invisible. Ліміт і
 reduced-motion, правило EB_Garamond для грецького italic і два нові пункти
 Definition of done («герой рухається», «всі механіки реально анімуються»).
 
-### Лишається відкритим
+### Production thresholds
 
-- **Пороги калібровані на малій вибірці.** `inkPer1000px ≥ 14` — здогад по двох
-  сторінках; піксельні пороги 1.5%/0.4% перевірені на одному демо з відео-героєм
-  (Pagoulatos: вхід 46.8%, утримання 12.8%); поріг амбіції 10/15 відкалібрований
-  по одній відхиленій сторінці (7/15). Перекалібрувати на 5-10 демо.
-- **Вартість критика.** Один прогін — ~10 хв і ~$1 підписки, 24-25 turns з
-  13 зображеннями. Плюс `closeness`/`wow` тепер округлюються, а не відхиляються:
-  критик відповів `5.5` і схема з `.int()` спалила цілий retry.
-- **Фото мають нести секцію** (§12 п.4 старої версії): `mediaAreaRatio` уже
-  рахується, гейту на нього досі немає.
-- **Висота сторінки vs обсяг контенту**: 7276px на ~1680 символів — забагато;
-  порогу px/символ немає.
-- **≥3 компоненти пулу реально анімуються** — вимога є в BUILD-TASK.md і в
-  промпті критика, але детермінованого гейту на неї немає (є лише
-  `transformedAtRest` у метриках).
+- `inkPer1000px >= 14` на desktop; додатково сторінка вища за 4500px з
+  щонайменше 800 символами не може перевищувати 4px висоти на символ.
+- Якщо evidence package має реальні фото, вони мають займати щонайменше 8%
+  desktop-page area. Враховуються лише URL реальних snapshot assets, а не SVG,
+  згенеровані фони чи іконки.
+- Кожна з 3-4 механік контракту отримує `implemented | partial | absent` verdict з
+  посиланням на motion-frame. `absent` блокує як high, `partial` — як medium;
+  без повного виконання всього scene map QA не проходить.
+- Числові пороги живуть у `src/build/layoutQuality.ts` та мають швидкий
+  regression у `scripts/test-layout-quality.ts`; QA report зберігає сирі метрики.
+- Дробові оцінки критика округлюються схемою. Це не послаблює гейти і не
+  спалює цілий agent retry через відповідь на кшталт `5.5`.

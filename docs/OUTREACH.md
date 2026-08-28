@@ -279,7 +279,7 @@ pnpm phasee:e2e
 ```
 
 `scripts/phaseE-e2e.ts` проганяє повний цикл на фікстурній кампанії
-`phaseE-fixture-<ts>`: approval → live SMTP → лист фізично в скриньці (перевірка
+`e2e-phasee-<ts>`: approval → live SMTP → лист фізично в скриньці (перевірка
 через IMAP) → відповідь → `poll-replies` → `outreach_events`/deal/status →
 follow-up відмовляється відправлятись. Плюс bounce, opt-out, WAHA-вебхук,
 exactly-once, HMAC. Наприкінці фікстури видаляються (`--keep` щоб лишити).

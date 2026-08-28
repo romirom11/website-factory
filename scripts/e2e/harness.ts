@@ -14,8 +14,8 @@
  *     writes — so a typo'd id fails loudly instead of updating a real salon.
  */
 import { pool } from '../../src/db/client.js';
-
-export const FIXTURE_PREFIX = 'e2e-';
+import { FIXTURE_PREFIX } from './safety.js';
+export { assertFixtureId, FIXTURE_PREFIX } from './safety.js';
 
 export interface CheckRecord {
   group: string;
@@ -81,13 +81,6 @@ export function summary(): { total: number; failed: number; byGroup: Map<string,
  * the write, so the failure mode of a bad id is an exception, never a modified
  * production row.
  */
-export function assertFixtureId(id: string): string {
-  if (!id.startsWith(FIXTURE_PREFIX)) {
-    throw new Error(`refusing to mutate non-fixture id "${id}" (must start with "${FIXTURE_PREFIX}")`);
-  }
-  return id;
-}
-
 export async function sql<T = any>(text: string, params: unknown[] = []): Promise<T[]> {
   const res = await pool.query(text, params);
   return res.rows as T[];
@@ -116,7 +109,7 @@ export const CENSUS_TABLES = [
   'businesses', 'campaigns', 'approvals', 'outreach_messages', 'outreach_events',
   'workflow_jobs', 'production_gaps', 'status_history', 'site_projects',
   'business_facts', 'business_contacts', 'business_sources', 'assets', 'deals',
-  'qualifications', 'website_audits', 'do_not_contact',
+  'qualifications', 'website_audits', 'do_not_contact', 'enrichment_runs',
 ] as const;
 
 export type Census = Record<string, number>;

@@ -1,10 +1,10 @@
 /**
  * Phase C mechanics rehearsal on an HONEST synthetic business.
  *
- * Creates campaign `phaseC-fixture` with one business whose evidence package is
+ * Creates campaign `e2e-phasec-fixture` with one business whose evidence package is
  * small but real in shape: real source rows, real facts with source ids, real
  * image files as assets. Nothing here is presented as a genuine Patras business —
- * the id is prefixed `gr-fixture-` and `--clean` removes every trace.
+ * every mutable id is prefixed `e2e-` and `--clean` removes every database trace.
  *
  * Purpose: shake out the plumbing (workspace prep, agent session, independent
  * build verification, provenance grep, QA loop, deploy + health check) without
@@ -14,30 +14,47 @@
  *   pnpm tsx scripts/phaseC-fixture.ts --run      # seed + full chain
  *   pnpm tsx scripts/phaseC-fixture.ts --clean    # remove everything
  */
-import { mkdir, writeFile, readFile } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { chromium } from 'playwright';
-import { eq } from 'drizzle-orm';
+import { desc, eq } from 'drizzle-orm';
 import { db, schema, pool } from '../src/db/client.js';
-import { ensureBuckets, putAsset, sha256 } from '../src/lib/storage.js';
-import { contentDesignHandler } from '../src/workers/contentDesign.js';
-import { buildSiteHandler } from '../src/workers/builder.js';
-import { visualQaHandler } from '../src/workers/visualQa.js';
-import { deployHandler } from '../src/workers/deploy.js';
-import { ensureDemoServer } from '../src/lib/serveDir.js';
+import { ensureBuckets, putAsset, putRaw, sha256 } from '../src/lib/storage.js';
+import { enqueue, getBoss } from '../src/orchestrator/queue.js';
+import { assertFixtureId, FIXTURE_PREFIX } from './e2e/safety.js';
 
-const CAMPAIGN_ID = 'phaseC-fixture';
-const BUSINESS_ID = 'gr-fixture-anemi-studio';
+const CAMPAIGN_ID = assertFixtureId('e2e-phasec-campaign', 'campaign');
+const BUSINESS_ID = assertFixtureId('e2e-phasec-anemi-studio', 'business');
 const args = new Set(process.argv.slice(2));
 
 async function clean(): Promise<void> {
+  const projects = await db.select({ dir: schema.siteProjects.dir })
+    .from(schema.siteProjects)
+    .where(eq(schema.siteProjects.businessId, BUSINESS_ID));
+  const allowedRoot = path.resolve(process.env.RUNNER_SITES_ROOT ?? 'sites');
+  for (const project of projects) {
+    const dir = path.resolve(project.dir);
+    if (dir.startsWith(`${allowedRoot}${path.sep}`)) await rm(dir, { recursive: true, force: true });
+  }
+  await pool.query(
+    `delete from workflow_reconciliation_events
+     where run_id in (select id from workflow_job_runs where business_id = $1)
+        or attempt_id in (select id from workflow_jobs where business_id = $1)`,
+    [BUSINESS_ID],
+  ).catch(() => {});
   for (const table of [
+    'outreach_events', 'outreach_messages', 'approvals', 'deals', 'enrichment_runs',
     'production_gaps', 'qualifications', 'website_audits', 'business_contacts',
     'business_facts', 'assets', 'site_projects', 'workflow_jobs', 'status_history',
     'business_sources',
   ]) {
     await pool.query(`delete from ${table} where business_id = $1`, [BUSINESS_ID]).catch(() => {});
   }
+  await pool.query('delete from workflow_job_runs where business_id = $1', [BUSINESS_ID]).catch(() => {});
+  await pool.query(
+    `delete from pgboss.job where data::text like $1 or singleton_key like $2`,
+    [`%${BUSINESS_ID}%`, `${FIXTURE_PREFIX}%`],
+  ).catch(() => {});
   await pool.query('delete from businesses where id = $1', [BUSINESS_ID]).catch(() => {});
   await pool.query('delete from campaigns where id = $1', [CAMPAIGN_ID]).catch(() => {});
   console.log('fixture removed');
@@ -86,7 +103,7 @@ async function seed(): Promise<void> {
   await clean();
 
   await db.insert(schema.campaigns).values({
-    id: CAMPAIGN_ID, country: 'gr', city: 'Patras', niche: 'beauty', language: 'el',
+    id: CAMPAIGN_ID, country: 'e2e', city: 'Fixture', niche: 'beauty', language: 'el',
     queries: ['nail salon Patras'], geofence: { lat: 38.246, lng: 21.735, radiusKm: 8 },
     targetCount: 1, status: 'created',
   });
@@ -107,18 +124,24 @@ async function seed(): Promise<void> {
   });
   await db.insert(schema.statusHistory).values({
     businessId: BUSINESS_ID, fromStatus: null, toStatus: 'production_ready',
-    actor: 'phaseC-fixture', reason: 'synthetic fixture for phase C mechanics',
+    actor: 'e2e-phasec-fixture', reason: 'synthetic fixture for phase C mechanics',
   });
 
+  const listingRawKey = await putRaw('e2e-phasec', Buffer.from(
+    'Controlled fixture listing for Anemi Nail Studio; synthetic acceptance data.',
+  ), 'text/plain');
+  const siteRawKey = await putRaw('e2e-phasec', Buffer.from(
+    '<html lang="el"><body>Anemi Nail Studio fixture evidence</body></html>',
+  ), 'text/html');
   const [source] = await db.insert(schema.businessSources).values({
     businessId: BUSINESS_ID, sourceType: 'google_maps',
     url: 'https://maps.google.com/?cid=FIXTURE', method: 'gosom_api',
-    rawObjectKey: 'fixture/raw-1',
+    rawObjectKey: listingRawKey,
   }).returning();
   const [siteSource] = await db.insert(schema.businessSources).values({
     businessId: BUSINESS_ID, sourceType: 'owned_website',
     url: 'https://anemi-fixture.example.gr/', method: 'playwright',
-    rawObjectKey: 'fixture/raw-2',
+    rawObjectKey: siteRawKey,
   }).returning();
 
   const facts: Array<[string, unknown, number]> = [
@@ -174,56 +197,69 @@ async function seed(): Promise<void> {
 }
 
 async function runChain(): Promise<void> {
-  await ensureDemoServer();
-  const t0 = Date.now();
-
-  console.log('\n=== stage 9: content brief + design ===');
-  await contentDesignHandler({ businessId: BUSINESS_ID, campaignId: CAMPAIGN_ID });
-  const [project] = await db.select().from(schema.siteProjects)
-    .where(eq(schema.siteProjects.businessId, BUSINESS_ID));
-  if (!project) throw new Error('no site project created');
-  console.log(`project ${project.id}: direction="${project.designDirection}" score=${project.designScore}`);
-
-  console.log('\n=== stage 10-11: build + QA loop ===');
-  let iteration = 0;
-  let projectState = project.state;
-  while (iteration < 10) {
-    const [current] = await db.select().from(schema.siteProjects)
-      .where(eq(schema.siteProjects.id, project.id));
-    projectState = current!.state;
-    if (projectState === 'ready' || projectState === 'deployed' || projectState === 'needs_human_review') break;
-
-    await buildSiteHandler({
-      businessId: BUSINESS_ID, campaignId: CAMPAIGN_ID, projectId: project.id, iteration,
-    });
-    // The builder enqueues visual-qa with the provenance findings; call it directly
-    // with the same payload shape a queue round-trip would have produced.
-    const provenanceIssues: string[] = [];
-    await visualQaHandler({
-      businessId: BUSINESS_ID, campaignId: CAMPAIGN_ID, projectId: project.id, iteration,
-      provenanceIssues,
-    }).catch((err) => {
-      if (err?.code === 'NEEDS_HUMAN') { console.log(`QA exhausted: ${err.message}`); return; }
-      throw err;
-    });
-    iteration++;
+  if (process.env.AGENT_EXECUTION_MODE !== 'remote'
+    || !(process.env.RUNNER_SITES_ROOT ?? '').startsWith('/app/')) {
+    throw new Error(
+      'F1 fixture must run inside the factory Compose service with the remote runner; '
+      + 'use `docker compose exec factory pnpm tsx scripts/phaseC-fixture.ts --run`',
+    );
   }
 
-  const [afterQa] = await db.select().from(schema.siteProjects)
-    .where(eq(schema.siteProjects.id, project.id));
-  console.log(`after QA: state=${afterQa!.state} iterations=${afterQa!.qaIterations} openIssues=${(afterQa!.openIssues ?? []).length}`);
+  const started = Date.now();
+  const result = await enqueue('content-and-design', {
+    businessId: BUSINESS_ID,
+    campaignId: CAMPAIGN_ID,
+    idempotencyKey: `e2e-content-and-design:${BUSINESS_ID}:${started}`,
+  });
+  if (result.kind !== 'accepted') throw new Error(`F1 enqueue was suppressed by run ${result.runId}`);
+  console.log(`queued F1 logical run ${result.runId}; workers own every successor stage`);
 
-  if (afterQa!.state !== 'ready') {
-    console.log('not ready; skipping deploy');
-    return;
+  const deadline = Date.now() + 90 * 60_000;
+  let lastLine = '';
+  for (;;) {
+    const [business] = await db.select().from(schema.businesses)
+      .where(eq(schema.businesses.id, BUSINESS_ID));
+    const [project] = await db.select().from(schema.siteProjects)
+      .where(eq(schema.siteProjects.businessId, BUSINESS_ID))
+      .orderBy(desc(schema.siteProjects.id)).limit(1);
+    const runs = await db.select().from(schema.workflowJobRuns)
+      .where(eq(schema.workflowJobRuns.businessId, BUSINESS_ID))
+      .orderBy(desc(schema.workflowJobRuns.updatedAt));
+    const latest = runs[0];
+    const line = `business=${business?.status ?? 'missing'} project=${project?.state ?? 'none'} job=${latest?.jobType ?? 'none'}:${latest?.status ?? 'none'}`;
+    if (line !== lastLine) {
+      console.log(`  ${line}`);
+      lastLine = line;
+    }
+
+    if (business?.status === 'site_ready' && project?.state === 'deployed' && project.deployUrl) {
+      console.log(JSON.stringify({
+        ok: true,
+        businessId: BUSINESS_ID,
+        projectId: project.id,
+        deployUrl: project.deployUrl,
+        qaIterations: project.qaIterations,
+        wallSeconds: Math.round((Date.now() - started) / 1000),
+      }, null, 2));
+      break;
+    }
+
+    const blocking = runs.find((run) => ['failed', 'needs_human'].includes(run.status));
+    if (blocking) {
+      const [attempt] = await db.select().from(schema.workflowJobs)
+        .where(eq(schema.workflowJobs.runId, blocking.id))
+        .orderBy(desc(schema.workflowJobs.attemptSequence)).limit(1);
+      throw new Error(
+        `F1 stopped at ${blocking.jobType}:${blocking.status} — `
+        + `${attempt?.errorCode ?? 'UNKNOWN'}: ${attempt?.errorDetail ?? 'no detail'}`,
+      );
+    }
+    if (Date.now() >= deadline) throw new Error(`F1 timed out after 90 minutes (${line})`);
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
   }
 
-  console.log('\n=== stage 12: deploy ===');
-  await deployHandler({ businessId: BUSINESS_ID, campaignId: CAMPAIGN_ID, projectId: project.id });
-  const [deployed] = await db.select().from(schema.siteProjects)
-    .where(eq(schema.siteProjects.id, project.id));
-  console.log(`deployed: ${deployed!.deployUrl}`);
-  console.log(`\ntotal wall time: ${Math.round((Date.now() - t0) / 1000)}s`);
+  const boss = await getBoss();
+  await boss.stop({ close: true, graceful: true, wait: true, timeout: 5_000 });
 }
 
 if (args.has('--clean')) {

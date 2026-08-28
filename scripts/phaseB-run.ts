@@ -35,8 +35,8 @@ await ensureBuckets();
  *
  * pg-boss only reassigns an abandoned job when it expires, and agent jobs get a
  * 90-minute expiry (a site build is legitimately long). Agent queues also run
- * with teamSize 1, so a single orphan blocks that queue completely — which is
- * exactly what happened mid-run here after a stale worker was killed.
+ * through explicit consumer handles. Resetting a stale active row prevents the
+ * queue slot from remaining occupied until the 90-minute agent expiry.
  */
 const orphans = await db.execute(sql`
   update pgboss.job set state = 'created', started_on = null

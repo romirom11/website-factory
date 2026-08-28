@@ -21,7 +21,10 @@ package** (кожен факт має source → immutable raw-обʼєкт) →
 | `minio` | 9000 / 9001 | object storage: raw evidence, скриншоти, QA-звіти |
 | `gosom` | 8085 | google-maps-scraper, REST API — **єдине** джерело discovery |
 | `factory` | 8787, 8788 | воркери `core,enrich` + JSON API/вебхуки (8787) + сервер демо (8788) |
-| `factory-build` | 7681 | воркери `build` (brief → збірка → visual QA), окремий семафор; на 7681 — **живий термінал збірки**, до якого можна підключитись |
+| `factory-build` | — | воркери `build` (brief → збірка → visual QA); сам provider CLI тут не запускається |
+| `agent-runner-gateway` | 8790 (internal) | auth, staging/sync, reservations; provider credentials не бачить |
+| `agent-runner-executor` | 7681 (loopback/reverse proxy) | ізольовані provider CLI, exact-workspace sandbox, живий термінал |
+| `agent-egress-proxy` / `agent-egress-dns` | internal | allowlisted HTTP(S)/DNS; arbitrary egress і lateral traffic заборонені |
 | `ui` | 3000 | **контрольний інтерфейс**: approve-черга, воронка, кампанії, jobs, розмови |
 | `waha` | 3001 | self-hosted WhatsApp HTTP API (НЕ Meta Cloud API) |
 | `greenmail` | 3025/3143/8081 | лише dev (`--profile dev-mail`): локальні SMTP+IMAP для тестів |
@@ -29,6 +32,9 @@ package** (кожен факт має source → immutable raw-обʼєкт) →
 `factory` і `factory-build` — один образ, різні `WORKER_GROUPS`. Розділені
 навмисно: семафор агентів діє **на процес**, тож 40-хвилинна збірка сайту і
 беклог enrichment інакше голодують один одного.
+
+Безпечний порядок оновлення schema/runner/workers, legacy drain і recovery без
+повернення локального agent path: [`docs/PRODUCTION-ROLLOUT.md`](docs/PRODUCTION-ROLLOUT.md).
 
 **Інтерфейс — це UI на :3000.** Telegram лише надсилає посилання в UI, approve
 там не робиться (рішення №9). `:8787` — службовий API, не інтерфейс.
@@ -471,27 +477,22 @@ WAHA — живі проби; **heartbeat воркерів** (кожен про�
 
 ---
 
-## (е) Відомі обмеження і TODO
+## (е) Операційні характеристики
 
-**Дизайн (головне; `docs/BUILD-PIPELINE.md` §12).** Перше демо ти відхилив як
-візуально слабке. Детерміновані гейти вже додані (обрізаний текст, щільність
-контенту `inkPer1000px`, плейсхолдери). **Чекає спільного проходу з тобою:**
-підкладати критику PNG референсу для прямого порівняння; осі «density» і «wow»
-в рубриці; вимога, щоб ≥3 компоненти пулу реально анімувались у DOM; гейт на
-частку площі під медіа; поріг «висота сторінки vs обсяг тексту». Пороги
-відкалібровані **на двох сторінках** — перекалібрувати на 5–10 реальних демо.
+**Дизайн.** Production QA порівнює демо з PNG обраного референсу,
+вимірює hero/scroll motion, щільність контенту, висоту до обсягу тексту та
+площу реальних evidence-фото. Кожна механіка з frozen design contract
+отримує блокуючий `implemented | partial | absent` verdict. Точні пороги і
+regression-контракт — у `docs/BUILD-PIPELINE.md`.
 
-**Outreach.**
-- Живу відправку WhatsApp **не перевірено** (немає окремого номера і QR-скану);
-  перевірені webhook, HMAC, `check-exists`, гейти. Email-цикл перевірено
-  повністю на GreenMail, включно з reply і bounce.
-- Анти-спам таймлок WhatsApp не опрацьовано: при масовій розсилці на незнайомі
-  номери банять. Тому окремий номер і малі денні ліміти.
-- Instagram DM не автоматизується принципово (бан акаунта) — фабрика готує
-  текст і дає deep link.
+**Outreach.** WhatsApp live потребує окремого номера з QR-прив’язкою і
+статусом WAHA `WORKING`; без цього adapter fail-closed. Окремий номер, DNC,
+малі денні ліміти та повторна перевірка перед send — обов’язкові safety-межі.
+Email проходить SMTP/IMAP/reply/bounce integration у release gate. Instagram DM
+залишається ручним deep-link каналом за продуктовим дизайном.
 
-**Discovery.** gosom обробляє **одну job за раз**; кампанії з багатьма запитами
-йдуть послідовно. Проксі закладені конфігом (`GOSOM_PROXIES`, типово порожньо).
+**Discovery.** Один gosom instance обробляє одну job за раз; черга чесно показує
+цю пропускну здатність. Проксі задаються через `GOSOM_PROXIES`.
 
 **Пошук соцмереж.** Крок працює **без ключів** — через публічну видачу
 пошуковиків у Playwright (Brave → Startpage → Bing → DuckDuckGo), тому впирається
@@ -506,32 +507,27 @@ WAHA — живі проби; **heartbeat воркерів** (кожен про�
   такий кандидат чесно лишається `medium`/`weak`, а не «верифікується».
 - Невдача пошуку **ніколи** не валить збагачення: це warning + gap
   `socials_unresolved`.
-- Якщо ліміти почнуть заважати на великих кампаніях — збільшити
-  `SOCIAL_DISCOVERY_DELAY_MS` (типово 2500 мс) або пустити крок через проксі.
-  Вимикається повністю: `SOCIAL_DISCOVERY=false`.
+- Rate-control задається `SOCIAL_DISCOVERY_DELAY_MS` (типово 2500 мс), проксі або
+  `SOCIAL_DISCOVERY=false` для кампаній, де social enrichment не є умовою.
 
-**Збірка.** Workspace однієї збірки ~735 МБ; після термінального стану GC
-чистить до ~9 МБ (`WORKSPACE_GC=false` вимикає). Референси є **лише для ніші
-beauty** — нова ніша потребує своєї теки `references/<niche>/`.
+**Збірка.** Workspace піково може займати сотні мегабайтів; terminal-state GC
+залишає лише діагностичні артефакти. Поточний reference pack є launch-scope ніші
+beauty; інша ніша має отримати власний versioned `references/<niche>/` до live-кампанії.
 
-**Термінал збірки (`BUILDER_MODE=tmux`).** Що перевірено і що ні:
+**Термінал збірки (`BUILDER_MODE=tmux`).**
 
-- Перевірено офлайн (`pnpm test:tmux-agent`, 35 перевірок): гард CLI-хука
-  збігається з SDK-гардом на всіх кейсах (вихід за workspace, `~/.ssh`, `.env`,
+- `pnpm test:tmux-agent` доводить, що гард CLI-хука збігається з SDK-гардом на всіх кейсах
+  (вихід за workspace, `~/.ssh`, `.env`,
   `curl` назовні vs loopback, `WebFetch`), хук fail-closed на битому payload,
   ttyd-argv справді read-only і з basic auth, маркер живої сесії протухає.
-- **Не перевірено живим прогоном**: справжня сесія `claude` у tmux
-  (`pnpm test:tmux-agent --live`) і сам `ttyd`. На маку Романа немає ні tmux, ні
-  ttyd, а ставити їх на його машину я не став. **Перший крок на сервері:**
-  `docker compose exec agent-runner-executor pnpm test:tmux-agent --live` — це підніме
-  одну коротку справжню сесію і перевірить весь ланцюг (сесія → промпт-файл →
-  `result.json` → скролбек → прибирання). Поки цього не зроблено, тримай
-  `BUILDER_MODE=sdk`, якщо не хочеш ризикувати першою реальною збіркою.
 - Один attachable terminal на executor через єдиний порт ttyd; headless-виклики
   паралельно використовують окремі ліміти `core` / `enrich` / `build`.
 - Якщо `claude` у tmux завершиться, не написавши `result.json`, збірка впаде з
   причиною (`idle` / `gone` / `timeout`) і хвостом pane у тексті помилки; повний
   скролбек лишиться у `sites/<biz>/<projectId>/terminal.log`.
+
+Якщо обрано tmux-mode, повний release gate має завершити реальний F1 build через
+remote executor; непройдена live-сесія не може бути release-рішенням.
 
 **Медіа.** Hero-відео: авто Ken Burns через ffmpeg (в образі) або завантажений
 з картки wow-кліп. Онлайн-генерації відео у фабрики немає — свідомо (SPEC §2.5).
@@ -622,4 +618,6 @@ pnpm verify:media-parsers
 cd ui && pnpm build
 
 pnpm tsx scripts/integration-e2e.ts          # discovery(gosom) + approve→1 simulated send
+pnpm release:gate -- --quick                 # швидкий dev-loop, НЕ дозвіл на deploy
+pnpm release:gate                            # повний Compose/security/F1 gate + evidence report
 ```

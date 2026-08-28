@@ -71,6 +71,16 @@ await withDisposableFactoryDatabase(async ({ pool, db: testDb, boss }) => {
       `select count(*) from workflow_jobs where run_id = $1`,
       [results[0]!.runId],
     ), 1);
+    const suppression = await pool.query<{
+      duplicate_suppressions: number;
+      last_duplicate_at: Date | null;
+    }>(
+      `select duplicate_suppressions, last_duplicate_at
+       from workflow_job_runs where id = $1`,
+      [results[0]!.runId],
+    );
+    assert.equal(suppression.rows[0]?.duplicate_suppressions, 99);
+    assert.ok(suppression.rows[0]?.last_duplicate_at instanceof Date);
     assert.equal(await count(
       `select count(*) from pgboss.job where id = $1`,
       [accepted[0]!.bossJobId],

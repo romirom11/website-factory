@@ -14,6 +14,7 @@ import { fastQualifyHandler } from '../src/workers/fastQualify.js';
 import { auditHandler } from '../src/workers/audit.js';
 import { readinessHandler } from '../src/workers/readiness.js';
 import { getBoss, register, enqueue } from '../src/orchestrator/queue.js';
+import { assertFixtureId } from './e2e/safety.js';
 
 let failures = 0;
 function check(name: string, ok: boolean, detail?: string) {
@@ -24,18 +25,41 @@ function check(name: string, ok: boolean, detail?: string) {
 await ensureBuckets();
 
 // clean slate for the smoke campaign
-const CID = 'smoke-test-campaign';
-const BIZ_PREFIX = 'gr-smoketown';
-await db.execute(`delete from status_history where business_id like '${BIZ_PREFIX}%'` as any).catch(() => {});
-for (const table of ['production_gaps', 'qualifications', 'website_audits', 'business_contacts', 'business_facts', 'business_sources', 'workflow_jobs']) {
-  await pool.query(`delete from ${table} where business_id like $1`, [`${BIZ_PREFIX}%`]).catch(() => {});
+const CID = assertFixtureId('e2e-smoke-campaign', 'campaign');
+const BIZ_PREFIX = 'e2e-smoketown-';
+async function cleanSmoke(): Promise<void> {
+  const like = `${BIZ_PREFIX}%`;
+  const ids = (await pool.query<{ id: string }>('select id from businesses where id like $1', [like]))
+    .rows.map((row) => assertFixtureId(row.id, 'business'));
+  await pool.query(
+    `delete from workflow_reconciliation_events
+     where run_id in (select id from workflow_job_runs where campaign_id = $1)
+        or attempt_id in (select id from workflow_jobs where campaign_id = $1)`,
+    [CID],
+  ).catch(() => {});
+  for (const table of [
+    'enrichment_runs', 'production_gaps', 'qualifications', 'website_audits',
+    'business_contacts', 'business_facts', 'business_sources', 'workflow_jobs',
+    'status_history',
+  ]) {
+    await pool.query(`delete from ${table} where business_id like $1`, [like]).catch(() => {});
+  }
+  await pool.query('delete from workflow_jobs where campaign_id = $1', [CID]).catch(() => {});
+  await pool.query('delete from workflow_job_runs where campaign_id = $1', [CID]).catch(() => {});
+  await pool.query(
+    `delete from pgboss.job where data->>'campaignId' = $1 or data->>'businessId' = any($2::text[])`,
+    [CID, ids],
+  ).catch(() => {});
+  await pool.query('delete from businesses where id like $1', [like]);
+  await pool.query('delete from campaigns where id = $1', [CID]);
 }
-await pool.query(`delete from status_history where business_id like $1`, [`${BIZ_PREFIX}%`]);
-await pool.query(`delete from businesses where id like $1`, [`${BIZ_PREFIX}%`]);
-await pool.query(`delete from campaigns where id = $1`, [CID]);
+
+await cleanSmoke();
 
 await db.insert(schema.campaigns).values({
-  id: CID, country: 'gr', city: 'Smoketown', niche: 'beauty', language: 'el',
+  // The deterministic normalizer derives ids as country-city-name. A fixture
+  // country is intentional: every created business is fail-closed under e2e-*.
+  id: CID, country: 'e2e', city: 'Smoketown', niche: 'beauty', language: 'el',
   queries: ['nail salon'], geofence: { lat: 38, lng: 21, radiusKm: 10 }, targetCount: 5,
 });
 check('campaign created', true);
@@ -73,6 +97,7 @@ await normalizeHandler({ campaignId: CID, candidate: candidate as any });
 let bizRows = await pool.query(`select * from businesses where campaign_id = $1`, [CID]);
 check('normalize materialized business', bizRows.rowCount === 1, bizRows.rows[0]?.id);
 const businessId = bizRows.rows[0].id as string;
+assertFixtureId(businessId, 'business');
 
 // dedup: same placeId again must NOT create a second business
 await normalizeHandler({ campaignId: CID, candidate: { ...candidate, name: 'Smoke Nails Studio DUPLICATE' } as any });
@@ -154,7 +179,7 @@ check('readiness gate blocks incomplete package', gaps.rowCount! >= 3, gaps.rows
 
 // ── queue round-trip ──
 await register('daily-summary', (await import('../src/workers/summary.js')).dailySummaryHandler);
-await enqueue('daily-summary', { idempotencyKey: `smoke-summary-${Date.now()}`, silent: true });
+await enqueue('daily-summary', { idempotencyKey: `e2e-smoke-summary-${Date.now()}`, silent: true });
 await new Promise((r) => setTimeout(r, 5000));
 const jobRow = await pool.query(`select status from workflow_jobs where job_type = 'daily-summary' order by created_at desc limit 1`);
 check('pg-boss queue round-trip', jobRow.rows[0]?.status === 'succeeded', jobRow.rows[0]?.status);
@@ -166,6 +191,7 @@ check('status history recorded', history.rowCount! >= 2, history.rows.map((h: an
 server.close();
 const boss = await getBoss();
 await boss.stop({ close: true, timeout: 2000 });
+await cleanSmoke();
 await pool.end();
 
 console.log(failures === 0 ? '\n🏭 SMOKE TEST PASSED' : `\n💥 ${failures} smoke checks failed`);

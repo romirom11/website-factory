@@ -1,5 +1,11 @@
+import { fileURLToPath } from 'node:url';
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // Keep standalone tracing scoped to this intentionally independent app.
+  // Without this, an unrelated lockfile higher in the home directory can make
+  // Next infer the wrong workspace root and omit or over-include runtime files.
+  outputFileTracingRoot: fileURLToPath(new URL('.', import.meta.url)),
   // `pg` is a native-ish driver; keep it external so the server bundle uses the
   // real module rather than a webpack-mangled copy.
   serverExternalPackages: ['pg', 'drizzle-orm'],

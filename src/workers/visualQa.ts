@@ -30,8 +30,9 @@ import { runAgent } from '../agents/agent.js';
 import { createAgentInputWorkspace } from '../agents/transport.js';
 import { parkBuildForHumanReview } from '../orchestrator/buildReviewDecision.js';
 import { enqueue, NeedsHumanError, type JobPayload } from '../orchestrator/queue.js';
-import { buildSnapshot, type BuildSnapshot } from '../build/snapshot.js';
+import { buildSnapshot, realPhotos, type BuildSnapshot } from '../build/snapshot.js';
 import { VisualCritiqueSchema, type QaIssue } from '../build/schemas.js';
+import { evaluateLayoutQuality } from '../build/layoutQuality.js';
 import {
   WOW_MAX, motionRefDir, renderWowGate, renderWowRubric, wowVerdict,
 } from '../build/motionRefs.js';
@@ -426,6 +427,13 @@ export async function deterministicChecks(
   const issues: QaIssue[] = [];
   const screenshots: Array<{ name: string; buf: Buffer }> = [];
   const metrics: Record<string, unknown> = {};
+  const evidencePhotos = realPhotos(snapshot);
+  const evidencePhotoFiles = [...new Set(evidencePhotos.flatMap((asset) => [
+    asset.file,
+    path.basename(asset.file),
+    asset.objectKey,
+    path.basename(asset.objectKey),
+  ]))];
 
   for (const vp of VIEWPORTS) {
     const ctx = await browser.newContext({ viewport: { width: vp.width, height: vp.height } });
@@ -504,7 +512,7 @@ export async function deterministicChecks(
     // content and the largest true gap was 85px, so "empty bands" was the wrong
     // metric. What was actually wrong is DENSITY — 52 content elements spread
     // over 4691px. Ink coverage per 1000px of page is the honest proxy.
-    const slop = await page.evaluate(() => {
+    const slop = await page.evaluate((realPhotoFiles) => {
       const vw = document.documentElement.clientWidth;
       const pageHeight = document.body.scrollHeight;
 
@@ -530,6 +538,7 @@ export async function deterministicChecks(
       let inkElements = 0;
       let textChars = 0;
       let mediaArea = 0;
+      let evidenceMediaArea = 0;
       for (const el of Array.from(document.querySelectorAll('body *')).slice(0, 8000)) {
         const r = el.getBoundingClientRect();
         if (r.width < 8 || r.height < 8) continue;
@@ -539,7 +548,16 @@ export async function deterministicChecks(
         const isMedia = ['IMG', 'VIDEO', 'CANVAS', 'SVG'].includes(el.tagName)
           || st.backgroundImage.includes('url(');
         if (isLeafText) { inkElements++; textChars += (el.textContent ?? '').trim().length; }
-        if (isMedia) { inkElements++; mediaArea += r.width * r.height; }
+        if (isMedia) {
+          inkElements++;
+          mediaArea += r.width * r.height;
+          let source = st.backgroundImage;
+          if (el instanceof HTMLImageElement) source += ` ${el.currentSrc} ${el.src}`;
+          if (el instanceof HTMLVideoElement) source += ` ${el.currentSrc} ${el.src} ${el.poster}`;
+          if (realPhotoFiles.some((file) => file.length > 0 && source.includes(file))) {
+            evidenceMediaArea += r.width * r.height;
+          }
+        }
       }
       const per1000 = pageHeight > 0 ? (inkElements / pageHeight) * 1000 : 0;
 
@@ -556,10 +574,11 @@ export async function deterministicChecks(
         inkElements,
         textChars,
         mediaAreaRatio: Number((mediaArea / Math.max(1, vw * pageHeight)).toFixed(3)),
+        evidenceMediaAreaRatio: Number((evidenceMediaArea / Math.max(1, vw * pageHeight)).toFixed(3)),
         inkPer1000px: Number(per1000.toFixed(1)),
         placeholders,
       };
-    });
+    }, evidencePhotoFiles);
 
     for (const c of slop.clipped) {
       issues.push({
@@ -572,17 +591,17 @@ export async function deterministicChecks(
       });
     }
 
-    // Calibration: the demo Roman rejected scored 11.1 ink elements and 0.06
-    // media-area per 1000px on desktop. Below 14 is measurably thinner than a
-    // page that has something to say; it is a prompt to add content or cut height,
-    // not an automatic failure, hence medium.
-    if (vp.name === 'desktop' && slop.inkPer1000px < 14) {
-      issues.push({
-        severity: 'medium', category: 'spacing-rhythm', viewport: vp.name,
-        issue: `Content density is thin: ${slop.inkElements} text/media elements over a ${slop.pageHeight}px page (${slop.inkPer1000px} per 1000px, ${slop.textChars} characters total). The page is mostly padding, which reads as unfinished rather than as confident whitespace.`,
-        fix: 'Either cut the page height (tighten section padding to a 3-step scale) or give the sparse sections real content from the snapshot. Whitespace should frame something.',
-      });
-    }
+    issues.push(...evaluateLayoutQuality({
+      viewport: vp.name,
+      hasRealPhotos: evidencePhotos.length > 0,
+      metrics: {
+        pageHeight: slop.pageHeight,
+        inkElements: slop.inkElements,
+        inkPer1000px: slop.inkPer1000px,
+        textChars: slop.textChars,
+        evidenceMediaAreaRatio: slop.evidenceMediaAreaRatio,
+      },
+    }));
     if (slop.placeholders.length) {
       issues.push({
         severity: 'high', category: 'content', viewport: vp.name,
@@ -593,6 +612,12 @@ export async function deterministicChecks(
     metrics[`${vp.name}.pageHeight`] = slop.pageHeight;
     metrics[`${vp.name}.inkPer1000px`] = slop.inkPer1000px;
     metrics[`${vp.name}.inkElements`] = slop.inkElements;
+    metrics[`${vp.name}.textChars`] = slop.textChars;
+    metrics[`${vp.name}.pageHeightPerTextChar`] = Number(
+      (slop.pageHeight / Math.max(1, slop.textChars)).toFixed(2),
+    );
+    metrics[`${vp.name}.mediaAreaRatio`] = slop.mediaAreaRatio;
+    metrics[`${vp.name}.evidenceMediaAreaRatio`] = slop.evidenceMediaAreaRatio;
     metrics[`${vp.name}.clippedText`] = slop.clipped.length;
 
     const brokenImages = await page.evaluate(() =>

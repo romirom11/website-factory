@@ -164,6 +164,12 @@ export async function writeHeartbeat(group: string, detail?: Record<string, unkn
     .catch(() => { /* a heartbeat must never break a worker */ });
 }
 
+/** Remove a heartbeat that belonged to a retired worker topology. */
+export async function retireHeartbeat(group: string): Promise<void> {
+  if (!/^[a-z0-9,-]+$/i.test(group)) throw new Error(`invalid heartbeat group: ${group}`);
+  await db.delete(schema.settings).where(eq(schema.settings.key, `${HEARTBEAT_PREFIX}${group}`));
+}
+
 /** Start stamping a heartbeat for this process's worker group. */
 export function startHeartbeat(group: string, detail?: () => Record<string, unknown>): NodeJS.Timeout {
   void writeHeartbeat(group, detail?.());

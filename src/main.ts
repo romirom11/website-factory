@@ -9,13 +9,17 @@
  */
 import { startWorkers, workerRuntimeStats } from './workers/main.js';
 import { startApi } from './api/server.js';
-import { initSettings, startHeartbeat } from './lib/settingsStore.js';
+import { initSettings, retireHeartbeat, startHeartbeat } from './lib/settingsStore.js';
 import { config } from './config.js';
 import { log } from './lib/logger.js';
 
 // Load the UI-edited settings BEFORE anything reads config, so a first job that
 // fires immediately already sees the operator's values rather than bare env.
 await initSettings();
+// Before split worker groups, one all-in-one process wrote `heartbeat:workers`.
+// It can never become fresh in the current topology and would otherwise render
+// as a permanent false outage next to the live `core` and `build` processes.
+await retireHeartbeat('workers');
 
 await startWorkers();
 await startApi();

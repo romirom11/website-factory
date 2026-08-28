@@ -45,7 +45,7 @@ try {
   check('failed attempt is closed', job?.status === 'cancelled', job?.status);
   check('business returns to ready-to-build, not rejected',
     business?.status === 'production_ready', business?.status);
-  check('abandoned project is marked failed', site?.state === 'failed', site?.state);
+  check('operator-stopped project is marked cancelled', site?.state === 'cancelled', site?.state);
 
   const after = await loadInbox();
   check('stopped build leaves Inbox', !after.jobs.some((item) => item.jobId === jobId));

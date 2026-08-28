@@ -383,7 +383,7 @@ export async function retryJobAction(jobId: number): Promise<ActionResult> {
 /**
  * Stop a dead build without rejecting its business.
  *
- * The failed attempt is history, the half-built project becomes `failed`, and
+ * The failed attempt is history, the half-built project becomes `cancelled`, and
  * the business returns to `production_ready` so Roman may build it again later.
  * This is the second honest ending of a failed-build card; dismissing only the
  * job row would leave the business stuck in `site_in_progress` forever.

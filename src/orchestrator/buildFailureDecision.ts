@@ -97,11 +97,11 @@ export async function stopFailedBuild(
 
     if (projectId) {
       await tx.update(schema.siteProjects)
-        .set({ state: 'failed' })
+        .set({ state: 'cancelled' })
         .where(and(
           eq(schema.siteProjects.id, projectId),
           eq(schema.siteProjects.businessId, business.id),
-          inArray(schema.siteProjects.state, ['pending', 'brief', 'building', 'qa', 'failed']),
+          inArray(schema.siteProjects.state, ['pending', 'brief', 'building', 'qa', 'failed', 'cancelled']),
         ));
     }
 

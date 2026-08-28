@@ -14,7 +14,9 @@ import {
   decryptSecret, encryptSecret, getSetting, maskSecret, masterKeyConfigured,
   settingSource, SETTINGS,
 } from '../src/lib/settings.js';
-import { initSettings, reloadSettings, writeSetting, rowKey } from '../src/lib/settingsStore.js';
+import {
+  initSettings, reloadSettings, retireHeartbeat, rowKey, writeHeartbeat, writeSetting,
+} from '../src/lib/settingsStore.js';
 import { config } from '../src/config.js';
 
 let failures = 0;
@@ -83,6 +85,23 @@ check('clearing a secret deletes the row (falls back to env/default)',
 // ── 4. registry sanity ───────────────────────────────────────────────────────
 check('no duplicate keys in the registry', new Set(SETTINGS.map((s) => s.key)).size === SETTINGS.length);
 check('every secret has a group and label', SETTINGS.every((s) => s.group && s.label));
+
+// ── 5. retired topology heartbeats ───────────────────────────────────────────
+const HEARTBEAT_GROUP = 'e2e-retired';
+const heartbeatKey = `heartbeat:${HEARTBEAT_GROUP}`;
+await writeHeartbeat(HEARTBEAT_GROUP, { fixture: true });
+check('fixture heartbeat exists before retirement',
+  (await db.select().from(schema.settings).where(eq(schema.settings.key, heartbeatKey))).length === 1);
+await retireHeartbeat(HEARTBEAT_GROUP);
+check('retiring a worker topology removes its exact heartbeat',
+  (await db.select().from(schema.settings).where(eq(schema.settings.key, heartbeatKey))).length === 0);
+let invalidHeartbeatRejected = false;
+try {
+  await retireHeartbeat('../workers');
+} catch {
+  invalidHeartbeatRejected = true;
+}
+check('retirement rejects an invalid heartbeat group', invalidHeartbeatRejected);
 
 // restore
 delete process.env[TEST_KEY];

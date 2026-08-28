@@ -255,7 +255,7 @@ export const siteProjects = pgTable('site_projects', {
   /** Unguessable path segment under deploys/; kept so a redeploy reuses the URL. */
   deployToken: text('deploy_token'),
   deployedAt: timestamp('deployed_at'),
-  state: text('state').notNull().default('pending'), // pending | brief | building | qa | needs_human_review | ready | deployed
+  state: text('state').notNull().default('pending'), // pending | brief | building | qa | needs_human_review | ready | deployed | failed | cancelled
   createdAt: timestamp('created_at').notNull().defaultNow(),
 }, (t) => [index('site_project_biz_idx').on(t.businessId)]);
 

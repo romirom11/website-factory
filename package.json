@@ -45,6 +45,7 @@
     "test:outreach-mode": "tsx scripts/test-outreach-mode.ts",
     "test:layout-quality": "tsx scripts/test-layout-quality.ts",
     "test:ui-shared-contracts": "tsx scripts/test-ui-shared-contracts.ts",
+    "test:smoke:compose": "tsx scripts/run-isolated-smoke.ts",
     "release:gate": "tsx scripts/release-gate.ts",
     "telegram:setup": "tsx src/telegram/bot.ts",
     "ui:dev": "pnpm --dir ui dev",

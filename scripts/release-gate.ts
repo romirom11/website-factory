@@ -67,7 +67,7 @@ const gates: Gate[] = [
   { name: 'all production images build', command: 'docker', args: ['compose', 'build'], fullOnly: true },
   { name: 'compose readiness', command: 'docker', args: ['compose', 'up', '-d', '--wait'], fullOnly: true },
   { name: 'runner confinement and fail-closed degradation', command: 'pnpm', args: ['test:runner-isolation'], fullOnly: true },
-  { name: 'fixture deterministic smoke', command: 'docker', args: ['compose', 'exec', '-T', 'factory', 'pnpm', 'tsx', 'scripts/smoke.ts'], fullOnly: true },
+  { name: 'fixture deterministic smoke', command: 'pnpm', args: ['test:smoke:compose'], fullOnly: true },
   { name: 'operator browser E2E', command: 'pnpm', args: ['e2e'], fullOnly: true },
   { name: 'discovery + approval integration', command: 'docker', args: ['compose', 'exec', '-T', 'factory', 'pnpm', 'tsx', 'scripts/integration-e2e.ts'], fullOnly: true },
   { name: 'GreenMail readiness', command: 'docker', args: ['compose', '--profile', 'dev-mail', 'up', '-d', '--wait', 'greenmail'], fullOnly: true },

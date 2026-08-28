@@ -28,7 +28,7 @@ import { query, type Options, type SDKMessage } from '@anthropic-ai/claude-agent
 import type { ZodType } from 'zod';
 import { config } from '../config.js';
 import { log } from '../lib/logger.js';
-import { zodToJsonSchema, extractJson, jsonOnlyInstruction } from './schema.js';
+import { outputJsonSchema, extractJson, jsonOnlyInstruction } from './schema.js';
 import { appendBuildLog, summarizeSdkMessage } from '../build/buildLog.js';
 import { withAgentSlot } from './semaphore.js';
 import { codeAgentEnv, buildPreToolUseGuard } from './sandbox.js';
@@ -309,7 +309,7 @@ export const claudeCodeRuntime: AgentRuntime = {
   terminalLaunch(opts: CodeAgentOptions, { settingsPath }: { settingsPath: string }): TerminalLaunchSpec {
     const args = [
       '--dangerously-skip-permissions',
-      '--model', effectiveModel(this.id, opts.heavy, config.agents.modelInputs()),
+      '--model', opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs()),
       '--settings', settingsPath,
       '--setting-sources', 'project',
       '--name', opts.name,
@@ -334,7 +334,7 @@ export const claudeCodeRuntime: AgentRuntime = {
   ): Promise<T> {
     const retries = opts.retries ?? 2;
     const timeoutMs = opts.timeoutMs ?? DEFAULT_STRUCTURED_TIMEOUT_MS;
-    const jsonSchema = zodToJsonSchema(schema);
+    const jsonSchema = outputJsonSchema(schema, opts.outputJsonSchema);
 
     // Images are handed over as file paths the agent reads itself (multimodal
     // Read); this keeps everything inside the subscription runtime.
@@ -344,7 +344,7 @@ export const claudeCodeRuntime: AgentRuntime = {
       : '';
 
     const cwd = opts.cwd ?? await mkdtemp(path.join(tmpdir(), 'factory-agent-'));
-    const model = effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
+    const model = opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
 
     return withStructuredRetries({
       name, runtime: this.id, retries,
@@ -371,7 +371,7 @@ export const claudeCodeRuntime: AgentRuntime = {
           env: codeAgentEnv(this.authEnv()),
         };
 
-        const prompt = `${userContent}${imageBlock}${jsonOnlyInstruction(schema)}`;
+        const prompt = `${userContent}${imageBlock}${jsonOnlyInstruction(schema, opts.outputJsonSchema)}`;
         const startedAt = Date.now();
         const run = await collectRun(options, prompt, timeoutMs, `structured:${name}`, {
           logPath: opts.buildLogPath, agent: name,
@@ -420,7 +420,7 @@ export const claudeCodeRuntime: AgentRuntime = {
     invocation: CodeAgentInvocationContext,
   ): Promise<T> {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_CODE_TIMEOUT_MS;
-    const model = effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
+    const model = opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
 
     return withAgentSlot(`code:${opts.name}`, async () => {
       const options: Options = {
@@ -458,7 +458,7 @@ export const claudeCodeRuntime: AgentRuntime = {
       const prompt =
         `${opts.prompt}\n\n` +
         `MANDATORY FINAL STEP: write a file named result.json in the workspace root (${opts.cwd}) ` +
-        `matching this JSON Schema, then stop:\n${JSON.stringify(zodToJsonSchema(resultSchema), null, 2)}`;
+        `matching this JSON Schema, then stop:\n${JSON.stringify(outputJsonSchema(resultSchema, opts.outputJsonSchema), null, 2)}`;
 
       const startedAt = Date.now();
       const run = await collectRun(options, prompt, timeoutMs, `code:${opts.name}`, {

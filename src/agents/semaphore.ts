@@ -109,6 +109,11 @@ export function withAgentWorkerGroup<T>(
   return workerGroupContext.run(group, operation);
 }
 
+/** Current group, exported so a remote transport can preserve the context. */
+export function currentAgentWorkerGroup(): WorkerGroup {
+  return workerGroupContext.getStore() ?? 'core';
+}
+
 /** Run one agent call under the current worker-group slot. */
 export function withAgentSlot<T>(label: string, operation: () => Promise<T>): Promise<T> {
   const group = workerGroupContext.getStore() ?? 'core';

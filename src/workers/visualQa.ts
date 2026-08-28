@@ -19,15 +19,15 @@
  */
 import { chromium, type Browser } from 'playwright';
 import path from 'node:path';
-import { copyFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { copyFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { eq } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { getObject, putRaw } from '../lib/storage.js';
 import { serveDir } from '../lib/serveDir.js';
 import { config } from '../config.js';
 import { runAgent } from '../agents/agent.js';
+import { createAgentInputWorkspace } from '../agents/transport.js';
 import { parkBuildForHumanReview } from '../orchestrator/buildReviewDecision.js';
 import { enqueue, NeedsHumanError, type JobPayload } from '../orchestrator/queue.js';
 import { buildSnapshot, type BuildSnapshot } from '../build/snapshot.js';
@@ -758,7 +758,7 @@ export async function runVisualCritique(opts: {
   /** Project's live build log; the critic's own turns are traced into it too. */
   buildLogPath?: string;
 }): Promise<import('../build/schemas.js').VisualCritique> {
-  const shotDir = await mkdtemp(path.join(tmpdir(), 'factory-qa-'));
+  const shotDir = await createAgentInputWorkspace('factory-qa-');
   try {
     const imagePaths: string[] = [];
     const inventory: Array<{ image: string; what: string }> = [];

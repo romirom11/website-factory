@@ -16,14 +16,14 @@
  * Both documents are frozen into object storage and referenced from `site_projects`,
  * so a rebuild months later reproduces the same inputs.
  */
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { and, desc, eq, inArray, ne } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { getObject, putRaw } from '../lib/storage.js';
 import { runAgent } from '../agents/agent.js';
+import { createAgentInputWorkspace } from '../agents/transport.js';
 import {
   businessTransitions,
   canContinueAfterTransition,
@@ -484,7 +484,7 @@ face are on the anti-slop ban-list and are vetoed by code.`;
   // the first shipped heroVideoBrief described «forearm skin with handpiece»
   // for a photo nobody had opened, while the card offered a vertical text
   // banner as the start frame (Roman, 2026-08-22: «І шо це за брєд?»).
-  const photoDir = await mkdtemp(path.join(tmpdir(), 'factory-design-'));
+  const photoDir = await createAgentInputWorkspace('factory-design-');
   const photoPaths: string[] = [];
   for (const asset of realPhotos(snapshot).slice(0, 6)) {
     try {

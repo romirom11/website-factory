@@ -19,7 +19,7 @@ import path from 'node:path';
 import type { ZodType } from 'zod';
 import { config } from '../config.js';
 import { log } from '../lib/logger.js';
-import { zodToJsonSchema, extractJson, jsonOnlyInstruction } from './schema.js';
+import { outputJsonSchema, extractJson, jsonOnlyInstruction } from './schema.js';
 import { withAgentSlot } from './semaphore.js';
 import { codeAgentEnv } from './sandbox.js';
 import { withStructuredRetries } from './retry.js';
@@ -89,7 +89,7 @@ export const codexRuntime: AgentRuntime = {
       '--skip-git-repo-check',
       '--cd', opts.cwd,
     ];
-    const model = effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
+    const model = opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
     if (model) args.push('--model', model);
     args.push(kickoffLine(PROMPT_FILE));
     return { command: config.agents.codexBin, args, needsKickoff: false, interactive: false };
@@ -107,11 +107,11 @@ export const codexRuntime: AgentRuntime = {
     const scratch = await mkdtemp(path.join(tmpdir(), 'factory-codex-'));
     const schemaPath = path.join(scratch, 'schema.json');
     const lastMessagePath = path.join(scratch, 'last-message.txt');
-    await writeFile(schemaPath, JSON.stringify(zodToJsonSchema(schema), null, 2), 'utf8');
+    await writeFile(schemaPath, JSON.stringify(outputJsonSchema(schema, opts.outputJsonSchema), null, 2), 'utf8');
 
     const imageArgs = (opts.imagePaths ?? []).flatMap((p) => ['--image', p]);
-    const prompt = `${systemPrompt}\n\n---\n\n${userContent}${jsonOnlyInstruction(schema)}`;
-    const model = effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
+    const prompt = `${systemPrompt}\n\n---\n\n${userContent}${jsonOnlyInstruction(schema, opts.outputJsonSchema)}`;
+    const model = opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
 
     try {
       return await withStructuredRetries({
@@ -165,7 +165,7 @@ export const codexRuntime: AgentRuntime = {
       const prompt =
         `${opts.appendSystemPrompt ? `${opts.appendSystemPrompt}\n\n---\n\n` : ''}${opts.prompt}\n\n` +
         `MANDATORY FINAL STEP: write a file named result.json in the workspace root (${opts.cwd}) ` +
-        `matching this JSON Schema, then stop:\n${JSON.stringify(zodToJsonSchema(resultSchema), null, 2)}`;
+        `matching this JSON Schema, then stop:\n${JSON.stringify(outputJsonSchema(resultSchema, opts.outputJsonSchema), null, 2)}`;
 
       const args = [
         'exec',
@@ -173,7 +173,7 @@ export const codexRuntime: AgentRuntime = {
         '--skip-git-repo-check',
         '--cd', opts.cwd,
       ];
-      const model = effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
+      const model = opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
       if (model) args.push('--model', model);
       args.push(prompt);
 

@@ -6,9 +6,9 @@
 
 | Рантайм | Оплата | Аутентифікація |
 |---|---|---|
-| `claude-code` (default) | підписка Claude Pro/Max Романа | сервер: `claude setup-token` → токен у налаштуваннях; локально: власний логін CLI |
-| `codex` | підписка ChatGPT | `codex login` (токен у `$CODEX_HOME`) |
-| `opencode` | підписка провайдера, залогіненого в opencode (Kimi, Zen, …) | `opencode providers login` (креденшели в `~/.local/share/opencode/auth.json`) |
+| `claude-code` (default) | підписка Claude Pro/Max Романа | UI запускає `claude setup-token` у runner; токен у runner credential volume |
+| `codex` | підписка ChatGPT | UI запускає `codex login`; credential у runner `$CODEX_HOME` |
+| `opencode` | підписка провайдера, залогіненого в opencode (Kimi, Zen, …) | `docker compose exec agent-runner-executor opencode auth login` |
 
 Усі реалізують `AgentRuntime` (`src/agents/types.ts`):
 
@@ -174,22 +174,22 @@ Builder працює з `bypassPermissions` (він мусить сам став
 
 ## Конкурентність
 
-`AGENT_CONCURRENCY` (дефолт 1) обмежує одночасні агентні виклики через in-process семафор (`withAgentSlot`, `src/agents/semaphore.ts`) — він огортає і `structured`, і `codeAgent` в обох адаптерах. Другий пояс: агентні типи jobs (`enrich`, `score-and-qa`, `content-and-design`, `build-site`, `visual-qa`, `request-approval`) реєструються в pg-boss з `teamSize: 1, batchSize: 1`, і їм дається довший `expireInSeconds` (90 хв), бо збірка сайту з `pnpm build` довга.
+Factory передає worker-group і її актуальний ліміт у кожному runner request. Executor відновлює окремі `core` / `enrich` / `build` семафори через `withAgentSlot`; attachable terminal додатково має окремий ліміт 1 через єдиний ttyd-порт. Другий пояс: агентні типи jobs (`enrich`, `score-and-qa`, `content-and-design`, `build-site`, `visual-qa`, `request-approval`) реєструються в pg-boss з `teamSize: 1, batchSize: 1`, і їм дається довший `expireInSeconds` (90 хв), бо збірка сайту з `pnpm build` довга.
 
 ## Docker
 
-Образ ставить усі три CLI:
+Окремий `Dockerfile.runner` ставить усі три CLI в executor (версії піновані):
 
 ```dockerfile
-RUN npm i -g @anthropic-ai/claude-code @openai/codex opencode-ai
+RUN npm i -g @anthropic-ai/claude-code@2.1.239 @openai/codex@0.149.1 opencode-ai@1.18.23
 ENV CODEX_HOME=/home/node/.codex
 ENV OPENCODE_DISABLE_AUTOUPDATE=1
 USER node          # НЕ hardening: --dangerously-skip-permissions відмовляється працювати під root
 ```
 
-`CLAUDE_CODE_OAUTH_TOKEN` підхоплюється з `.env`. Для Codex змонтуй `~/.codex`
-як volume (`codexhome`), для OpenCode — `~/.local/share/opencode`
-(`opencodehome`), щоб логіни підписок переживали рестарти.
+Claude token пишеться account-flow у runner-owned volume файлом `0600`. Codex і
+OpenCode мають окремі `codexhome` / `opencodehome` volumes. Factory-контейнери
+не монтують жоден із них і не містять provider CLI.
 
 Плюс два бінарники для термінала збірки: `tmux` (з apt) і `ttyd`. **ttyd ставиться
 не через apt**, а як пінований статичний бінарник із перевіркою sha256: його немає
@@ -208,9 +208,10 @@ pnpm tsx scripts/verify-agent-runtime.ts   # реальні виклики по 
 AGENT_RUNTIME=codex pnpm tsx scripts/verify-agent-runtime.ts
 AGENT_RUNTIME=opencode AGENT_MODEL=opencode/x-preview-f-free pnpm tsx scripts/verify-agent-runtime.ts
 pnpm tsx scripts/test-tmux-agent.ts --live-opencode  # реальна tmux-сесія opencode TUI
+pnpm test:agent-runner                 # protocol + gateway/executor + sync, без підписок
 ```
 
-## Групи воркерів: семафор на процес (рішення Романа, 2026-08-16)
+## Групи воркерів і capacity через runner (оновлено 2026-08-28)
 
 `AGENT_CONCURRENCY` і `withAgentSlot` обмежують агентні виклики **в межах одного
 процесу**. Поки `startWorkers()` реєстрував усі типи jobs, це означало спільну
@@ -218,9 +219,7 @@ FIFO-чергу: 40-хвилинна сесія `build-site` або блокув
 сама ставала в чергу за ним (реально спостережено: 126 `enrich` у черзі, білд не
 стартував 50 хвилин).
 
-Рішення — топологія процесів, не зміна архітектури (спека §2.3(а) говорить про
-конкурентність, а вона конфігурується на процес). `src/workers/main.ts` реєструє
-jobs групами `core` / `enrich` / `build`:
+Factory і надалі реєструє jobs групами `core` / `enrich` / `build`:
 
 ```bash
 pnpm workers                      # усі групи (дефолт, локальна розробка)
@@ -229,10 +228,10 @@ pnpm workers --only=build         # контейнер factory-build
 WORKER_GROUPS=build pnpm workers  # те саме через env
 ```
 
-Процес, що хостить рівно одну агентну групу, бере її власний ліміт:
-`AGENT_CONCURRENCY_BUILD` / `AGENT_CONCURRENCY_ENRICH` (інакше — глобальний
-`AGENT_CONCURRENCY`). Розклади реєструє тільки `core`. Деталі груп і сервісів
-compose — `docs/BUILD-PIPELINE.md` §11.
+Factory передає назву поточної групи й її ефективний ліміт у runner request.
+Executor відновлює три незалежні семафори, тому один довгий `build` не забирає
+слот у `enrich`, хоча provider CLI централізовані. Розклади реєструє тільки
+`core`. Деталі груп і сервісів compose — `docs/BUILD-PIPELINE.md` §11.
 
 Перемикання `AGENT_RUNTIME=codex` у UI кладе всі агентні етапи на підписку
 ChatGPT. Поточний runtime і фактичні normal/heavy моделі можна запитати прямо

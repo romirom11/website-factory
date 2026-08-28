@@ -344,7 +344,7 @@ export function LiveBuildPanel({ businessId, projectState }: {
             <p className="mt-1.5 text-sm text-ink-mute">
               Веб-термінал не налаштований. Підключитись можна по SSH:{' '}
               <span className="font-mono">tmux attach -r -t {terminal.session}</span>{' '}
-              у контейнері <span className="font-mono">factory-build</span>.
+              у контейнері <span className="font-mono">agent-runner-executor</span>.
             </p>
           )}
           {terminal.writable && (

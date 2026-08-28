@@ -31,6 +31,9 @@ import {
   startSession, submitCode, telegramChats,
 } from './accounts.js';
 import { reloadSettings } from '../lib/settingsStore.js';
+import { writeSetting } from '../lib/settingsStore.js';
+import { usesRemoteAgentTransport } from '../agents/transport.js';
+import { remoteAgentTransport } from '../agents/remoteTransport.js';
 import { ensureQueues } from '../orchestrator/queue.js';
 import { enqueue } from '../orchestrator/queue.js';
 import { createInternalAuth } from './internalAuth.js';
@@ -137,10 +140,27 @@ export async function startApi(): Promise<void> {
   // Same internal-key protection as the checks: these SPAWN processes and STORE
   // credentials, so they are strictly more sensitive than a read.
 
+  async function remoteAccount(
+    operation: 'start' | 'status' | 'submit-code' | 'cancel' | 'disconnect',
+    provider: 'claude' | 'codex',
+    code?: string,
+  ) {
+    try {
+      return await remoteAgentTransport.account(operation, provider, code);
+    } catch (error) {
+      log.warn('remote account control failed', { operation, provider, error });
+      return {
+        ok: false,
+        message: `Runner акаунтів недоступний: ${error instanceof Error ? error.message : String(error)}`.slice(0, 500),
+      };
+    }
+  }
+
   /** Begin a flow. Returns the first snapshot; the UI then polls /status. */
   app.post('/internal/accounts/:provider/start', internalAuth, async (c) => {
     const p = c.req.param('provider');
     if (!isAccountProvider(p)) return c.json({ ok: false, message: `невідомий провайдер: ${p}` }, 400);
+    if (usesRemoteAgentTransport()) return c.json(await remoteAccount('start', p));
     return c.json({ ok: true, session: startSession(p) });
   });
 
@@ -152,6 +172,7 @@ export async function startApi(): Promise<void> {
   app.get('/internal/accounts/:provider/status', internalAuth, async (c) => {
     const p = c.req.param('provider');
     if (!isAccountProvider(p)) return c.json({ ok: false, message: `невідомий провайдер: ${p}` }, 400);
+    if (usesRemoteAgentTransport()) return c.json(await remoteAccount('status', p));
     return c.json({ ok: true, session: activeSession(p) });
   });
 
@@ -160,20 +181,30 @@ export async function startApi(): Promise<void> {
     const p = c.req.param('provider');
     if (!isAccountProvider(p)) return c.json({ ok: false, message: `невідомий провайдер: ${p}` }, 400);
     const body = await c.req.json().catch(() => null) as { code?: string } | null;
+    if (usesRemoteAgentTransport()) {
+      return c.json(await remoteAccount('submit-code', p, String(body?.code ?? '')));
+    }
     return c.json({ ok: true, session: submitCode(p, String(body?.code ?? '')) });
   });
 
   app.post('/internal/accounts/:provider/cancel', internalAuth, async (c) => {
     const p = c.req.param('provider');
     if (!isAccountProvider(p)) return c.json({ ok: false, message: `невідомий провайдер: ${p}` }, 400);
+    if (usesRemoteAgentTransport()) return c.json(await remoteAccount('cancel', p));
     return c.json({ ok: true, session: cancelSession(p) });
   });
 
-  /** "Відключити": drop the stored credential (see accounts.ts for the asymmetry). */
+  /** "Відключити": ask the runtime owner to remove the provider credential. */
   app.post('/internal/accounts/:provider/disconnect', internalAuth, async (c) => {
     const p = c.req.param('provider');
     if (!isAccountProvider(p)) return c.json({ ok: false, message: `невідомий провайдер: ${p}` }, 400);
-    const res = await disconnect(p);
+    const res = usesRemoteAgentTransport()
+      ? await remoteAccount('disconnect', p)
+      : await disconnect(p);
+    if (usesRemoteAgentTransport() && p === 'claude' && res.ok) {
+      await writeSetting('CLAUDE_CODE_OAUTH_TOKEN', '', 'runner-disconnect').catch(() => undefined);
+      await reloadSettings().catch(() => undefined);
+    }
     // The cached chip would otherwise keep saying «підключено» for up to ten
     // minutes about a credential that has just been deleted.
     if (isCheckKind(p)) await invalidateCheck(p);
@@ -344,10 +375,18 @@ ${previous || '(попередніх автоматичних зауважень
     const tail = await readBuildLog(buildLogPath(businessId), after);
 
     // Whether Roman can attach to the REAL terminal of this build right now.
-    // Read off the shared volume rather than from tmux, because tmux runs in
-    // `factory-build` and this endpoint answers from `factory` — see
-    // TERMINAL_MARKER in src/agents/tmuxRuntime.ts.
-    const marker = project?.dir ? await liveTerminal(project.dir) : null;
+    // Production asks the runner gateway because tmux lives in the isolated
+    // executor; explicit local-development mode reads the marker directly.
+    const marker = project?.dir
+      ? usesRemoteAgentTransport()
+        ? await remoteAgentTransport.terminal('status', project.dir).catch((error) => {
+            log.warn('runner terminal status unavailable', {
+              businessId, err: String(error).slice(0, 200),
+            });
+            return null;
+          })
+        : await liveTerminal(project.dir)
+      : null;
 
     return c.json({
       ok: true,
@@ -378,8 +417,12 @@ ${previous || '(попередніх автоматичних зауважень
             // password, and anyone holding INTERNAL_API_KEY can derive this
             // value themselves. Withheld when no server is up, so the pair is
             // never handed out for a terminal that does not exist.
-            user: marker.served ? TERMINAL_USER : null,
-            password: marker.served ? terminalPassword() || null : null,
+            user: marker.served
+              ? ('user' in marker ? marker.user : TERMINAL_USER) ?? null
+              : null,
+            password: marker.served
+              ? ('password' in marker ? marker.password : terminalPassword()) || null
+              : null,
           }
         : null,
       active: job?.status === 'running' || job?.status === 'retry_wait',

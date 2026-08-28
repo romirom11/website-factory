@@ -30,10 +30,12 @@ import { log } from '../lib/logger.js';
 import { claudeCodeRuntime } from './claudeCodeRuntime.js';
 import { codexRuntime } from './codexRuntime.js';
 import { opencodeRuntime } from './opencodeRuntime.js';
+import { effectiveModel } from './modelPolicy.js';
 import {
   associateInvocationWithError,
   prepareCodeAgentInvocation,
 } from './result.js';
+import { usesRemoteAgentTransport } from './transport.js';
 import type {
   AgentKind,
   AgentRuntime,
@@ -71,7 +73,22 @@ export async function runAgent<T>(
   outputSchema: ZodType<T>,
   opts: StructuredOptions = {},
 ): Promise<T> {
-  return getRuntime(opts.kind).structured(name, systemPrompt, userContent, outputSchema, opts);
+  const runtime = getRuntime(opts.kind);
+  if (!usesRemoteAgentTransport()) {
+    return runtime.structured(name, systemPrompt, userContent, outputSchema, opts);
+  }
+  const { remoteAgentTransport } = await import('./remoteTransport.js');
+  return remoteAgentTransport.structured(
+    runtime.id,
+    name,
+    systemPrompt,
+    userContent,
+    outputSchema,
+    {
+      ...opts,
+      model: opts.model ?? effectiveModel(runtime.id, opts.heavy, config.agents.modelInputs()),
+    },
+  );
 }
 
 /**
@@ -99,6 +116,30 @@ export function shouldUseAttachableTerminal(
   return opts.terminal ?? mode === 'tmux';
 }
 
+/**
+ * Direct adapter dispatch used by explicit local development and by the remote
+ * runner executor. Factory production code reaches it only through the remote
+ * transport; there is deliberately no remote-error fallback into this helper.
+ */
+export async function executeCodeAgentLocally<T>(
+  opts: CodeAgentOptions,
+  resultSchema: ZodType<T>,
+  invocation: import('./types.js').CodeAgentInvocationContext,
+  runtime: AgentRuntime = getRuntime(opts.kind ?? 'builder'),
+): Promise<T> {
+  const wantsTerminal = shouldUseAttachableTerminal(opts, config.build.mode);
+  if (wantsTerminal) {
+    const { runCodeAgentTmux, tmuxAvailable } = await import('./tmuxRuntime.js');
+    if (await tmuxAvailable()) {
+      return runCodeAgentTmux(opts, resultSchema, opts.terminalSession, runtime, invocation);
+    }
+    log.warn('tmux is not installed; falling back to the selected headless runtime', {
+      agent: opts.name, runtime: runtime.id,
+    });
+  }
+  return runtime.codeAgent(opts, resultSchema, invocation);
+}
+
 export async function runCodeAgent<T>(
   opts: CodeAgentOptions,
   resultSchema: ZodType<T>,
@@ -110,21 +151,21 @@ export async function runCodeAgent<T>(
   try {
     const runtime = getRuntime(opts.kind ?? 'builder');
 
-    const wantsTerminal = shouldUseAttachableTerminal(opts, config.build.mode);
-    if (wantsTerminal) {
-      const { runCodeAgentTmux, tmuxAvailable } = await import('./tmuxRuntime.js');
-      if (await tmuxAvailable()) {
-        return await runCodeAgentTmux(opts, resultSchema, undefined, runtime, invocation);
-      }
-      // Not an error: a dev box without tmux should still build. Warned rather
-      // than silent, because "why can't I attach to the terminal" has exactly one
-      // answer and this is it.
-      log.warn('tmux is not installed; falling back to the selected headless runtime', {
-        agent: opts.name, runtime: runtime.id,
-      });
+    if (usesRemoteAgentTransport()) {
+      const { remoteAgentTransport } = await import('./remoteTransport.js');
+      return await remoteAgentTransport.code(
+        runtime.id,
+        {
+          ...opts,
+          terminal: shouldUseAttachableTerminal(opts, config.build.mode),
+          model: opts.model ?? effectiveModel(runtime.id, opts.heavy, config.agents.modelInputs()),
+        },
+        resultSchema,
+        invocation,
+      );
     }
 
-    return await runtime.codeAgent(opts, resultSchema, invocation);
+    return await executeCodeAgentLocally(opts, resultSchema, invocation, runtime);
   } catch (error) {
     throw associateInvocationWithError(error, invocation);
   }
@@ -132,5 +173,11 @@ export async function runCodeAgent<T>(
 
 export { z };
 export type { AgentKind, AgentRuntime, AgentRuntimeId, CodeAgentOptions, StructuredOptions } from './types.js';
-export { RateLimitedError, isRateLimitedError, AgentSchemaError } from './types.js';
+export {
+  RateLimitedError,
+  isRateLimitedError,
+  AgentSchemaError,
+  RunnerUnavailableError,
+  isRunnerUnavailableError,
+} from './types.js';
 export { agentSlotStats, withAgentSlot } from './semaphore.js';

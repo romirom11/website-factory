@@ -57,7 +57,7 @@ import type { ZodType } from 'zod';
 import { config } from '../config.js';
 import { log } from '../lib/logger.js';
 import { appendBuildLog, clip } from '../build/buildLog.js';
-import { zodToJsonSchema } from './schema.js';
+import { outputJsonSchema } from './schema.js';
 import { withAgentSlot } from './semaphore.js';
 import { codeAgentEnv } from './sandbox.js';
 import { readAndValidateResult } from './result.js';
@@ -155,7 +155,7 @@ async function sendKickoffVerified(
   const hint = /select login method|sign in|log in to continue|api key/i.test(raw)
     ? ' CLI просить логін — токен Claude Code не дійшов або недійсний: перепідключи його в /settings → Акаунти.'
     : /choose the text style|dark mode.*light mode|to get started/i.test(raw)
-      ? ' CLI показує первинний майстер налаштування — образ factory-build старий (фікс preTrustWorkspace ще не задеплоєний): онови деплой.'
+      ? ' CLI показує первинний майстер налаштування — образ agent-runner-executor старий (фікс preTrustWorkspace ще не задеплоєний): онови деплой.'
       : '';
   throw new Error(
     `tmux session ${session}: kickoff line never reached the input box.${hint} On screen: ${tail || '(порожня панель)'}`,
@@ -200,11 +200,9 @@ export const TERMINAL_LOG = 'terminal.log';
 /**
  * Marker announcing "a terminal for this project is live right now".
  *
- * It exists because the two things that need to agree live in DIFFERENT
- * CONTAINERS: tmux runs in `factory-build`, while the API that answers the UI
- * runs in `factory`, and `tmux has-session` in the latter would always say no.
- * The transport is the one they already share — the `sitesdata` volume — which
- * is exactly how `build-log.ndjson` crosses the same boundary.
+ * In production tmux runs in the isolated executor while the API answers from
+ * factory. The gateway reads this marker from the per-invocation scratch and
+ * returns only the terminal metadata; local-development mode reads it directly.
  *
  * Written when the session starts, deleted when it ends, including on failure.
  * A stale marker (host killed mid-build) is handled by the reader, which treats
@@ -315,6 +313,14 @@ async function captureVisible(session: string): Promise<string> {
 
 async function killSession(session: string): Promise<void> {
   await exec('tmux', ['kill-session', '-t', session], { timeoutMs: 10_000 });
+}
+
+/** Trusted runner control-plane cancellation for one known live session. */
+export async function cancelTmuxSession(session: string): Promise<void> {
+  if (!/^build-[A-Za-z0-9_-]{1,120}$/.test(session)) {
+    throw new Error('invalid tmux session name');
+  }
+  await killSession(session);
 }
 
 /**
@@ -451,7 +457,7 @@ export async function runCodeAgentTmux<T>(
       promptPath,
       `${prompt}\n\n` +
       `MANDATORY FINAL STEP: write a file named result.json in the workspace root (${opts.cwd}) ` +
-      `matching this JSON Schema, then stop:\n${JSON.stringify(zodToJsonSchema(resultSchema), null, 2)}\n`,
+      `matching this JSON Schema, then stop:\n${JSON.stringify(outputJsonSchema(resultSchema, opts.outputJsonSchema), null, 2)}\n`,
       'utf8',
     );
     // Per-runtime workspace/host preparation — guard wiring, trust seeding,
@@ -494,8 +500,12 @@ export async function runCodeAgentTmux<T>(
 
     // The spectator seat. Best-effort by construction: a build must not fail
     // because ttyd is missing or its port is busy.
-    const writable = config.build.terminalWritable && launch.interactive;
-    const served = await startTerminalServer(session, { writable }).catch(() => false);
+    const writable = (opts.terminalWritable ?? config.build.terminalWritable) && launch.interactive;
+    const served = await startTerminalServer(session, {
+      enabled: opts.terminalWeb,
+      port: opts.terminalPort,
+      writable,
+    }).catch(() => false);
     const markerPath = path.join(opts.cwd, TERMINAL_MARKER);
     const startedAtIso = new Date().toISOString();
     const writeMarker = async (): Promise<void> => {

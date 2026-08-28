@@ -2,6 +2,7 @@
   "name": "websites-factory",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@11.24.0",
   "type": "module",
   "description": "Autonomous factory: discover local businesses -> evidence package -> personalized demo site -> approval-gated outreach",
   "scripts": {
@@ -12,6 +13,8 @@
     "factory": "tsx src/cli.ts",
     "workers": "tsx src/workers/main.ts",
     "api": "tsx src/api/server.ts",
+    "runner:gateway": "tsx src/runner/gateway.ts",
+    "runner:executor": "tsx src/runner/executor.ts",
     "all": "tsx src/main.ts",
     "e2e": "tsx --tsconfig scripts/e2e/tsconfig.json scripts/e2e.ts",
     "import:legacy": "tsx scripts/import-legacy.ts",
@@ -36,6 +39,7 @@
     "test:landing-gallery": "tsx scripts/test-landing-gallery.ts",
     "test:tmux-agent": "tsx scripts/test-tmux-agent.ts",
     "test:agent-result-lifecycle": "tsx scripts/test-agent-result-lifecycle.ts",
+    "test:agent-runner": "tsx scripts/test-agent-runner.ts",
     "telegram:setup": "tsx src/telegram/bot.ts",
     "ui:dev": "pnpm --dir ui dev",
     "ui:build": "pnpm --dir ui build",
@@ -76,10 +80,5 @@
     "drizzle-kit": "^0.31.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild"
-    ]
   }
 }

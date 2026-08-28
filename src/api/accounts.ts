@@ -6,10 +6,10 @@
  * has to find a terminal, run `claude setup-token` there, and copy a secret
  * between two machines. The console should just have a **Підключити** button.
  *
- * These flows live in the FACTORY process, not in the UI, for the same reason
- * the checks do (see `checks.ts`): the factory container is the one with the
- * `claude` and `codex` CLIs, and it is the process whose credentials actually
- * get used. A login brokered anywhere else would prove nothing.
+ * These flows live beside the runtime that owns the credential, not in the UI.
+ * In production that is the isolated runner executor; explicit local-development
+ * mode keeps the same engine in the factory process. A login brokered by the UI
+ * container would authenticate the wrong filesystem and prove nothing.
  *
  * ─── What the CLIs really do (measured, not assumed) ─────────────────────────
  *
@@ -43,13 +43,17 @@
  * a `claude` process camped on a PTY forever.
  *
  * Nothing here touches business data, and no secret is ever returned to the
- * browser: the resulting token goes straight into the encrypted settings store.
+ * browser: the resulting token goes straight into the runtime credential store.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { config } from '../config.js';
 import { log } from '../lib/logger.js';
-import { writeSetting, reloadSettings } from '../lib/settingsStore.js';
-import { runCheck, type CheckResult } from './checks.js';
+import { runLocalAgentCheck, type CheckResult } from './checks.js';
+import {
+  clearRunnerClaudeCredential,
+  runnerCredentialStoreEnabled,
+  seedRunnerClaudeCredential,
+} from '../runner/credentials.js';
 
 export type AccountProvider = 'claude' | 'codex';
 
@@ -459,17 +463,27 @@ function startClaude(s: Session): void {
 async function storeClaudeToken(s: Session, token: string): Promise<void> {
   s.phase = 'submitting';
   s.message = 'Токен отримано, зберігаю…';
+  const runnerStore = runnerCredentialStoreEnabled();
   try {
-    await writeSetting('CLAUDE_CODE_OAUTH_TOKEN', token, 'accounts-ui');
-    // The check reads through the config getters, which read the snapshot.
-    await reloadSettings().catch(() => {});
+    if (runnerStore) {
+      await seedRunnerClaudeCredential(token);
+    } else {
+      // Keep the executor free of a static settingsStore -> db/client edge. The
+      // database-backed store exists only in explicit local-development mode.
+      const { writeSetting, reloadSettings } = await import('../lib/settingsStore.js');
+      await writeSetting('CLAUDE_CODE_OAUTH_TOKEN', token, 'accounts-ui');
+      // The check reads through the config getters, which read the snapshot.
+      await reloadSettings().catch(() => {});
+    }
   } catch (err) {
     finish(s, 'error', `Токен отримано, але не зберігся: ${String(err).slice(0, 200)}. `
-      + 'Найімовірніше не заданий SETTINGS_MASTER_KEY.');
+      + (runnerStore
+        ? 'Перевір права на runner credential volume.'
+        : 'Найімовірніше не заданий SETTINGS_MASTER_KEY.'));
     return;
   }
   // Kill the child before the (slow) ping so no PTY lingers while we wait.
-  const check = await runCheck('claude').catch((err): CheckResult => ({
+  const check = await runLocalAgentCheck('claude').catch((err): CheckResult => ({
     ok: false, message: `Токен збережено, але перевірка впала: ${String(err).slice(0, 200)}`,
   }));
   s.check = check;
@@ -528,7 +542,7 @@ function startCodex(s: Session): void {
       s.message = 'Вхід прийнято, перевіряю…';
       // `codex login status` is the CLI's own answer — the credential lands in
       // $CODEX_HOME (a named volume), so this also proves it persisted.
-      void runCheck('codex')
+      void runLocalAgentCheck('codex')
         .then((check) => {
           s.check = check;
           finish(s, check.ok ? 'done' : 'error', check.ok
@@ -655,26 +669,48 @@ export function cancelSession(provider: AccountProvider): AccountSession {
 /**
  * Disconnect a provider.
  *
- * Claude: delete the stored token (writeSetting('') deletes the row, so the
- * resolution order falls back to env/CLI login rather than storing an empty
- * override). Codex: we deliberately do NOT wipe $CODEX_HOME from a web button —
- * that is Roman's ChatGPT session on disk, and `codex logout` is one shell
- * command away if he ever wants it gone.
+ * Claude: delete the token from the active runtime credential store. In local
+ * development, writeSetting('') deletes the row rather than storing an empty
+ * override. Codex: invoke the CLI's own logout command against the credential
+ * volume; deleting files behind the CLI's back would make its format our API.
  */
 export async function disconnect(provider: AccountProvider): Promise<{ ok: boolean; message: string }> {
   if (provider === 'claude') {
+    const runnerStore = runnerCredentialStoreEnabled();
     try {
-      await writeSetting('CLAUDE_CODE_OAUTH_TOKEN', '', 'accounts-ui');
-      await reloadSettings().catch(() => {});
-      return { ok: true, message: 'Токен Claude видалено з налаштувань.' };
+      if (runnerStore) {
+        await clearRunnerClaudeCredential();
+      } else {
+        const { writeSetting, reloadSettings } = await import('../lib/settingsStore.js');
+        await writeSetting('CLAUDE_CODE_OAUTH_TOKEN', '', 'accounts-ui');
+        await reloadSettings().catch(() => {});
+      }
+      return {
+        ok: true,
+        message: runnerStore
+          ? 'Токен Claude видалено з runner credential volume.'
+          : 'Токен Claude видалено з налаштувань.',
+      };
     } catch (err) {
       return { ok: false, message: `Не вдалося видалити: ${String(err).slice(0, 200)}` };
     }
   }
-  return {
-    ok: false,
-    message: 'Codex-логін лежить у volume codexhome. Прибрати: `docker compose exec factory codex logout`.',
-  };
+  return new Promise((resolve) => {
+    const child = spawn(config.agents.codexBin, ['logout'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: loginEnv(),
+    });
+    let output = '';
+    child.stdout.on('data', (value) => { output += String(value); });
+    child.stderr.on('data', (value) => { output += String(value); });
+    child.on('error', (error) => resolve({
+      ok: false,
+      message: `Не вдалося запустити Codex logout: ${String(error).slice(0, 200)}`,
+    }));
+    child.on('close', (code) => resolve(code === 0
+      ? { ok: true, message: 'Codex відключений, login volume очищено CLI-командою.' }
+      : { ok: false, message: `Codex logout завершився з кодом ${code}: ${tidyCliReason(output).slice(0, 200)}` }));
+  });
 }
 
 export function isAccountProvider(v: string): v is AccountProvider {

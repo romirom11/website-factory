@@ -1,12 +1,10 @@
 /**
  * Connectivity checks behind the UI's "Перевірити" buttons.
  *
- * These live in the FACTORY process, not the UI, for two reasons:
- *  1. the UI container has no `codex`/`claude` CLI and is not on the same
- *     network path for every dependency — the factory is the process that will
- *     actually do the sending, so a green check here means the real path works;
- *  2. they read the same live `config.*` getters the workers use, so a check
- *     verifies the value Roman just saved, not a copy.
+ * Agent-provider checks run beside the runtime credential (the isolated runner
+ * executor in production). Deterministic channel checks remain in the factory,
+ * beside the network/configuration path they prove. The UI never performs a
+ * synthetic substitute for either path.
  *
  * Every check RETURNS a result and never throws: a failing dependency must show
  * up as a red line in the console, not as a 500.
@@ -26,9 +24,11 @@ import { getRuntime } from '../agents/runtime.js';
 import { effectiveModel, effectiveModels } from '../agents/modelPolicy.js';
 import { z } from 'zod';
 import { readCodexAccountEmail } from './codexAccount.js';
+import { usesRemoteAgentTransport } from '../agents/transport.js';
 
 export type CheckKind =
   | 'claude' | 'codex' | 'opencode' | 'telegram' | 'telegram-send' | 'smtp' | 'imap' | 'waha';
+export type AgentCheckKind = Extract<CheckKind, 'claude' | 'codex' | 'opencode'>;
 
 export interface CheckResult {
   ok: boolean;
@@ -49,9 +49,9 @@ const short = (err: unknown, max = 300): string =>
  * Cheapest possible real agent call: a one-field structured answer. It proves
  * the token AND the subscription path, which a token-format check would not.
  */
-async function checkClaude(): Promise<CheckResult> {
+async function checkClaude(modelOverride?: string): Promise<CheckResult> {
   const token = config.agents.oauthToken;
-  const model = effectiveModel('claude-code', false, config.agents.modelInputs());
+  const model = modelOverride ?? effectiveModel('claude-code', false, config.agents.modelInputs());
   try {
     // The claude-code runtime explicitly, not `getRuntime()`: this button says
     // "Claude", and it must not silently pass when AGENT_RUNTIME is `codex`.
@@ -60,7 +60,7 @@ async function checkClaude(): Promise<CheckResult> {
       'You answer with JSON only.',
       'Reply with {"pong": true}. Nothing else.',
       z.object({ pong: z.boolean() }),
-      { retries: 0, timeoutMs: 90_000 },
+      { retries: 0, timeoutMs: 90_000, model },
     );
     return {
       ok: res?.pong === true,
@@ -123,7 +123,7 @@ async function checkCodex(): Promise<CheckResult> {
         ? `Codex залогінений як ${accountEmail}.`
         : `Codex залогінений: ${text.slice(0, 160) || 'ok'}`
       // The remedy is the «Підключити» button on this very card (it runs
-      // `codex login --device-auth` in the factory container), so the message
+      // `codex login --device-auth` in the runtime executor), so the message
       // must not send Roman to a terminal for something the page now does.
       : 'Codex не залогінений — натисни «Підключити».',
     detail: { accountEmail, bin, exit: code, output: text.slice(0, 300) },
@@ -136,11 +136,11 @@ async function checkCodex(): Promise<CheckResult> {
  * Same philosophy as checkClaude: the cheapest real agent call proves both the
  * login and the whole path, which no credential-file inspection could.
  * The credential lives in OpenCode's own home (`auth.json`); if it is missing
- * or its provider refuses, the remedy is `opencode providers login`.
+ * or its provider refuses, the remedy is `opencode auth login` in the executor.
  */
-async function checkOpenCode(): Promise<CheckResult> {
+async function checkOpenCode(modelOverride?: string): Promise<CheckResult> {
   const bin = config.agents.openCodeBin;
-  const model = effectiveModel('opencode', false, config.agents.modelInputs());
+  const model = modelOverride ?? effectiveModel('opencode', false, config.agents.modelInputs());
   try {
     // This runtime explicitly, not `getRuntime()`: the button says "OpenCode".
     const res = await opencodeRuntime.structured(
@@ -148,7 +148,7 @@ async function checkOpenCode(): Promise<CheckResult> {
       'You answer with JSON only.',
       'Reply with {"pong": true}. Nothing else.',
       z.object({ pong: z.boolean() }),
-      { retries: 0, timeoutMs: 90_000 },
+      { retries: 0, timeoutMs: 90_000, model },
     );
     return {
       ok: res?.pong === true,
@@ -163,7 +163,7 @@ async function checkOpenCode(): Promise<CheckResult> {
     return {
       ok: false,
       message: needsLogin
-        ? 'OpenCode не залогінений — виконай `opencode providers login` у контейнері factory і залогінь потрібного провайдера.'
+        ? 'OpenCode не залогінений — виконай `docker compose exec agent-runner-executor opencode auth login` і залогінь потрібного провайдера.'
         : `OpenCode не відповів: ${text}`,
       detail: { bin, model: model || 'типова модель CLI' },
     };
@@ -385,12 +385,31 @@ const CHECKS: Record<CheckKind, () => Promise<CheckResult>> = {
   waha: checkWaha,
 };
 
+export function isAgentCheckKind(kind: CheckKind): kind is AgentCheckKind {
+  return kind === 'claude' || kind === 'codex' || kind === 'opencode';
+}
+
+/** Direct provider check used only inside the runner executor/local development. */
+export async function runLocalAgentCheck(kind: AgentCheckKind, model?: string): Promise<CheckResult> {
+  try {
+    if (kind === 'claude') return await checkClaude(model);
+    if (kind === 'opencode') return await checkOpenCode(model);
+    return await checkCodex();
+  } catch (err) {
+    return { ok: false, message: `Перевірка впала: ${short(err)}` };
+  }
+}
+
 export function isCheckKind(v: string): v is CheckKind {
   return v in CHECKS;
 }
 
 export async function runCheck(kind: CheckKind): Promise<CheckResult> {
   try {
+    if (isAgentCheckKind(kind) && usesRemoteAgentTransport()) {
+      const { remoteAgentTransport } = await import('../agents/remoteTransport.js');
+      return await remoteAgentTransport.check(kind);
+    }
     return await CHECKS[kind]();
   } catch (err) {
     return { ok: false, message: `Перевірка впала: ${short(err)}` };

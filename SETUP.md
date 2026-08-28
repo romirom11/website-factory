@@ -126,7 +126,7 @@ CMD обох factory-сервісів, ідемпотентно).
 BUILD_TERMINAL_BASE_URL=http://<host-або-tailscale-імʼя>:7681
 ```
 
-Порт `7681` опублікований на `127.0.0.1` контейнера `factory-build`, тому
+Порт `7681` опублікований на `127.0.0.1` контейнера `agent-runner-executor`, тому
 «з браузера» означає: через Tailscale, SSH-тунель (`ssh -L 7681:localhost:7681
 <host>`) або той самий authenticated reverse-proxy, що й UI.
 
@@ -134,22 +134,23 @@ BUILD_TERMINAL_BASE_URL=http://<host-або-tailscale-імʼя>:7681
 додати path-маршрут на compose-сервіс, тому маршрут заведений РУЧНИМ файлом
 `/etc/dokploy/traefik/dynamic/website-factory-terminal-custom.yml` —
 `Host(website-factory.kdnx.cloud) && PathPrefix(/terminal)` →
-`http://factory-build:7681`, priority 100 (вище за Host-only роутер UI).
+`http://agent-runner-executor:7681`, priority 100 (вище за Host-only роутер UI).
 Traefik підхоплює зміни файлу без рестарту; Dokploy цей файл не генерує і не
 чіпає. При переїзді сервера файл треба перенести або створити заново, а в
 «Адресі термінала збірки» стоїть `https://website-factory.kdnx.cloud/terminal`.
 Памʼятай: ttyd живе лише під час активної збірки — поза нею `/terminal`
 відповідає 502/504, і це норма, а не зламаний маршрут. Пароль — basic auth,
-логін `roman`, пароль **похідний** від `INTERNAL_API_KEY`; побачити його можна
+логін `roman`, пароль **похідний** від приватного `RUNNER_EXECUTOR_API_KEY`;
+побачити його можна
 так:
 
 ```bash
-docker compose exec factory-build node -e "console.log(require('crypto').createHash('sha256').update('build-terminal:'+process.env.INTERNAL_API_KEY).digest('hex').slice(0,24))"
+docker compose exec agent-runner-executor node -e "console.log(require('crypto').createHash('sha256').update('build-terminal:'+process.env.INTERNAL_API_KEY).digest('hex').slice(0,24))"
 ```
 
 Якщо `BUILD_TERMINAL_BASE_URL` порожній — нічого не ламається: у картці бізнесу
 замість кнопки зʼявиться підказка, як підключитись по SSH
-(`docker compose exec factory-build tmux attach -r -t build-<projectId>`).
+(`docker compose exec agent-runner-executor tmux attach -r -t build-<requestId>`).
 
 Термін «підключитись» тут означає **дивитись**. Щоб мати змогу друкувати живому
 агенту, треба свідомо ввімкнути `BUILD_TERMINAL_WRITABLE` (у `/settings` →
@@ -173,10 +174,11 @@ docker compose exec factory-build node -e "console.log(require('crypto').createH
 > **Оновлення (2026-08-17, друге):** підключення акаунтів — це вже не поля з
 > токенами, а розділ **«Акаунти»** на `/settings` (сторінка розбита на розділи
 > з бічним меню) з кнопкою **Підключити** в кожному рядку. Термінал більше не
-> потрібен **ніде**, включно з
-> `claude setup-token` і `codex login`: фабрика запускає ці CLI у себе в
-> контейнері, показує тобі посилання (і код, де він потрібен) прямо на
-> сторінці, і сама зберігає результат зашифрованим.
+> потрібен для Claude або Codex: UI просить runner executor запустити
+> `claude setup-token` / `codex login`, показує посилання (і код, де він
+> потрібен) та зберігає credential у його окремому volume. OpenCode поки має
+> власний інтерактивний TUI, тому логіниться командою
+> `docker compose exec agent-runner-executor opencode auth login`.
 >
 > Коротка версія всього кроку (г): **відкрий `/settings` → «Акаунти», клікни
 > рядок і натисни «Підключити».** Розгорнуті пояснення нижче — на випадок,
@@ -189,7 +191,7 @@ docker compose exec factory-build node -e "console.log(require('crypto').createH
 > Біля кожного поля видно, звідки взялося значення (`БД` / `env` / `дефолт`),
 > хто і коли його змінив.
 
-### 0. `.env` — рівно чотири речі (єдиний крок у файлі)
+### 0. `.env` — шість локальних секретів (єдиний крок у файлі)
 
 ```bash
 cp .env.example .env
@@ -197,6 +199,8 @@ echo "UI_PASSWORD=$(openssl rand -hex 16)" >> .env          # вхід у кон
 echo "UI_SESSION_SECRET=$(openssl rand -hex 32)" >> .env    # підпис cookie
 echo "SETTINGS_MASTER_KEY=$(openssl rand -hex 32)" >> .env  # ключ шифрування секретів
 echo "INTERNAL_API_KEY=$(openssl rand -hex 32)" >> .env     # UI → фабрика (кнопки «Перевірити»)
+echo "RUNNER_API_KEY=$(openssl rand -hex 32)" >> .env       # фабрика → runner gateway
+echo "RUNNER_EXECUTOR_API_KEY=$(openssl rand -hex 32)" >> .env # gateway → executor
 ```
 
 Плюс `DATABASE_URL` / `POSTGRES_PASSWORD` / `S3_*`, які вже є в шаблоні.
@@ -216,12 +220,12 @@ open http://localhost:3000/settings      # далі — тільки тут
 
 Далі все на сторінці:
 
-1. фабрика запускає `claude setup-token` у себе в контейнері й показує
+1. runner executor запускає `claude setup-token` і показує
    **посилання** — відкрий його (кнопка відкриває нову вкладку; поруч є те саме
    посилання текстом, якщо треба відкрити на іншій машині);
 2. увійди акаунтом з підпискою **Pro/Max** і скопіюй код, який покаже сторінка;
 3. встав його в поле **«Вставте код зі сторінки»** → **«Надіслати код»**;
-4. токен зберігається зашифрованим у Postgres, і фабрика одразу робить
+4. токен записується з правами `0600` у credential volume executor-а, і runner одразу робить
    **справжній агентний виклик** для перевірки. Зелений рядок = працює.
 
 На все відведено 5 хвилин, далі сесія сама згасає (кнопка «Скасувати» — будь-коли).
@@ -232,7 +236,9 @@ open http://localhost:3000/settings      # далі — тільки тут
 - `Токен збережено, але перевірка не пройшла…` — токен прийнявся, але виклик не
   пройшов; дивись текст перевірки (найчастіше вичерпано ліміт підписки).
 
-**«Відключити»** прибирає токен із налаштувань (падає назад на `.env`/CLI-логін).
+**«Відключити»** прибирає credential з runner volume. Legacy-токен із БД можна
+одноразово перенести через `RUNNER_SEED_CLAUDE_CREDENTIAL=true`, перевірити й
+одразу повернути цей прапорець у `false`.
 
 Жодного `ANTHROPIC_API_KEY` — він не потрібен і свідомо не читається кодом
 (рішення №10); більше того, він **прибирається** з оточення процесу логіну, щоб
@@ -495,12 +501,12 @@ beauty** — нова ніша потребує своєї теки `references/
 - **Не перевірено живим прогоном**: справжня сесія `claude` у tmux
   (`pnpm test:tmux-agent --live`) і сам `ttyd`. На маку Романа немає ні tmux, ні
   ttyd, а ставити їх на його машину я не став. **Перший крок на сервері:**
-  `docker compose exec factory-build pnpm test:tmux-agent --live` — це підніме
+  `docker compose exec agent-runner-executor pnpm test:tmux-agent --live` — це підніме
   одну коротку справжню сесію і перевірить весь ланцюг (сесія → промпт-файл →
   `result.json` → скролбек → прибирання). Поки цього не зроблено, тримай
   `BUILDER_MODE=sdk`, якщо не хочеш ризикувати першою реальною збіркою.
-- Одна сесія на процес: `factory-build` і так тримає одного агента, тому
-  паралельні збірки з окремими терміналами не передбачені.
+- Один attachable terminal на executor через єдиний порт ttyd; headless-виклики
+  паралельно використовують окремі ліміти `core` / `enrich` / `build`.
 - Якщо `claude` у tmux завершиться, не написавши `result.json`, збірка впаде з
   причиною (`idle` / `gone` / `timeout`) і хвостом pane у тексті помилки; повний
   скролбек лишиться у `sites/<biz>/<projectId>/terminal.log`.
@@ -519,9 +525,9 @@ beauty** — нова ніша потребує своєї теки `references/
 
 **`ERR_PNPM_IGNORED_BUILDS` при збірці образу.** pnpm 11 виходить з ненульовим
 кодом, якщо build-скрипти залежностей заблоковані. Дозвіл живе **тільки** в
-`pnpm-workspace.yaml` (`onlyBuiltDependencies: [esbuild]`) — поле `pnpm` у
-`package.json` pnpm 11 більше не читає. Цей файл **обовʼязково** копіюється в
-образ.
+`pnpm-workspace.yaml` (`allowBuilds: { esbuild: true }`). pnpm 11 видалив
+`onlyBuiltDependencies`; старе поле лише мовчки залишало нативний setup
+заблокованим. Workspace-файл **обовʼязково** копіюється в образ.
 
 **Агентні джоби падають з `--dangerously-skip-permissions cannot be used with
 root`.** Claude Code відмовляється працювати під root. Образ тому запускається
@@ -554,10 +560,10 @@ pnpm tsx scripts/purge-orphan-jobs.ts --apply   # видалити
 1. `BUILD_TERMINAL_BASE_URL` порожній → кнопки не буде за задумом (у картці
    натомість підказка про SSH). Заповни в `/settings` → Агенти.
 2. `BUILDER_MODE=sdk` → термінала немає взагалі, це безголова сесія.
-3. tmux не знайшовся на хості → в логах `factory-build` буде
+3. tmux не знайшовся в executor → у його логах буде
    `tmux is not installed; falling back to the headless SDK runtime`.
 4. ttyd не піднявся → `build terminal not served: …`. Дві типові причини:
-   не виставлений `INTERNAL_API_KEY` (без нього пароля немає, а термінал без
+   не виставлений `RUNNER_EXECUTOR_API_KEY` (без похідного пароля термінал без
    автентифікації — це шел на хості для будь-кого, тому він свідомо не
    стартує), або порт `7681` уже зайнятий.
 

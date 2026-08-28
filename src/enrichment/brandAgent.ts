@@ -33,13 +33,13 @@
  * costs a business its palette.
  */
 import path from 'node:path';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { rm, writeFile } from 'node:fs/promises';
 import type { Browser, Page } from 'playwright';
 import { and, desc, eq, like } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { getObject } from '../lib/storage.js';
 import { runCodeAgent, z } from '../agents/codeAgent.js';
+import { createAgentInputWorkspace } from '../agents/transport.js';
 import { log } from '../lib/logger.js';
 import {
   decodeImage, fromHex, newDecodePage, paletteFromImage, type PaletteEntry, type Rgb,
@@ -476,7 +476,7 @@ export async function runBrandAgent(
     return null;
   }
 
-  const dir = await mkdtemp(path.join(tmpdir(), 'factory-brand-'));
+  const dir = await createAgentInputWorkspace('factory-brand-');
   const ownBrowser = !opts.browser;
   let browser: Browser | null = null;
   let page: Page | null = null;
@@ -528,8 +528,8 @@ export async function runBrandAgent(
           timeoutMs: opts.timeoutMs ?? 10 * 60_000,
           // Headless even when builds run in tmux: this is a few minutes of
           // looking at images in a scratch dir, with nothing worth attaching
-          // to, and it runs in the `factory` process — which does not own the
-          // terminal port that `factory-build` serves.
+          // to. The shared runner reserves its single web-terminal slot for
+          // attachable build sessions.
           terminal: false,
           onUsage: (u) => log.info('agent usage', { businessId, call: 'brand-identity', ...u }),
         }, BrandAgentResultSchema);

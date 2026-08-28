@@ -32,6 +32,7 @@ import type {
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
+process.env.AGENT_EXECUTION_MODE = 'local-development';
 const ResultSchema = z.object({ ok: z.boolean(), note: z.string() });
 const validResult = JSON.stringify({ ok: true, note: 'current invocation' });
 let passed = 0;
@@ -187,8 +188,11 @@ try {
     const preparedAt = body.indexOf('prepareCodeAgentInvocation(opts.cwd)');
     const selectedAt = body.indexOf("getRuntime(opts.kind ?? 'builder')");
     assert.ok(preparedAt >= 0 && selectedAt > preparedAt);
-    assert.match(body, /runCodeAgentTmux\(opts, resultSchema, undefined, runtime, invocation\)/);
-    assert.match(body, /runtime\.codeAgent\(opts, resultSchema, invocation\)/);
+    assert.match(body, /remoteAgentTransport\.code\([\s\S]*?invocation/);
+    assert.match(body, /executeCodeAgentLocally\(opts, resultSchema, invocation, runtime\)/);
+    const localBody = source.slice(source.indexOf('export async function executeCodeAgentLocally'));
+    assert.match(localBody, /runCodeAgentTmux\(opts, resultSchema, opts\.terminalSession, runtime, invocation\)/);
+    assert.match(localBody, /runtime\.codeAgent\(opts, resultSchema, invocation\)/);
   });
 
   await check('result cleanup exists only at the shared boundary', async () => {

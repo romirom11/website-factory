@@ -118,13 +118,13 @@ export const SETTINGS: SettingDef[] = [
   {
     key: 'CLAUDE_CODE_OAUTH_TOKEN', label: 'Токен Claude Code', group: 'agents',
     kind: 'password', secret: true, advanced: true,
-    hint: 'Звичайний шлях — кнопка «Підключити» в «Акаунтах» вище. Це поле лишається для токена, отриманого вручну через `claude setup-token`.',
+    hint: 'Звичайний шлях — кнопка «Підключити» в «Акаунтах» вище. Поле потрібне лише для локальної розробки або контрольованої одноразової міграції в runner.',
     placeholder: 'sk-ant-oat01-…',
   },
   {
     key: 'AGENT_RUNTIME', label: 'Чим виконувати агентні етапи', group: 'agents',
     kind: 'select', options: ['claude-code', 'codex', 'opencode'], default: 'claude-code',
-    hint: 'Усі працюють по підписці. Оплата за токени недоступна в принципі. OpenCode юзає провайдера, залогіненого в opencode (opencode providers list).',
+    hint: 'Усі працюють по підписці. Оплата за токени недоступна в принципі. OpenCode юзає провайдера, залогіненого в runner executor (`opencode auth list`).',
   },
   {
     key: 'AGENT_MODEL', label: 'Модель для звичайних етапів', group: 'agents', kind: 'text',
@@ -169,7 +169,7 @@ export const SETTINGS: SettingDef[] = [
   {
     key: 'BUILD_TERMINAL_BASE_URL', label: 'Адреса термінала збірки', group: 'agents',
     kind: 'text', validate: url, placeholder: 'https://<адреса цього UI>/terminal',
-    hint: 'Куди веде кнопка «Відкрити термінал». Новий домен НЕ потрібен: у Dokploy додай до сервісу factory-build запис з тим САМИМ доменом, шлях /terminal, порт 7681 — і встав сюди https://<домен UI>/terminal. Порожньо = кнопки немає.',
+    hint: 'Куди веде кнопка «Відкрити термінал». Новий домен НЕ потрібен: у Dokploy додай до сервісу agent-runner-executor запис з тим САМИМ доменом, шлях /terminal, порт 7681 — і встав сюди https://<домен UI>/terminal. Порожньо = кнопки немає.',
   },
   {
     key: 'BUILD_TERMINAL_PORT', label: 'Порт термінала збірки', group: 'agents',

@@ -1,0 +1,67 @@
+FROM node:22-bookworm AS dependencies
+
+# A system install is shared by the root build and uid-1000 runtime. Corepack's
+# per-user cache would otherwise make every container start depend on npmjs.org.
+RUN npm install --global pnpm@11.24.0
+WORKDIR /app
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+
+FROM dependencies AS gateway
+COPY . .
+RUN mkdir -p /app/sites /app/agent-inputs /app/runner-work \
+    && chown -R node:node /app /home/node
+USER node
+CMD ["pnpm", "runner:gateway"]
+
+FROM dependencies AS executor
+
+# Subscription runtimes exist only in this image. Factory images contain the
+# control plane and deterministic workers, never provider auth mounts. Versions
+# are deliberately pinned to the releases exercised by the runtime adapters;
+# an upstream CLI flag/parser change must arrive as a reviewed dependency bump.
+ARG CLAUDE_CODE_VERSION=2.1.239
+ARG CODEX_CLI_VERSION=0.149.1
+ARG OPENCODE_VERSION=1.18.23
+RUN npm i -g \
+      "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+      "@openai/codex@${CODEX_CLI_VERSION}" \
+      "opencode-ai@${OPENCODE_VERSION}" \
+    && claude --version && codex --version && opencode --version
+
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+# Runner browser tooling is headless. Avoid shipping a second, unused headed
+# Chromium binary in the most frequently rebuilt production image.
+RUN npx playwright install --with-deps --only-shell chromium \
+    && chmod -R a+rx /ms-playwright
+
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg tmux \
+    && rm -rf /var/lib/apt/lists/* \
+    && tmux -V
+
+ARG TTYD_VERSION=1.7.7
+ARG TTYD_SHA256_X86_64=8a217c968aba172e0dbf3f34447218dc015bc4d5e59bf51db2f2cd12b7be4f55
+ARG TTYD_SHA256_AARCH64=b38acadd89d1d396a0f5649aa52c539edbad07f4bc7348b27b4f4b7219dd4165
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+      amd64)  arch=x86_64;  sha="$TTYD_SHA256_X86_64" ;; \
+      arm64)  arch=aarch64; sha="$TTYD_SHA256_AARCH64" ;; \
+      *) echo "no ttyd build for $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /usr/local/bin/ttyd \
+      "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.${arch}"; \
+    echo "${sha}  /usr/local/bin/ttyd" | sha256sum -c -; \
+    chmod +x /usr/local/bin/ttyd; \
+    ttyd --version
+
+COPY . .
+RUN mkdir -p /app/runner-work /app/runner-auth /app/.claude/skills \
+      /home/node/.codex /home/node/.local/share/opencode \
+    && cp -r /app/skills/. /app/.claude/skills/ \
+    && chown -R node:node /app /home/node
+
+ENV CODEX_HOME=/home/node/.codex
+ENV OPENCODE_DISABLE_AUTOUPDATE=1
+USER node
+CMD ["pnpm", "runner:executor"]

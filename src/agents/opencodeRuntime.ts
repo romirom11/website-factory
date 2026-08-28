@@ -2,7 +2,7 @@
  * OpenCode runtime adapter — subscription harness #3.
  *
  * Auth lives in OpenCode's own home (`~/.local/share/opencode/auth.json`,
- * managed by `opencode providers login`), so like Codex this adapter injects
+ * managed by `opencode auth login`), so like Codex this adapter injects
  * NO credentials into agent processes (`authEnv()` is empty). Nothing
  * pay-per-token: whatever provider Roman logged in to bills its own
  * subscription; no API key is ever read or passed by the factory.
@@ -31,7 +31,7 @@ import path from 'node:path';
 import type { ZodType } from 'zod';
 import { config } from '../config.js';
 import { log } from '../lib/logger.js';
-import { zodToJsonSchema, extractJson, jsonOnlyInstruction } from './schema.js';
+import { outputJsonSchema, extractJson, jsonOnlyInstruction } from './schema.js';
 import { withAgentSlot } from './semaphore.js';
 import { codeAgentEnv } from './sandbox.js';
 import { withStructuredRetries } from './retry.js';
@@ -344,7 +344,7 @@ export const opencodeRuntime: AgentRuntime = {
 
   terminalLaunch(opts: CodeAgentOptions, _context: { settingsPath: string }): TerminalLaunchSpec {
     const args = [];
-    const model = effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
+    const model = opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
     if (model) args.push('--model', model);
     args.unshift('--pure');
     return {
@@ -367,8 +367,8 @@ export const opencodeRuntime: AgentRuntime = {
   ): Promise<T> {
     const retries = opts.retries ?? 2;
     const timeoutMs = opts.timeoutMs ?? DEFAULT_STRUCTURED_TIMEOUT_MS;
-    const prompt = `${systemPrompt}\n\n---\n\n${userContent}${jsonOnlyInstruction(schema)}`;
-    const model = effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
+    const prompt = `${systemPrompt}\n\n---\n\n${userContent}${jsonOnlyInstruction(schema, opts.outputJsonSchema)}`;
+    const model = opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
 
     return withStructuredRetries({
       name, runtime: this.id, retries,
@@ -424,14 +424,14 @@ export const opencodeRuntime: AgentRuntime = {
     invocation: CodeAgentInvocationContext,
   ): Promise<T> {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_CODE_TIMEOUT_MS;
-    const model = effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
+    const model = opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
     const startedAt = Date.now();
 
     return withAgentSlot(`code:${opts.name}`, async () => {
       const prompt =
         `${opts.appendSystemPrompt ? `${opts.appendSystemPrompt}\n\n---\n\n` : ''}${opts.prompt}\n\n` +
         `MANDATORY FINAL STEP: write a file named result.json in the workspace root (${opts.cwd}) ` +
-        `matching this JSON Schema, then stop:\n${JSON.stringify(zodToJsonSchema(resultSchema), null, 2)}`;
+        `matching this JSON Schema, then stop:\n${JSON.stringify(outputJsonSchema(resultSchema, opts.outputJsonSchema), null, 2)}`;
 
       // --pure keeps the operator's personal plugins/MCP servers out of a
       // client build (the workspace agent's analogue of settingSources:

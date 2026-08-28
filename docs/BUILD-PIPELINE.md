@@ -158,17 +158,16 @@ BUILD-TASK.md           жорсткі правила — пише КОД
 - **Скролбек зберігається.** Перед killом сесії повна історія pane пишеться у
   `terminal.log` поруч із build-log — це те, що Роман читає постфактум.
 
-Веб-термінал (`src/agents/terminalServer.ts`): один `ttyd` на процес (білд-воркер
-і так тримає одну агентну сесію), basic auth з паролем, **похідним** від
+Веб-термінал (`src/agents/terminalServer.ts`): один `ttyd` в runner executor;
+attachable сесії серіалізуються окремо від headless-викликів. Basic auth з паролем, **похідним** від
 `INTERNAL_API_KEY` (не самим ключем), і `tmux attach -r` — тільки перегляд.
 `BUILD_TERMINAL_WRITABLE=true` знімає `-r` і дає друкувати живому агенту; типово
 **вимкнено**, бо такий дотик змінює демо клієнта без approval і без сліду в
 історії, тоді як усі інші зміни у фабриці мають і те, і те.
 
-Оскільки tmux живе в `factory-build`, а API відповідає з `factory`,
-`tmux has-session` звідти завжди сказав би «немає». Тому факт живої сесії їде
-маркером `terminal-session.json` через спільний том `sitesdata` — тим самим
-каналом, що й `build-log.ndjson`. Маркер має heartbeat: якщо воркер убили,
+Оскільки tmux живе в `agent-runner-executor`, а API відповідає з `factory`,
+статус іде через authenticated runner gateway. Він читає маркер
+`terminal-session.json` тільки з per-invocation scratch. Маркер має heartbeat: якщо executor убили,
 застарілий маркер читається як «сесії немає», а не як вічне посилання в нікуди.
 
 **Після агента код перевіряє:**
@@ -269,7 +268,7 @@ FlowKit/Veo кліп з РЕАЛЬНОГО фото → ffmpeg Ken Burns mp4 →
 | `BUILDER_MODE` | tmux | `tmux` — до збірки можна підключитись; `sdk` — безголова сесія. Без tmux на хості → автоматично `sdk` |
 | `BUILD_TERMINAL_WEB` | true | піднімати ttyd на час збірки |
 | `BUILD_TERMINAL_BASE_URL` | — | куди веде кнопка «Відкрити термінал». Порожньо = кнопки немає, тільки SSH |
-| `BUILD_TERMINAL_PORT` | 7681 | порт ttyd усередині `factory-build` |
+| `BUILD_TERMINAL_PORT` | 7681 | порт ttyd усередині `agent-runner-executor` |
 | `BUILD_TERMINAL_WRITABLE` | false | дозволити друкувати живому агенту (див. застереження вище) |
 | `BUILDER_MAX_TURNS` | 200 | стеля ходів свіжого білда |
 | `BUILDER_FIX_MAX_TURNS` | 120 | стеля ходів QA-фікса |
@@ -323,12 +322,14 @@ pnpm workers --only=build         # контейнер factory-build
 WORKER_GROUPS=build pnpm workers  # те саме через env (docker-compose)
 ```
 
-Семафор лишається **на процес**; процес, що хостить рівно одну агентну групу,
-бере її власний ліміт (`AGENT_CONCURRENCY_BUILD` / `AGENT_CONCURRENCY_ENRICH`).
+Factory передає worker-group і актуальний ліміт у версіонованому runner-протоколі;
+executor відновлює окремі семафори `core` / `enrich` / `build`, тому централізація
+CLI не повертає одну спільну FIFO-чергу.
 Розклади (`poll-replies`, `daily-summary`) реєструє тільки `core`, щоб два
 процеси не дублювали їх. У `docker-compose` це два сервіси з одного образу:
 `factory` (core+enrich, плюс API і демо-сервер) і `factory-build` (build,
-`command: pnpm workers`). Обидва монтують спільні `sites/` і `deploys/`.
+`command: pnpm workers`). Обидва монтують спільні `sites/` і `deploys/`, але не
+provider credentials: workspace копіює trusted gateway, CLI запускає executor.
 
 Перемикання `AGENT_RUNTIME=codex` у UI кладе всі агентні етапи, включно з
 білдом, на підписку ChatGPT. Прихованих per-stage runtime override немає: UI є

@@ -65,10 +65,9 @@ services:
   # Factory core: discovery/normalize/qualify/assets/audit/readiness, enrichment,
   # deploy + approval + outreach, plus the internal API and the demo static server.
   #
-  # Split from factory-build on purpose (SPEC §2.3(а)): the agent semaphore is
-  # PER PROCESS, so hosting a 40-minute `build-site` session in the same process
-  # as an enrichment backlog makes the two starve each other. Two processes = two
-  # independent slots. `pnpm all` still runs every group for local dev.
+  # Split from factory-build on purpose (SPEC §2.3(а)): job ownership and
+  # heartbeats remain independent. Agent capacity is preserved as group context
+  # across the remote runner boundary. `pnpm all` still runs every group locally.
   factory:
     image: websites-factory/factory:local
     build: .
@@ -80,6 +79,8 @@ services:
         condition: service_started
       gosom:
         condition: service_started
+      agent-runner-gateway:
+        condition: service_healthy
     # `.env` carries INFRA only (DATABASE_URL, S3_*, UI_*, SETTINGS_MASTER_KEY,
     # ports). Operational settings live in Postgres and are edited at /settings
     # in the UI — env values below stay as a FALLBACK for a fresh box, and are
@@ -106,7 +107,7 @@ services:
       # the `ports:` mapping below, which publishes only to the host's 127.0.0.1.
       DEMO_HOST: 0.0.0.0
       # Where the «Відкрити термінал збірки» button points. The terminal itself
-      # is served by `factory-build`; this process only reports the URL, so it
+      # is served by `agent-runner-executor`; this process only reports the URL, so it
       # must be an address ROMAN'S BROWSER can reach, not a compose-internal one.
       # Empty is a valid answer: the console then explains the SSH attach instead
       # of offering a link that would not resolve. NO fallback here on purpose:
@@ -114,6 +115,12 @@ services:
       # rendered the button — pointing every server visitor at their own
       # localhost — while the settings hint promised «порожньо = кнопки немає».
       BUILD_TERMINAL_BASE_URL: ${BUILD_TERMINAL_BASE_URL:-}
+      AGENT_EXECUTION_MODE: remote
+      RUNNER_GATEWAY_URL: http://agent-runner-gateway:8790
+      RUNNER_API_KEY: ${RUNNER_API_KEY:?RUNNER_API_KEY must be set for remote agent execution}
+      RUNNER_SITES_ROOT: /app/sites
+      RUNNER_INPUTS_ROOT: /app/agent-inputs
+      RUNNER_SEED_CLAUDE_CREDENTIAL: ${RUNNER_SEED_CLAUDE_CREDENTIAL:-false}
     volumes:
       # Named volumes, NOT host bind mounts: a bind dir is created by the docker
       # daemon as root:root and the container runs as `node` (uid 1000), which
@@ -122,16 +129,15 @@ services:
       # To inspect contents from the host: docker compose cp factory:/app/sites ./
       - sitesdata:/app/sites
       - deploysdata:/app/deploys
-      # Codex CLI subscription login (`codex login` inside the container once).
-      # A named volume, so the auth survives image rebuilds.
-      - codexhome:/home/node/.codex
-      - opencodehome:/home/node/.local/share/opencode
+      # Small image/brief workspaces staged for the remote runner gateway.
+      - agentinputs:/app/agent-inputs
     ports:
       - "127.0.0.1:8787:8787"   # internal API / webhooks
       - "127.0.0.1:8788:8788"   # demo static server
 
-  # Site production only: content-and-design, build-site, visual-qa. One long
-  # agent session at a time, with its own semaphore (AGENT_CONCURRENCY_BUILD).
+  # Site production orchestration only: content-and-design, build-site, visual-qa.
+  # Agent processes themselves run in the isolated runner executor, which
+  # restores this worker group's separately configured capacity.
   # Shares the sites/ and deploys/ volumes with `factory`, which serves the demos.
   factory-build:
     image: websites-factory/factory:local
@@ -141,20 +147,24 @@ services:
         condition: service_healthy
       minio:
         condition: service_started
+      agent-runner-gateway:
+        condition: service_healthy
     env_file: .env
     environment:
       DATABASE_URL: postgres://factory:${POSTGRES_PASSWORD:-factory}@postgres:5432/factory
       S3_ENDPOINT: http://minio:9000
       WORKER_GROUPS: build
-      # The attachable build terminal (Roman's requirement 2026-08-22): the
-      # builder agent runs in tmux here, and ttyd serves that session on the
-      # port published below. Both values are only FALLBACKS — /settings wins.
-      BUILD_TERMINAL_PORT: ${BUILD_TERMINAL_PORT:-7681}
       # pnpm content-addressable store on the persistent sites volume: workspace
       # installs become hardlink-only after the first build instead of pulling
       # the registry on every container recreate (MOTION-PLAN phase 6). The
       # NPM_CONFIG_ prefix passes the agent-env allowlist (sandbox.ts).
       NPM_CONFIG_STORE_DIR: /app/sites/.pnpm-store
+      AGENT_EXECUTION_MODE: remote
+      RUNNER_GATEWAY_URL: http://agent-runner-gateway:8790
+      RUNNER_API_KEY: ${RUNNER_API_KEY:?RUNNER_API_KEY must be set for remote agent execution}
+      RUNNER_SITES_ROOT: /app/sites
+      RUNNER_INPUTS_ROOT: /app/agent-inputs
+      RUNNER_SEED_CLAUDE_CREDENTIAL: ${RUNNER_SEED_CLAUDE_CREDENTIAL:-false}
     volumes:
       # Named volumes, NOT host bind mounts: a bind dir is created by the docker
       # daemon as root:root and the container runs as `node` (uid 1000), which
@@ -163,20 +173,79 @@ services:
       # To inspect contents from the host: docker compose cp factory:/app/sites ./
       - sitesdata:/app/sites
       - deploysdata:/app/deploys
-      # Shared with `factory`: gen-image runs in the build group too.
-      - codexhome:/home/node/.codex
-      - opencodehome:/home/node/.local/share/opencode
-    # The build terminal. Bound to 127.0.0.1 like every other port here: ttyd
-    # serves a live agent session, so an exposed port is someone else watching
-    # (and, with BUILD_TERMINAL_WRITABLE, typing into) a client's build. Reach it
-    # the same way as the UI — a tunnel or an authenticated reverse proxy, never
-    # a raw public port. ttyd's own basic auth is a second layer, not the first.
-    ports:
-      - "127.0.0.1:${BUILD_TERMINAL_PORT:-7681}:${BUILD_TERMINAL_PORT:-7681}"
+      - agentinputs:/app/agent-inputs
     # Workers only: the API and demo server belong to `factory` (one port owner).
     # `db:migrate` is idempotent and also runs in `factory`'s CMD; whichever
     # container starts first applies the schema, the other is a no-op.
     command: ["sh", "-c", "pnpm db:migrate && pnpm workers"]
+
+  # Trusted staging gateway. It can see factory workspaces, but has no provider
+  # auth volumes and never starts a model/tool process itself.
+  agent-runner-gateway:
+    image: websites-factory/agent-runner-gateway:local
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+      target: gateway
+    restart: unless-stopped
+    depends_on:
+      agent-runner-executor:
+        condition: service_healthy
+    environment:
+      RUNNER_GATEWAY_PORT: 8790
+      RUNNER_API_KEY: ${RUNNER_API_KEY:?RUNNER_API_KEY must be set for remote agent execution}
+      EXECUTOR_API_KEY: ${RUNNER_EXECUTOR_API_KEY:?RUNNER_EXECUTOR_API_KEY must be set for the private executor hop}
+      RUNNER_EXECUTOR_URL: http://agent-runner-executor:8791
+      RUNNER_SITES_ROOT: /app/sites
+      RUNNER_INPUTS_ROOT: /app/agent-inputs
+      RUNNER_WORK_ROOT: /app/runner-work
+      RUNNER_WORK_RETENTION_HOURS: ${RUNNER_WORK_RETENTION_HOURS:-168}
+    volumes:
+      - sitesdata:/app/sites
+      - agentinputs:/app/agent-inputs
+      - runnerwork:/app/runner-work
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8790/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Provider/runtime executor. It sees only per-invocation scratch and provider
+  # auth volumes — never sitesdata, Postgres, MinIO or factory settings.
+  agent-runner-executor:
+    image: websites-factory/agent-runner-executor:local
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+      target: executor
+    restart: unless-stopped
+    environment:
+      RUNNER_EXECUTOR_PORT: 8791
+      EXECUTOR_API_KEY: ${RUNNER_EXECUTOR_API_KEY:?RUNNER_EXECUTOR_API_KEY must be set for the private executor hop}
+      RUNNER_WORK_ROOT: /app/runner-work
+      RUNNER_CREDENTIAL_ROOT: /app/runner-auth
+      # Used only to derive ttyd basic auth inside the executor. Gateway has the
+      # same private hop key and returns the derived password to authenticated UI.
+      INTERNAL_API_KEY: ${RUNNER_EXECUTOR_API_KEY:?RUNNER_EXECUTOR_API_KEY must be set for the private executor hop}
+      BUILD_TERMINAL_PORT: ${BUILD_TERMINAL_PORT:-7681}
+      BUILD_TERMINAL_WEB: ${BUILD_TERMINAL_WEB:-true}
+      BUILD_TERMINAL_WRITABLE: ${BUILD_TERMINAL_WRITABLE:-false}
+      # The shared work volume is initialized as uid 1000 by the image. Keeping
+      # the pnpm store below it avoids a separately mounted root-owned cache
+      # while still preserving downloads across executor restarts.
+      NPM_CONFIG_STORE_DIR: /app/runner-work/.pnpm-store
+    volumes:
+      - runnerwork:/app/runner-work
+      - runnerclaude:/app/runner-auth
+      - codexhome:/home/node/.codex
+      - opencodehome:/home/node/.local/share/opencode
+    ports:
+      - "127.0.0.1:${BUILD_TERMINAL_PORT:-7681}:${BUILD_TERMINAL_PORT:-7681}"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8791/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   # Control UI (spec §2.2, decision #9): approval queue, funnel, campaigns,
   # jobs, conversations. This is THE interface — Telegram only links into it.
@@ -211,8 +280,8 @@ services:
       # Decrypts the secrets stored in the `settings` table so /settings can
       # show a masked tail and write new ones. Same key as the factory's.
       SETTINGS_MASTER_KEY: ${SETTINGS_MASTER_KEY:-}
-      # The UI asks the FACTORY to run connectivity checks (it owns the agent
-      # CLIs and does the real sending). Shared secret, not just network trust.
+      # The UI asks the factory API to route connectivity checks to the process
+      # that owns each dependency (agent checks continue to the runner).
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
       FACTORY_API_URL: ${FACTORY_API_URL:-http://factory:8787}
       # Read-only fallbacks for the status panel and the WAHA QR proxy; the
@@ -328,6 +397,9 @@ services:
 volumes:
   codexhome:
   opencodehome:
+  runnerclaude:
+  runnerwork:
+  agentinputs:
   pgdata:
   miniodata:
   gosomdata:

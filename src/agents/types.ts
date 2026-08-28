@@ -91,6 +91,18 @@ export interface StructuredOptions {
    */
   buildLogPath?: string;
   /**
+   * Transport-supplied model after the factory resolves live policy. Runner
+   * executors have no settings-store access, so they must not resolve it again.
+   * Ordinary callers leave this unset.
+   */
+  model?: string;
+  /**
+   * Serialized caller-owned schema used only for the model/output-format
+   * instruction on a remote executor. The factory still validates the returned
+   * value with `schema`; this never weakens the caller's Zod contract.
+   */
+  outputJsonSchema?: Readonly<Record<string, unknown>>;
+  /**
    * @deprecated No effect. Kept so existing call sites compile: the subscription
    * runtimes manage their own output budget, there is no per-request max_tokens.
    */
@@ -143,6 +155,10 @@ export interface CodeAgentOptions {
    * and Codex, and ignored on a host with no tmux — see `runCodeAgent()`.
    */
   terminal?: boolean;
+  /** Effective terminal settings supplied by the remote factory transport. */
+  terminalWeb?: boolean;
+  terminalWritable?: boolean;
+  terminalPort?: number;
   /**
    * Absolute path of the project's `build-log.ndjson`. When set, the runtime
    * appends a one-line summary of every SDK message as it streams — which is
@@ -155,6 +171,15 @@ export interface CodeAgentOptions {
    * the worker's own stage markers keep the timeline honest in either mode.
    */
   buildLogPath?: string;
+  /** Transport-supplied resolved model; ordinary callers leave this unset. */
+  model?: string;
+  /**
+   * Remote prompt schema. Final validation remains at the factory boundary
+   * against the caller's Zod schema after the workspace is synchronized back.
+   */
+  outputJsonSchema?: Readonly<Record<string, unknown>>;
+  /** Runner-internal unique tmux name; factory callers never set this. */
+  terminalSession?: string;
 }
 
 /**
@@ -289,4 +314,22 @@ export class AgentSchemaError extends Error {
     super(message);
     this.name = 'AgentSchemaError';
   }
+}
+
+/**
+ * Remote execution is required but its trusted gateway is unavailable.
+ * Worker lifecycle code can park this explicitly; production must never fall
+ * back to running an untrusted code agent inside the factory process.
+ */
+export class RunnerUnavailableError extends Error {
+  readonly code = 'RUNNER_UNAVAILABLE';
+  constructor(message: string) {
+    super(message);
+    this.name = 'RunnerUnavailableError';
+  }
+}
+
+export function isRunnerUnavailableError(error: unknown): error is RunnerUnavailableError {
+  return error instanceof RunnerUnavailableError
+    || (error as { code?: string } | null)?.code === 'RUNNER_UNAVAILABLE';
 }

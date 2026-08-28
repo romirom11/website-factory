@@ -406,8 +406,8 @@ function useCliFlow({ provider, needsCode, onDone }: {
  * Claude and Codex: one card shape, because they are the same job — an
  * interactive CLI login driven from the browser. They differ only in whether a
  * code comes back here (Claude) or is entered on the provider's own page
- * (Codex), and in whether disconnecting is possible at all: Claude's credential
- * is a row we can delete, Codex's is a file in the `codexhome` volume.
+ * (Codex). Both can be disconnected through their CLI/runtime-owned store; the
+ * shared component never reaches into credential files itself.
  *
  * The action row is where Roman's "кнопки в ряд" complaint is answered.
  * Connected means the status is the hero and no button is filled: «Оновити» is
@@ -788,8 +788,8 @@ export function ConnectedAccounts({ accounts, checks, checksError }: {
 
       {!accounts.masterKey && (
         <div className="rounded-lg border border-dot-stop/30 bg-dot-stop/8 px-3 py-2 text-sm text-dot-stop">
-          <code>SETTINGS_MASTER_KEY</code> не заданий — секрети неможливо зберегти.
-          Підключення нижче не спрацюють, доки ключ не зʼявиться в <code>.env</code>.
+          <code>SETTINGS_MASTER_KEY</code> не заданий — DB-секрети Telegram, Gmail і WAHA
+          не збережуться. Claude/Codex credentials у runner volume від цього ключа не залежать.
         </div>
       )}
 
@@ -805,10 +805,10 @@ export function ConnectedAccounts({ accounts, checks, checksError }: {
           canDisconnect
           onResult={set('claude')}
           onDisconnect={() => void doDisconnect('claude')}
-          footnote="Токен зберігається зашифрованим і діє наживо, без перезапуску контейнерів."
+          footnote="Токен зберігається у закритому credential volume runner-а (файл 0600) і діє без перезапуску."
           how={(
             <p>
-              «Підключити» запускає <code>claude setup-token</code> у контейнері фабрики, показує
+              «Підключити» запускає <code>claude setup-token</code> в ізольованому runner executor, показує
               посилання на сторінку входу і чекає на код звідти. Код вводиться тут — CLI стоїть на
               запиті, доки не отримає його.
             </p>
@@ -824,8 +824,9 @@ export function ConnectedAccounts({ accounts, checks, checksError }: {
           verdict={codex}
           checkedAt={at('codex')}
           needsCode={false}
-          canDisconnect={false}
+          canDisconnect
           onResult={set('codex')}
+          onDisconnect={() => void doDisconnect('codex')}
           footnote="Логін лягає у volume codexhome і переживає ребілди образу."
           how={(
             <p>
@@ -837,7 +838,7 @@ export function ConnectedAccounts({ accounts, checks, checksError }: {
 
         {/*
           OpenCode has NO browser-driven login flow here on purpose: its
-          `providers login` is an interactive TUI with per-provider steps we
+          `auth login` is an interactive TUI with per-provider steps we
           cannot drive honestly from a button. The row is status + refresh;
           the check's error message names the exact command when a login is
           what is missing. If AGENT_RUNTIME=opencode, this card is the one to
@@ -852,8 +853,8 @@ export function ConnectedAccounts({ accounts, checks, checksError }: {
           actions={<RefreshButton kind="opencode" onResult={set('opencode')} />}
           how={(
             <p>
-              Підключення вручну, один раз: <code>docker compose exec factory opencode providers login</code> —
-              вибери провайдера і заверши вхід. Список того, що вже залогінено: <code>opencode providers list</code>.
+              Підключення вручну, один раз: <code>docker compose exec agent-runner-executor opencode auth login</code> —
+              вибери провайдера і заверши вхід. Список підключень: <code>docker compose exec agent-runner-executor opencode auth list</code>.
               Перевірка тут робить справжній виклик тією моделлю, що записана в налаштуваннях.
             </p>
           )}

@@ -70,7 +70,7 @@ export function ttydAvailable(): Promise<boolean> {
 /**
  * Path prefix ttyd serves under. Fixed at /terminal so the operator needs NO
  * extra hostname: one Dokploy/Traefik domain entry on the SAME host
- * (path /terminal → service factory-build, port 7681) is enough, and
+ * (path /terminal → service agent-runner-executor, port 7681) is enough, and
  * BUILD_TERMINAL_BASE_URL becomes https://<та сама адреса UI>/terminal.
  */
 export const TERMINAL_BASE_PATH = '/terminal';
@@ -115,9 +115,9 @@ export function ttydArgs(session: string, opts: {
  */
 export async function startTerminalServer(
   session: string,
-  opts: { writable?: boolean } = {},
+  opts: { enabled?: boolean; port?: number; writable?: boolean } = {},
 ): Promise<boolean> {
-  if (!config.build.terminalWeb) return false;
+  if (!(opts.enabled ?? config.build.terminalWeb)) return false;
   if (current?.session === session && current.proc.exitCode === null) return true;
 
   stopTerminalServer();
@@ -135,7 +135,8 @@ export async function startTerminalServer(
   }
 
   const writable = opts.writable ?? config.build.terminalWritable;
-  const proc = spawn('ttyd', ttydArgs(session, { port: config.build.terminalPort, password, writable }), {
+  const port = opts.port ?? config.build.terminalPort;
+  const proc = spawn('ttyd', ttydArgs(session, { port, password, writable }), {
     stdio: 'ignore',
     // Detached false: the ttyd must die with the worker, or a restarted worker
     // finds the port taken by a server attached to a session that is long gone.
@@ -152,7 +153,7 @@ export async function startTerminalServer(
 
   current = { proc, session };
   log.info('build terminal serving', {
-    session, port: config.build.terminalPort, writable,
+    session, port, writable,
   });
   if (writable) {
     log.warn('build terminal is WRITABLE: keystrokes reach a running client build with no approval trail', { session });

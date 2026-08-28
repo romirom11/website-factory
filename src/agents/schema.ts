@@ -34,6 +34,14 @@ export function zodToJsonSchema(schema: ZodType): Record<string, unknown> {
   }
 }
 
+/** The exact JSON Schema shown to a runtime, with a remote contract override. */
+export function outputJsonSchema(
+  schema: ZodType,
+  override?: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  return override ? { ...override } : zodToJsonSchema(schema);
+}
+
 /**
  * Pull a JSON value out of model output that may be wrapped in prose or fences.
  * Tries, in order: the whole string, fenced blocks, then the outermost
@@ -93,12 +101,15 @@ function balancedSpan(s: string, open: string, close: string): string | undefine
 }
 
 /** Prompt suffix that pins the model to schema-shaped JSON when no native structured output is available. */
-export function jsonOnlyInstruction(schema: ZodType): string {
+export function jsonOnlyInstruction(
+  schema: ZodType,
+  override?: Readonly<Record<string, unknown>>,
+): string {
   return (
     '\n\nOUTPUT CONTRACT (mandatory):\n' +
     'Reply with a SINGLE JSON value and NOTHING else — no prose, no explanation, no markdown code fences.\n' +
     'It must validate against this JSON Schema:\n' +
-    JSON.stringify(zodToJsonSchema(schema), null, 2) +
+    JSON.stringify(outputJsonSchema(schema, override), null, 2) +
     '\n\nIf evidence for a field is missing, use null / an empty array — never invent a value.'
   );
 }

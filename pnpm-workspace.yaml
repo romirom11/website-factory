@@ -1,19 +1,8 @@
 packages:
   - "."
 
-# esbuild (pulled in by tsx/drizzle-kit) ships a postinstall that fetches its
-# native binary. pnpm 10+ blocks dependency build scripts by default and pnpm 11
-# EXITS NON-ZERO on ERR_PNPM_IGNORED_BUILDS, which turned a successful install
-# into a failed `docker build`. Approving esbuild here is what makes `pnpm
-# install` succeed both on the host and inside the image — so this file MUST be
-# copied into the Docker image alongside package.json (see Dockerfile).
-#
-# The `pnpm.onlyBuiltDependencies` field in package.json is NO LONGER READ by
-# pnpm 11 ("The 'pnpm' field in package.json is no longer read by pnpm"); this
-# file is its only home now.
-onlyBuiltDependencies:
-  - esbuild
-
-# Do not fail the install when some other transitive dependency has an ignored
-# build script: esbuild is the only one we actually need built.
-strictDepBuilds: false
+# esbuild (pulled in by tsx/drizzle-kit) needs its install script to select the
+# correct native binary. pnpm 11 denies every dependency build not explicitly
+# reviewed; keep that strict default and approve only this package family.
+allowBuilds:
+  esbuild: true

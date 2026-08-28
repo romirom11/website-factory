@@ -65,10 +65,9 @@ export async function loadAccounts(): Promise<AccountsSnapshot> {
     effectiveValue('WAHA_SESSION'),
   ]);
 
-  // Claude: a token here is one path; a CLI login inside the container is the
-  // other, and it is invisible from the database. So "no token" is reported as
-  // an unknown-but-probably-missing rather than a flat failure — the check
-  // button is what settles it.
+  // Claude may live in the legacy settings store or the runner credential
+  // volume, which is intentionally invisible from the database. The real
+  // runner check, not this cheap snapshot, settles whether it is connected.
   const claude: AccountStatus = claudeToken
     ? {
       id: 'claude', readiness: 'configured',
@@ -76,10 +75,10 @@ export async function loadAccounts(): Promise<AccountsSnapshot> {
         ? `токен ${mask(claudeToken)}`
         : `токен ${mask(claudeToken)} — формат незвичний (очікується sk-ant-oat…)`,
     }
-    : { id: 'claude', readiness: 'missing', detail: 'токен не заданий' };
+    : { id: 'claude', readiness: 'partial', detail: 'стан credential volume — за перевіркою' };
 
   // Codex has no stored setting at all: its credential is a file in the
-  // codexhome volume. Only `codex login status` in the factory knows, so this
+  // codexhome volume. Only `codex login status` in the runner knows, so this
   // row is always "перевір" until the button says otherwise.
   const codex: AccountStatus = {
     id: 'codex', readiness: 'partial',

@@ -13,21 +13,21 @@
  * by that prefix in foreign-key order. The census in `harness.ts` proves after
  * the fact that nothing else moved.
  */
-import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { assertFixtureId, sql, sqlOne, FIXTURE_PREFIX } from './harness.js';
+import {
+  PROJECT_ROOT, factoryBusinessWorkspaceRoot, factoryDeployDir, factoryWorkspaceDir,
+  removeFactoryFixturePath, writeFactoryFixtureFile,
+} from './runtimeFs.js';
 
 export const FIXTURE_CAMPAIGN = 'e2e-fixture-campaign';
-export const ROOT = path.resolve(new URL('../..', import.meta.url).pathname);
+export const ROOT = PROJECT_ROOT;
 
 export interface FixtureBusiness {
   id: string;
   name: string;
   projectId?: number;
-  deployToken?: string;
-  deployDir?: string;
-  workspaceDir?: string;
 }
 
 export async function createCampaign(): Promise<string> {
@@ -102,10 +102,9 @@ export async function createBusiness(input: {
 /**
  * A deployed demo on disk, so the approval card has something real to link to.
  *
- * The deploy directory is written under `deploys/e2e-<token>` — inside the
- * directory the live demo server already serves, because the privacy checks in
- * group 7 walk every directory there and a fixture that lived somewhere else
- * would be exempt from exactly the rules it should be proving.
+ * The deploy directory is written to the factory container's real named volume
+ * under `deploys/e2e<token>`. The privacy checks inspect that same volume, so a
+ * fixture cannot pass from a host-only directory the demo server never sees.
  */
 export async function createSiteProject(biz: FixtureBusiness, state: string, opts: {
   deployed?: boolean;
@@ -129,16 +128,15 @@ export async function createSiteProject(biz: FixtureBusiness, state: string, opt
   // the Referer re-rooting path it is supposed to be exercising. `e2e` stays as
   // an alphanumeric leading marker so teardown can still recognise it.
   const token = `e2e${Math.random().toString(36).slice(2, 12)}${Date.now().toString(36)}`.replace(/[^a-z0-9]/g, '');
-  const dir = path.join(ROOT, 'deploys', token);
+  const dir = factoryDeployDir(token);
   let deployUrl: string | null = null;
 
   if (opts.deployed) {
-    await mkdir(dir, { recursive: true });
-    await writeFile(path.join(dir, 'index.html'),
+    await writeFactoryFixtureFile(path.posix.join(dir, 'index.html'),
       '<!doctype html><html lang="el"><head><meta charset="utf-8">'
       + '<meta name="robots" content="noindex, nofollow">'
       + `<title>${biz.name}</title></head><body><h1>${biz.name}</h1>`
-      + '<p>e2e fixture demo</p></body></html>', 'utf8');
+      + '<p>e2e fixture demo</p></body></html>');
     deployUrl = `${process.env.DEMO_BASE_URL ?? 'http://localhost:8788'}/${token}/`;
   }
 
@@ -151,36 +149,20 @@ export async function createSiteProject(biz: FixtureBusiness, state: string, opt
       JSON.stringify(state === 'needs_human_review' ? ['[high] e2e fixture open issue'] : [])],
   );
 
-  /**
-   * `dir` is resolved INSIDE THE FACTORY CONTAINER, not on the host.
-   *
-   * `existsSync(path.join(project.dir, 'package.json'))` runs in the factory
-   * process, where `./sites` is mounted at `/app/sites` (docker-compose.yml).
-   * Storing the host path here makes every workspace look missing to the very
-   * check «Ще спроба» performs first — which is exactly how this fixture failed
-   * before: the action correctly refused with «Воркспейс цієї збірки більше не
-   * на диску», and the gate read a real refusal as a broken button.
-   *
-   * The directory is created on the HOST path (same bind mount, other side) and
-   * recorded under the CONTAINER path.
-   */
-  const relDir = path.join('sites', biz.id, String(project!.id));
-  const hostDir = path.join(ROOT, relDir);
-  const containerDir = path.posix.join(process.env.E2E_FACTORY_ROOT ?? '/app', relDir);
+  // `dir` and the file are both resolved inside the factory runtime. Compose
+  // uses a named volume here, so a same-named host directory is unrelated.
+  const containerDir = factoryWorkspaceDir(biz.id, project!.id);
   if (opts.withWorkspace) {
-    await mkdir(hostDir, { recursive: true });
-    await writeFile(path.join(hostDir, 'package.json'),
-      JSON.stringify({ name: 'e2e-fixture-site', private: true, version: '0.0.0' }, null, 2), 'utf8');
+    await writeFactoryFixtureFile(
+      path.posix.join(containerDir, 'package.json'),
+      JSON.stringify({ name: 'e2e-fixture-site', private: true, version: '0.0.0' }, null, 2),
+    );
   }
   await sql(`update site_projects set dir = $1 where id = $2`, [containerDir, project!.id]);
-  const workspace = opts.withWorkspace ? hostDir : undefined;
 
   return {
     ...biz,
     projectId: project!.id,
-    deployToken: opts.deployed ? token : undefined,
-    deployDir: opts.deployed ? dir : undefined,
-    workspaceDir: workspace,
   };
 }
 
@@ -316,14 +298,14 @@ export async function destroyFixtures(): Promise<void> {
     // Tokens are alphanumeric (see `createSiteProject`), so the marker is the
     // bare `e2e` prefix rather than the hyphenated row-id prefix.
     if (!/^e2e[a-z0-9]+$/i.test(t.deploy_token ?? '')) continue;
-    await rm(path.join(ROOT, 'deploys', t.deploy_token), { recursive: true, force: true });
+    await removeFactoryFixturePath(factoryDeployDir(t.deploy_token));
   }
   // Build workspaces (`sites/e2e-…/`) — same reasoning: a directory the DB no
   // longer points at is invisible to the leftover query but still on disk.
   const workspaces = await sql<{ id: string }>(
     `select id from businesses where id like $1`, [like]);
   for (const w of workspaces) {
-    await rm(path.join(ROOT, 'sites', assertFixtureId(w.id)), { recursive: true, force: true });
+    await removeFactoryFixturePath(factoryBusinessWorkspaceRoot(w.id));
   }
 
   await sql(`delete from workflow_reconciliation_events

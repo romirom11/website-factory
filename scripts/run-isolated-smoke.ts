@@ -33,7 +33,7 @@ if (stopExit !== 0) {
       'factory', 'pnpm', 'tsx', 'scripts/smoke.ts',
     ]);
   } finally {
-    startExit = await runDocker(['compose', 'start', 'factory']);
+    startExit = await runDocker(['compose', 'up', '-d', '--wait', 'factory']);
   }
   if (startExit !== 0) console.error('factory service did not restart after isolated smoke');
   process.exitCode = smokeExit !== 0 ? smokeExit : startExit;

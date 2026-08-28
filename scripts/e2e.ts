@@ -27,14 +27,13 @@
  * Flags: `--no-agent-ping` skips the one real Claude subscription call in group 8.
  */
 import { chromium } from 'playwright';
-import { readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { pool } from '../src/db/client.js';
 import {
   check, checking, group, summary, failures, sql, sqlOne, count,
-  takeCensus, diffCensus, waitFor, FIXTURE_PREFIX,
+  takeCensus, diffCensus, waitFor, FIXTURE_PREFIX, assertFixtureId,
 } from './e2e/harness.js';
 import {
   BASE, DEMO_BASE, login, newContext, watch, scanRawEnums, scanUnresolved,
@@ -46,6 +45,7 @@ import {
   createLogicalJobRun, createBlockedEnrichment,
   destroyFixtures, leftoverFixtures,
 } from './e2e/fixtures.js';
+import { listFactoryDemoDirectories } from './e2e/runtimeFs.js';
 
 const execFileAsync = promisify(execFile);
 const AGENT_PING = !process.argv.includes('--no-agent-ping');
@@ -280,7 +280,7 @@ async function checkDataTruth(browser: import('playwright').Browser): Promise<vo
 
   await checking('Бізнеси: total matches SQL', async () => {
     await page.goto(`${BASE}/businesses`, { waitUntil: 'networkidle' });
-    const rows = await page.locator('section.card li').count();
+    const rows = await page.locator('[data-business-id]').count();
     const dbCount = await count(
       `select count(*)::int n from businesses where id not like $1`, [`${FIXTURE_PREFIX}%`]);
     // The list paginates/filters; assert it never shows MORE than exist.
@@ -786,7 +786,7 @@ async function checkFunnel(browser: import('playwright').Browser): Promise<void>
     { qaIterations: 3, withWorkspace: true });
   const retryVerdictJob = await createNeedsHumanVisualQaJob(retryBiz, retryProj.projectId!);
   await checking('«Ще спроба» enqueues exactly 1 build-site', async () => {
-    const before = await count(`select count(*)::int n from pgboss.job where name = 'build-site'`);
+    const before = await count(`select count(*)::int n from workflow_jobs where job_type = 'build-site'`);
     await page.goto(`${BASE}/businesses/${retryBiz.id}`, { waitUntil: 'networkidle' });
     await page.getByRole('button', { name: 'Ще спроба' }).first().click();
     await page.waitForTimeout(300);
@@ -797,15 +797,17 @@ async function checkFunnel(browser: import('playwright').Browser): Promise<void>
     // Claude build could start on a fixture. Cancelling by projectId is safe
     // before the count because a cancelled row is still a row.
     await waitFor(async () => count(
-      `select count(*)::int n from pgboss.job where name = 'build-site' and data->>'projectId' = $1`,
-      [String(retryProj.projectId)]), { timeoutMs: 15_000 });
+      `select count(*)::int n from workflow_jobs
+       where job_type = 'build-site' and business_id = $1 and payload->>'projectId' = $2`,
+      [retryBiz.id, String(retryProj.projectId)]), { timeoutMs: 15_000 });
     await cancelFixtureJob('build-site', retryProj.projectId!, retryBiz.id);
 
-    const after = await count(`select count(*)::int n from pgboss.job where name = 'build-site'`);
+    const after = await count(`select count(*)::int n from workflow_jobs where job_type = 'build-site'`);
     if (after - before !== 1) throw new Error(`build-site jobs went ${before} → ${after}`);
     const mine = await count(
-      `select count(*)::int n from pgboss.job where name = 'build-site' and data->>'projectId' = $1`,
-      [String(retryProj.projectId)]);
+      `select count(*)::int n from workflow_jobs
+       where job_type = 'build-site' and business_id = $1 and payload->>'projectId' = $2`,
+      [retryBiz.id, String(retryProj.projectId)]);
     if (mine !== 1) throw new Error(`${mine} build-site jobs for the fixture project`);
     const verdict = await sqlOne<{ status: string }>(
       `select status from workflow_jobs where id = $1`, [retryVerdictJob]);
@@ -821,18 +823,19 @@ async function checkFunnel(browser: import('playwright').Browser): Promise<void>
   });
   const deployProj = await createSiteProject(deployBiz, 'needs_human_review', { qaIterations: 3 });
   await checking('«Опублікувати як є» creates a deploy job', async () => {
-    const before = await count(`select count(*)::int n from pgboss.job where name = 'deploy-demo'`);
+    const before = await count(`select count(*)::int n from workflow_jobs where job_type = 'deploy-demo'`);
     await page.goto(`${BASE}/businesses/${deployBiz.id}`, { waitUntil: 'networkidle' });
     // The button asks for confirmation first — accepting it IS the flow.
     page.once('dialog', (d) => { void d.accept(); });
     await page.getByRole('button', { name: 'Опублікувати як є' }).first().click();
     // Cancel-then-count, same race as «Ще спроба» above.
     await waitFor(async () => count(
-      `select count(*)::int n from pgboss.job where name = 'deploy-demo' and data->>'projectId' = $1`,
-      [String(deployProj.projectId)]), { timeoutMs: 15_000 });
+      `select count(*)::int n from workflow_jobs
+       where job_type = 'deploy-demo' and business_id = $1 and payload->>'projectId' = $2`,
+      [deployBiz.id, String(deployProj.projectId)]), { timeoutMs: 15_000 });
     await cancelFixtureJob('deploy-demo', deployProj.projectId!, deployBiz.id);
 
-    const after = await count(`select count(*)::int n from pgboss.job where name = 'deploy-demo'`);
+    const after = await count(`select count(*)::int n from workflow_jobs where job_type = 'deploy-demo'`);
     if (after - before !== 1) throw new Error(`deploy-demo jobs went ${before} → ${after}`);
     return '+1, cancelled';
   });
@@ -892,11 +895,30 @@ async function assertOnlyFixture(page: import('playwright').Page, name: string):
  * and `workflow_jobs` (what the console displays).
  */
 async function cancelFixtureJob(name: string, projectId: number, businessId: string): Promise<void> {
-  await sql(`update pgboss.job set state = 'cancelled'
-             where name = $1 and data->>'projectId' = $2 and state in ('created','active','retry')`,
-    [name, String(projectId)]);
-  await sql(`update workflow_jobs set status = 'cancelled' where business_id = $1 and job_type = $2`,
-    [businessId, name]);
+  assertFixtureId(businessId, 'business');
+  await sql(
+    `update pgboss.job set state = 'cancelled'
+     where id in (
+       select boss_job_id::uuid from workflow_jobs
+       where business_id = $1 and job_type = $2 and payload->>'projectId' = $3
+         and boss_job_id is not null
+     ) and state in ('created','active','retry')`,
+    [businessId, name, String(projectId)],
+  );
+  await sql(
+    `with closed as (
+       update workflow_jobs
+       set status = 'cancelled', finished_at = now()
+       where business_id = $1 and job_type = $2 and payload->>'projectId' = $3
+         and status in ('queued','running','retry_wait')
+       returning run_id
+     )
+     update workflow_job_runs
+     set status = 'cancelled', finished_at = now(), updated_at = now()
+     where id in (select run_id from closed where run_id is not null)
+       and status in ('queued','running','retry_wait')`,
+    [businessId, name, String(projectId)],
+  );
 }
 
 // ─── 6 · Jobs UX ─────────────────────────────────────────────────────────────
@@ -1068,14 +1090,14 @@ async function checkJobsUx(browser: import('playwright').Browser): Promise<void>
     ), { timeoutMs: 15_000 });
     if (stopped?.business_status !== 'production_ready'
       || stopped.job_status !== 'cancelled'
-      || stopped.project_state !== 'failed') {
+      || stopped.project_state !== 'cancelled') {
       throw new Error(`stop result = ${JSON.stringify(stopped)}`);
     }
     await page.goto(`${BASE}/inbox?business=${failedBuildBiz.id}`, { waitUntil: 'networkidle' });
     if (await page.getByText(failedBuildBiz.name, { exact: true }).count()) {
       throw new Error('stopped failed build is still in Вхідні');
     }
-    return 'production_ready; job cancelled; project failed';
+    return 'production_ready; job and project cancelled';
   });
 
   await ctx.close();
@@ -1092,17 +1114,14 @@ async function checkJobsUx(browser: import('playwright').Browser): Promise<void>
  */
 async function checkDemoPrivacy(): Promise<void> {
   group('7 · Demo privacy');
-  const deploysDir = path.join(ROOT, 'deploys');
   let dirs: string[] = [];
   try {
-    dirs = (await readdir(deploysDir, { withFileTypes: true }))
-      .filter((d) => d.isDirectory())
+    dirs = (await listFactoryDemoDirectories())
       // Only things the demo server will actually route. Its token pattern is
       // `[a-z0-9]{16,}` or `preview-<n>`; anything else in this folder (a stray
       // `.screenshots/`) is not reachable over HTTP by construction, so
       // demanding a 200 from it would be testing the gate's own readdir.
-      .filter((d) => /^(?:[a-z0-9]{16,}|preview-\d+)$/i.test(d.name))
-      .map((d) => d.name);
+      .filter((name) => /^(?:[a-z0-9]{16,}|preview-\d+)$/i.test(name));
   } catch { /* no deploys yet */ }
 
   check('deploys/ has at least one demo to check', dirs.length > 0, `${dirs.length} demo dirs`);

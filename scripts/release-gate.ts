@@ -50,6 +50,7 @@ const gates: Gate[] = [
   { name: 'build policy', command: 'pnpm', args: ['tsx', 'scripts/test-build-policy.ts'] },
   { name: 'brand agent', command: 'pnpm', args: ['tsx', 'scripts/test-brand-agent.ts'] },
   { name: 'workspace dependencies', command: 'pnpm', args: ['tsx', 'scripts/test-workspace-dependencies.ts'] },
+  { name: 'UI shared Docker contracts', command: 'pnpm', args: ['test:ui-shared-contracts'] },
   { name: 'fixture mutation boundary', command: 'pnpm', args: ['test:fixture-safety'] },
   { name: 'campaign/global dry-run gate', command: 'pnpm', args: ['test:outreach-mode'] },
   { name: 'deterministic layout quality gates', command: 'pnpm', args: ['test:layout-quality'] },
@@ -106,16 +107,25 @@ async function run(gate: Gate): Promise<GateResult> {
 
 const selected = gates.filter((gate) => !gate.fullOnly || !quick);
 const results: GateResult[] = [];
-for (const gate of selected) results.push(await run(gate));
+for (const gate of selected) {
+  const result = await run(gate);
+  results.push(result);
+  // Every later full gate assumes the previous artifact/topology is current.
+  // Continuing after a failed image build would test stale containers and can
+  // even mutate fixture state under code that was not just built.
+  if (!result.ok) break;
+}
+const skipped = selected.slice(results.length).map((gate) => gate.name);
 
 const reportDir = path.join(root, '.artifacts', 'release-gate');
 await mkdir(reportDir, { recursive: true });
 const report = {
-  version: 1,
+  version: 2,
   mode: quick ? 'quick-non-release' : 'full',
   generatedAt: new Date().toISOString(),
   passed: results.filter((result) => result.ok).length,
   failed: results.filter((result) => !result.ok).length,
+  skipped,
   results,
 };
 await writeFile(path.join(reportDir, 'latest.json'), `${JSON.stringify(report, null, 2)}\n`, 'utf8');

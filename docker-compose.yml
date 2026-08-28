@@ -204,6 +204,16 @@ services:
       - sitesdata:/app/sites
       - agentinputs:/app/agent-inputs
       - runnerwork:/app/runner-work
+    networks:
+      - default
+      - runner-control
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    init: true
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8790/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 5s
@@ -219,11 +229,18 @@ services:
       dockerfile: Dockerfile.runner
       target: executor
     restart: unless-stopped
+    depends_on:
+      agent-egress-proxy:
+        condition: service_healthy
+      agent-egress-dns:
+        condition: service_healthy
     environment:
       RUNNER_EXECUTOR_PORT: 8791
       EXECUTOR_API_KEY: ${RUNNER_EXECUTOR_API_KEY:?RUNNER_EXECUTOR_API_KEY must be set for the private executor hop}
       RUNNER_WORK_ROOT: /app/runner-work
-      RUNNER_CREDENTIAL_ROOT: /app/runner-auth
+      RUNNER_CREDENTIAL_ROOT: /app/runner-work/.private/credentials
+      CODEX_HOME: /app/runner-work/.private/codex
+      XDG_DATA_HOME: /app/runner-work/.private/provider
       # Used only to derive ttyd basic auth inside the executor. Gateway has the
       # same private hop key and returns the derived password to authenticated UI.
       INTERNAL_API_KEY: ${RUNNER_EXECUTOR_API_KEY:?RUNNER_EXECUTOR_API_KEY must be set for the private executor hop}
@@ -234,11 +251,53 @@ services:
       # the pnpm store below it avoids a separately mounted root-owned cache
       # while still preserving downloads across executor restarts.
       NPM_CONFIG_STORE_DIR: /app/runner-work/.pnpm-store
+      NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+      NPM_CONFIG_PROXY: http://agent-egress-proxy:3128
+      NPM_CONFIG_HTTPS_PROXY: http://agent-egress-proxy:3128
+      HTTP_PROXY: http://agent-egress-proxy:3128
+      HTTPS_PROXY: http://agent-egress-proxy:3128
+      http_proxy: http://agent-egress-proxy:3128
+      https_proxy: http://agent-egress-proxy:3128
+      NO_PROXY: 127.0.0.1,localhost,agent-runner-executor,agent-runner-gateway
+      no_proxy: 127.0.0.1,localhost,agent-runner-executor,agent-runner-gateway
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      DISABLE_TELEMETRY: "1"
+      DO_NOT_TRACK: "1"
+      NEXT_TELEMETRY_DISABLED: "1"
+      RUNNER_REQUIRE_ISOLATION: "true"
+      # Claude's first-run/trust state must be writable but ephemeral. Provider
+      # credentials live only in their dedicated named volumes below.
+      HOME: /home/node/runtime-home
+      XDG_CACHE_HOME: /home/node/.cache
     volumes:
       - runnerwork:/app/runner-work
-      - runnerclaude:/app/runner-auth
-      - codexhome:/home/node/.codex
-      - opencodehome:/home/node/.local/share/opencode
+      # Nested named-volume overlays keep credentials out of runnerwork as seen
+      # by the gateway, while their writable parent lets bubblewrap establish
+      # deny mounts under a read-only container root.
+      - runnerclaude:/app/runner-work/.private/credentials
+      - codexhome:/app/runner-work/.private/codex
+      - opencodehome:/app/runner-work/.private/provider/opencode
+    networks:
+      - runner-control
+      - runner-egress
+    dns:
+      - ${RUNNER_EGRESS_DNS_IP:-172.31.250.53}
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+      - /home/node/.cache:size=512m,uid=1000,gid=1000,mode=700
+      - /home/node/runtime-home:size=512m,uid=1000,gid=1000,mode=700
+      - /home/node/.local/state:size=256m,uid=1000,gid=1000,mode=700
+    cap_drop: ["ALL"]
+    # Nested bubblewrap needs clone/unshare syscalls. No capabilities are added;
+    # the tool sandbox itself applies filesystem/network/seccomp restrictions.
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=unconfined
+    pids_limit: 512
+    mem_limit: ${RUNNER_MEMORY_LIMIT:-6g}
+    init: true
     ports:
       - "127.0.0.1:${BUILD_TERMINAL_PORT:-7681}:${BUILD_TERMINAL_PORT:-7681}"
     healthcheck:
@@ -246,6 +305,60 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  # The executor has no public route. Squid is its only HTTP(S) bridge and
+  # rejects direct IPs, private addresses, arbitrary CONNECT and non-allowlisted
+  # destinations before resolving them on the ordinary Compose network.
+  agent-egress-proxy:
+    image: websites-factory/agent-egress-proxy:local
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+      target: egress-proxy
+    restart: unless-stopped
+    networks:
+      - runner-egress
+      - default
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,uid=13,gid=13,mode=700
+      - /var/log/squid:size=32m,uid=13,gid=13,mode=700
+      - /var/spool/squid:size=64m,uid=13,gid=13,mode=700
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/busybox", "nc", "-z", "-w", "2", "127.0.0.1", "3128"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Filtering resolver: approved provider/package zones are forwarded; every
+  # other external query is answered REFUSED and never leaves the machine.
+  agent-egress-dns:
+    image: websites-factory/agent-egress-dns:local
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+      target: egress-dns
+    restart: unless-stopped
+    networks:
+      runner-egress:
+        ipv4_address: ${RUNNER_EGRESS_DNS_IP:-172.31.250.53}
+      default: {}
+    read_only: true
+    cap_drop: ["ALL"]
+    # CoreDNS runs non-root but its binary carries CAP_NET_BIND_SERVICE so it
+    # can bind the standard resolver port. Keeping only that capability avoids
+    # Docker rejecting exec after the bounding set is otherwise emptied.
+    cap_add: ["NET_BIND_SERVICE"]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8181/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   # Control UI (spec §2.2, decision #9): approval queue, funnel, campaigns,
   # jobs, conversations. This is THE interface — Telegram only links into it.
@@ -406,3 +519,12 @@ volumes:
   wahasessions:
   sitesdata:
   deploysdata:
+
+networks:
+  runner-control:
+    internal: true
+  runner-egress:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${RUNNER_EGRESS_SUBNET:-172.31.250.0/24}

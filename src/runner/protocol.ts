@@ -106,6 +106,7 @@ export const RunnerErrorCodeSchema = z.enum([
   'UNAUTHORIZED',
   'RUNNER_UNAVAILABLE',
   'EXECUTION_FAILED',
+  'SECURITY_VIOLATION',
   'RATE_LIMITED',
   'NEEDS_HUMAN',
   'CANCELLED',

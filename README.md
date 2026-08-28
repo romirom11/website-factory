@@ -4,10 +4,12 @@
 
 Code-first мультиагентна система: **PostgreSQL = state machine і джерело істини, pg-boss = черга jobs, агенти = workers для нечітких етапів**. Оркеструє детермінований код, не LLM.
 
-Агентний шар працює **тільки по підписці, без API-білінгу** (спека §2.3, рішення №10) — деталі в [docs/AGENT-RUNTIME.md](docs/AGENT-RUNTIME.md). Етапи 9-12 (brief → дизайн → збірка → QA → приватний деплой) описані в [docs/BUILD-PIPELINE.md](docs/BUILD-PIPELINE.md). Два взаємозамінні рантайми (`AGENT_RUNTIME`):
+Агентний шар працює **тільки по підписці, без API-білінгу** (спека §2.3, рішення №10) — деталі в [docs/AGENT-RUNTIME.md](docs/AGENT-RUNTIME.md). Етапи 9-12 (brief → дизайн → збірка → QA → приватний деплой) описані в [docs/BUILD-PIPELINE.md](docs/BUILD-PIPELINE.md). Production builder має два повністю ізольовані взаємозамінні рантайми (`AGENT_RUNTIME`):
 
 - **claude-code (default)**: Claude Code по підписці Pro/Max. Два режими виклику — headless structured (enrichment, brief, дизайн-напрямки, QA, текст outreach) і code agent з workspace (builder + QA-fix loop): ізольований Next.js-шаблон, immutable snapshot, brief, design contract і локальні assets; агент сам пише код, сам ганяє `pnpm install`/`pnpm build`, сам фіксить помилки. QA-issues повертаються в той самий workspace.
 - **codex**: те саме через Codex CLI по підписці ChatGPT; один вибір у UI застосовується до всіх агентних етапів.
+
+OpenCode також реалізує tool-free structured-виклики. Його tool-enabled builder у production fail-closed вимкнений, бо pinned CLI не має OS sandbox для subprocess tools; вибір OpenCode для збірки дає явний `needs_human`, а не слабший security mode.
 
 `ANTHROPIC_API_KEY` не потрібен ніде.
 

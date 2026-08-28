@@ -214,6 +214,28 @@ docker compose up -d
 open http://localhost:3000/settings      # далі — тільки тут
 ```
 
+Перед підключенням акаунтів перевір production boundary один раз після кожної
+зміни `Dockerfile.runner`, Compose networks або egress allowlist:
+
+```bash
+docker compose build agent-runner-gateway agent-runner-executor agent-egress-proxy agent-egress-dns
+pnpm test:runner-isolation
+```
+
+Тест підіймає окремий тимчасовий Compose project і перевіряє: approved npm
+через proxy; deny для arbitrary CONNECT, direct fetch, Python urllib, raw IP і
+DNS; відсутність route до Postgres/MinIO/factory/host; exact-workspace write;
+deny для сусіднього workspace, auth volumes і parent `/proc`; read-only root,
+mount/network/capability topology та fail-closed readiness. Після себе він
+видаляє тільки власні test volumes/networks.
+
+Allowlist не розширюється лише в одному місці. Для нового provider/package
+domain онови `infra/agent-proxy/squid.conf`, `infra/agent-dns/Corefile` і, якщо
+домен потрібен tool subprocess Claude, `APPROVED_TOOL_DOMAINS` у
+`src/agents/confinement.ts`; потім перебудуй образи й обов'язково повтори тест.
+OpenCode дозволений у production лише для tool-free structured stages; для
+builder/QA-fix обери Claude Code або Codex.
+
 ### 1. Claude Code по підписці (без цього агентні етапи не працюють)
 
 `/settings` → **Підключені акаунти** → рядок **Claude Code** → **«Підключити»**.
@@ -263,7 +285,7 @@ open http://localhost:3000/settings      # далі — тільки тут
 одноразова дія. Кнопка **«Перевірити»** будь-коли показує `codex login status`.
 
 Відключення з браузера навмисно немає: це твоя ChatGPT-сесія на диску, і
-прибирається вона однією командою — `docker compose exec factory codex logout`.
+прибирається вона однією командою — `docker compose exec agent-runner-executor codex logout`.
 
 ### 3. Telegram (сповіщення + лінки в UI)
 

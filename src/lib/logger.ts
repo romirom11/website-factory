@@ -1,7 +1,9 @@
+import { redactSensitiveValue } from './redaction.js';
+
 type Ctx = Record<string, unknown>;
 
 function line(level: string, msg: string, ctx?: Ctx) {
-  const entry = { t: new Date().toISOString(), level, msg, ...ctx };
+  const entry = redactSensitiveValue({ t: new Date().toISOString(), level, msg, ...ctx });
   console.log(JSON.stringify(entry));
 }
 

@@ -40,6 +40,7 @@
     "test:tmux-agent": "tsx scripts/test-tmux-agent.ts",
     "test:agent-result-lifecycle": "tsx scripts/test-agent-result-lifecycle.ts",
     "test:agent-runner": "tsx scripts/test-agent-runner.ts",
+    "test:runner-isolation": "tsx scripts/test-runner-isolation.ts",
     "telegram:setup": "tsx src/telegram/bot.ts",
     "ui:dev": "pnpm --dir ui dev",
     "ui:build": "pnpm --dir ui build",

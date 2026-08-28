@@ -297,15 +297,16 @@ console.log('\nReading by offset');
 
 // ─── plumbing the workers depend on ──────────────────────────────────────────
 //
-// The log's location is a contract between four processes: three workers write
-// it, the API reads it, and the workspace wipe must not delete it. None of that
+// The business-scoped log's location is a contract between four processes:
+// three workers write it, the API reads it, and project workspace cleanup must
+// not delete it. None of that
 // is expressible as a unit call, so it is asserted against the source.
 
 console.log('\nWorkspace plumbing');
 {
-  const p = buildLogPath('e2e-fixture-biz', 42);
-  check('the log lives inside the project workspace',
-    p.endsWith(path.join('sites', 'e2e-fixture-biz', '42', 'build-log.ndjson')), p);
+  const p = buildLogPath('e2e-fixture-biz');
+  check('the log lives at the business root outside disposable project workspaces',
+    p.endsWith(path.join('sites', 'e2e-fixture-biz', 'pipeline-log.ndjson')), p);
 
   const workspaceSrc = await readFile(path.resolve('src/build/workspace.ts'), 'utf8');
   check('SITES_ROOT is still `path.resolve(\'sites\')` in workspace.ts',
@@ -331,7 +332,7 @@ console.log('\nWorkspace plumbing');
   check('the builder passes its log path to the agent',
     /buildLogPath: logPath/.test(await readFile(path.resolve('src/workers/builder.ts'), 'utf8')));
   check('the API exposes the log read-only',
-    /app\.get\('\/internal\/build-log\/:projectId', internalAuth/.test(
+    /app\.get\('\/internal\/build-log\/:businessId', internalAuth/.test(
       await readFile(path.resolve('src/api/server.ts'), 'utf8')));
 }
 

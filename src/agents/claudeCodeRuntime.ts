@@ -36,6 +36,7 @@ import { withStructuredRetries } from './retry.js';
 import { looksRateLimited, rateLimitedFromInfo, rateLimitedFromText } from './ratelimit.js';
 import { effectiveModel } from './modelPolicy.js';
 import { readAndValidateResult } from './result.js';
+import { claudeToolSandbox } from './confinement.js';
 import {
   RateLimitedError,
   RUNTIME_LABELS,
@@ -257,6 +258,7 @@ export async function preTrustWorkspace(cwd: string): Promise<void> {
  */
 export function guardSettings(workspace: string, tsxBin: string): unknown {
   return {
+    sandbox: claudeToolSandbox(workspace),
     hooks: {
       PreToolUse: [
         {
@@ -365,10 +367,14 @@ export const claudeCodeRuntime: AgentRuntime = {
           allowDangerouslySkipPermissions: true,
           systemPrompt: { type: 'preset', preset: 'claude_code', append: systemPrompt },
           settingSources: [],
+          ...(needsRead ? {
+            hooks: { PreToolUse: [{ hooks: [buildPreToolUseGuard(cwd, name)] }] },
+          } : {}),
+          sandbox: claudeToolSandbox(cwd),
           outputFormat: { type: 'json_schema', schema: jsonSchema },
           // No tools here, but there is still no reason to expose factory
           // secrets to a model processing scraped third-party text.
-          env: codeAgentEnv(this.authEnv()),
+          env: codeAgentEnv(this.authEnv(), cwd),
         };
 
         const prompt = `${userContent}${imageBlock}${jsonOnlyInstruction(schema, opts.outputJsonSchema)}`;
@@ -437,6 +443,7 @@ export const claudeCodeRuntime: AgentRuntime = {
         // is not consulted under bypassPermissions (SDK emits
         // CLAUDE_SDK_CAN_USE_TOOL_SHADOWED), verified empirically.
         hooks: { PreToolUse: [{ hooks: [buildPreToolUseGuard(opts.cwd, opts.name)] }] },
+        sandbox: claudeToolSandbox(opts.cwd),
         systemPrompt: { type: 'preset', preset: 'claude_code', append: opts.appendSystemPrompt },
         // Deliberate asymmetry with structured(), which pins settingSources: [].
         // The workspace agent NEEDS its own `<cwd>/.claude/` (that is where the
@@ -452,7 +459,7 @@ export const claudeCodeRuntime: AgentRuntime = {
         ...(opts.skills ? { skills: opts.skills } : {}),
         // Allowlist only: the builder never needs SMTP/IMAP/Telegram/S3/DB creds,
         // and must not be able to exfiltrate them via `echo $SMTP_PASS`.
-        env: codeAgentEnv(this.authEnv()),
+        env: codeAgentEnv(this.authEnv(), opts.cwd),
       };
 
       const prompt =

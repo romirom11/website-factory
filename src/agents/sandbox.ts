@@ -21,7 +21,7 @@
  * on hooks. Do not "simplify" this to canUseTool: it would silently do nothing.
  *
  * This is a safety net, not the security boundary. Production isolation is the
- * Docker container (spec §2.3: no internet beyond package registries).
+ * native runtime sandbox plus the internal Docker/DNS/proxy topology.
  */
 import path from 'node:path';
 import { realpathSync } from 'node:fs';
@@ -68,7 +68,10 @@ function isDenied(name: string): boolean {
  * disk and inject nothing).
  * @param injected per-runtime credentials, added verbatim on top of the allowlist.
  */
-export function codeAgentEnv(injected?: Record<string, string>): Record<string, string> {
+export function codeAgentEnv(
+  injected?: Record<string, string>,
+  workspace?: string,
+): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined || isDenied(k)) continue;
@@ -84,6 +87,17 @@ export function codeAgentEnv(injected?: Record<string, string>): Record<string, 
   // multibyte input on its way into the agent TUI (measured), and tools inside
   // the workspace read/write UTF-8 files. Containers often ship with no LANG.
   if (!env.LANG) env.LANG = 'C.UTF-8';
+  // Native/runtime sandboxes isolate tool processes from the credential-bearing
+  // coordinator. Claude additionally creates a private PID namespace so Bash
+  // cannot scrape the parent's environment through /proc.
+  env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = '1';
+  env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
+  env.DISABLE_TELEMETRY = '1';
+  env.DO_NOT_TRACK = '1';
+  env.NEXT_TELEMETRY_DISABLED = '1';
+  if (workspace) {
+    env.TMPDIR = path.join(path.resolve(workspace), '.factory-tmp');
+  }
   return env;
 }
 
@@ -219,9 +233,15 @@ export function evaluateToolCall(cwd: string, toolName: string, input: unknown):
 
   // ── network tools ─────────────────────────────────────────────────────────
   //
-  // WebSearch is allowed: it is executed by Anthropic's infrastructure, so it
-  // reads nothing of ours and is the one search path a blocked server IP still
-  // has (see socialFinderAgent.ts).
+  // WebSearch runs on provider infrastructure, but its query is still an
+  // outbound payload. Keep it bounded and reject secret/high-entropy strings.
+  if (toolName === 'WebSearch') {
+    const query = String(i.query ?? '');
+    if (!isSafeSearchQuery(query)) {
+      return { allow: false, reason: 'search query rejected by controlled-search policy' };
+    }
+    return { allow: true };
+  }
   //
   // WebFetch is DENIED even when a caller lists it. Measured 2026-08-21: it
   // fetches from THIS host's egress — it reported our own public IP and was
@@ -236,17 +256,43 @@ export function evaluateToolCall(cwd: string, toolName: string, input: unknown):
   return { allow: true };
 }
 
+/** Pure controlled-search policy; never logs or returns the rejected query. */
+export function isSafeSearchQuery(query: string, forbiddenValues: readonly string[] = []): boolean {
+  const value = query.trim();
+  if (!value || value.length > 500 || /[\u0000-\u001f\u007f]/.test(value)) return false;
+  if (/\b(?:https?|ftp|file|data):\/\//i.test(value)) return false;
+  if (forbiddenValues.some((secret) => secret.length >= 8 && value.includes(secret))) return false;
+  const tokens = value.match(/[A-Za-z0-9_+\/=.-]{24,}/g) ?? [];
+  return !tokens.some((token) => {
+    const compact = token.replace(/[=._/-]/g, '');
+    const classes = [/[a-z]/.test(compact), /[A-Z]/.test(compact), /\d/.test(compact)].filter(Boolean).length;
+    const uniqueRatio = new Set(compact).size / Math.max(compact.length, 1);
+    return compact.length >= 24 && classes >= 2 && uniqueRatio > 0.45;
+  });
+}
+
 /**
  * PreToolUse hook enforcing the workspace boundary.
  * Fail-closed: if the guard itself throws, the call is denied.
  */
 export function buildPreToolUseGuard(cwd: string, agentName: string) {
+  const secretValues = Object.entries(process.env)
+    .filter(([name, value]) => value && (isDenied(name) || /(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i.test(name)))
+    .map(([, value]) => value as string)
+    .filter((value) => value.length >= 8);
   return async (input: unknown): Promise<Record<string, unknown>> => {
     const { tool_name: toolName, tool_input: toolInput } =
       (input ?? {}) as { tool_name?: string; tool_input?: unknown };
     let decision: GuardDecision;
     try {
-      decision = evaluateToolCall(cwd, String(toolName ?? ''), toolInput);
+      if (toolName === 'WebSearch') {
+        const query = String((toolInput as { query?: unknown } | null)?.query ?? '');
+        decision = isSafeSearchQuery(query, secretValues)
+          ? { allow: true }
+          : { allow: false, reason: 'search query rejected by controlled-search policy' };
+      } else {
+        decision = evaluateToolCall(cwd, String(toolName ?? ''), toolInput);
+      }
     } catch (err) {
       decision = { allow: false, reason: `guard error: ${String(err).slice(0, 120)}` };
     }

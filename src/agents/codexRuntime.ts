@@ -7,12 +7,12 @@
  * nothing.
  *
  * structured(): `codex exec --output-schema <schema.json> --output-last-message <file>`
- *               in a read-only sandbox — the last agent message is the JSON.
- * codeAgent():  `codex exec --cd <workspace> --sandbox workspace-write`; the
- *               agent writes result.json, the same contract as every adapter.
+ *               in the exact-root read-only profile.
+ * codeAgent():  `codex exec --cd <workspace>` in the exact-root tool profile;
+ *               the agent writes result.json, the same contract as every adapter.
  */
 import { spawn } from 'node:child_process';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -28,6 +28,11 @@ import { effectiveModel } from './modelPolicy.js';
 import { readAndValidateResult } from './result.js';
 import { kickoffLine, PROMPT_FILE } from './tmuxRuntime.js';
 import {
+  CODEX_READ_ONLY_PROFILE,
+  CODEX_TOOL_PROFILE,
+  codexExecConfinementArgs,
+} from './confinement.js';
+import {
   RateLimitedError,
   RUNTIME_LABELS,
   type AgentRuntime,
@@ -42,12 +47,13 @@ const DEFAULT_CODE_TIMEOUT_MS = 60 * 60_000;
 
 interface ExecResult { code: number | null; stdout: string; stderr: string; timedOut: boolean }
 
-function runCodex(args: string[], cwd: string, timeoutMs: number): Promise<ExecResult> {
+async function runCodex(args: string[], cwd: string, timeoutMs: number): Promise<ExecResult> {
+  await mkdir(path.join(cwd, '.factory-tmp'), { recursive: true });
   return new Promise((resolve, reject) => {
     // Same allowlist as the Claude adapter: factory credentials (SMTP/IMAP/
     // Telegram/S3/DATABASE_URL) never reach an agent process, and no
     // pay-per-token API key is passed either.
-    const env = codeAgentEnv();
+    const env = codeAgentEnv(undefined, cwd);
 
     const child = spawn(config.agents.codexBin, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
@@ -85,7 +91,7 @@ export const codexRuntime: AgentRuntime = {
   terminalLaunch(opts: CodeAgentOptions, _context: { settingsPath: string }): TerminalLaunchSpec {
     const args = [
       'exec',
-      '--sandbox', 'workspace-write',
+      ...codexExecConfinementArgs(CODEX_TOOL_PROFILE, 'workspace-write'),
       '--skip-git-repo-check',
       '--cd', opts.cwd,
     ];
@@ -119,7 +125,7 @@ export const codexRuntime: AgentRuntime = {
         attempt: (attempt) => withAgentSlot(`structured:${name}`, async () => {
           const args = [
             'exec',
-            '--sandbox', 'read-only',
+            ...codexExecConfinementArgs(CODEX_READ_ONLY_PROFILE, 'read-only'),
             '--skip-git-repo-check',
             '--ephemeral',
             '--cd', opts.cwd ?? scratch,
@@ -169,7 +175,7 @@ export const codexRuntime: AgentRuntime = {
 
       const args = [
         'exec',
-        '--sandbox', 'workspace-write',
+        ...codexExecConfinementArgs(CODEX_TOOL_PROFILE, 'workspace-write'),
         '--skip-git-repo-check',
         '--cd', opts.cwd,
       ];

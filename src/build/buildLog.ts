@@ -27,6 +27,7 @@
  */
 import { appendFile, mkdir, open, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { redactSensitiveText } from '../lib/redaction.js';
 
 /**
  * Deliberately re-derived rather than imported from `workspace.ts`.
@@ -196,7 +197,9 @@ export function toolEvent(block: unknown, t: string, agent?: string): BuildLogEv
       detail = clip([str(input.pattern), shortPath(str(input.path))].filter(Boolean).join(' в '), SUMMARY_CMD_MAX);
       break;
     case 'WebSearch':
-      detail = clip(str(input.query), SUMMARY_CMD_MAX);
+      // Search queries are outbound payloads. Even rejected tool calls can
+      // appear in the SDK stream, so never persist the query itself.
+      detail = 'контрольований пошук';
       break;
     case 'Skill':
       detail = clip(str(input.skill), SUMMARY_CMD_MAX);
@@ -241,7 +244,10 @@ export async function appendBuildLog(logPath: string | undefined, event: BuildLo
     const size = await stat(logPath).then((s) => s.size).catch(() => 0);
     if (size > MAX_LOG_BYTES) return;
     if (size === 0) await mkdir(path.dirname(logPath), { recursive: true });
-    await appendFile(logPath, `${JSON.stringify(event)}\n`, 'utf8');
+    await appendFile(logPath, `${JSON.stringify({
+      ...event,
+      summary: redactSensitiveText(event.summary),
+    })}\n`, 'utf8');
   } catch (err) {
     if (!warned.has(logPath)) {
       warned.add(logPath);

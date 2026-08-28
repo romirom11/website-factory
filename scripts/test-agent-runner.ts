@@ -83,6 +83,16 @@ const { config } = await import('../src/config.js');
 const { isRunnerUnavailableError } = await import('../src/agents/types.js');
 const { terminalPassword } = await import('../src/agents/terminalServer.js');
 const {
+  assertCodeRuntimeConfined,
+  RuntimeConfinementError,
+} = await import('../src/agents/confinement.js');
+const { assertNoSecretLeaks, RunnerSecurityError } = await import('../src/runner/secretScan.js');
+const {
+  redactSensitiveText,
+  redactSensitiveValue,
+  setSensitiveValues,
+} = await import('../src/lib/redaction.js');
+const {
   agentSlotStats,
   currentAgentWorkerGroup,
   withAgentSlot,
@@ -116,6 +126,19 @@ fakeExecutor.post('/v1/executions', async (c) => {
 
   const paths = executionPaths(request.requestId);
   if (request.operation === 'code') {
+    if (request.name === 'security-violation') {
+      await writeFile(path.join(paths.workspace, 'blocked-output.txt'), 'must never sync');
+      return c.json({
+        version: RUNNER_PROTOCOL_VERSION,
+        requestId: request.requestId,
+        ok: false,
+        error: {
+          code: 'SECURITY_VIOLATION',
+          message: 'runner output failed the security gate',
+          runtime: request.runtime,
+        },
+      });
+    }
     if (request.options.terminal) {
       const now = new Date().toISOString();
       await writeFile(path.join(paths.workspace, 'terminal-session.json'), JSON.stringify({
@@ -138,7 +161,12 @@ fakeExecutor.post('/v1/executions', async (c) => {
   if (request.name.includes('slow')) await new Promise((resolve) => setTimeout(resolve, 250));
   const value = request.name === 'invalid-structured-schema'
     ? { pong: 'not-a-boolean', runtime: request.runtime }
-    : { pong: true, runtime: request.runtime };
+    : request.name === 'attachment-path'
+      ? {
+        insideWorkspace: existsSync(path.join(paths.workspace, request.attachments[0]!.target)),
+        outsideWorkspace: existsSync(path.join(paths.root, request.attachments[0]!.target)),
+      }
+      : { pong: true, runtime: request.runtime };
   return c.json({
     version: RUNNER_PROTOCOL_VERSION,
     requestId: request.requestId,
@@ -231,6 +259,77 @@ try {
     assert.equal(existsSync(oldRoot), false);
   });
 
+  await check('production runtime gate disables unconfinable OpenCode tools', () => {
+    const previous = process.env.RUNNER_REQUIRE_ISOLATION;
+    process.env.RUNNER_REQUIRE_ISOLATION = 'true';
+    try {
+      assert.doesNotThrow(() => assertCodeRuntimeConfined('claude-code'));
+      assert.doesNotThrow(() => assertCodeRuntimeConfined('codex'));
+      assert.throws(
+        () => assertCodeRuntimeConfined('opencode'),
+        (error: unknown) => error instanceof RuntimeConfinementError
+          && error.code === 'NEEDS_HUMAN'
+          && /no enforceable OS sandbox/.test(error.message),
+      );
+    } finally {
+      if (previous === undefined) delete process.env.RUNNER_REQUIRE_ISOLATION;
+      else process.env.RUNNER_REQUIRE_ISOLATION = previous;
+    }
+  });
+
+  await check('runner redacts nested secret values without logging them', () => {
+    const secret = 'runner-redaction-secret-value';
+    setSensitiveValues([secret]);
+    try {
+      assert.equal(redactSensitiveText(`before ${secret} after`), 'before [REDACTED] after');
+      assert.deepEqual(redactSensitiveValue({ nested: [secret] }), { nested: ['[REDACTED]'] });
+    } finally {
+      setSensitiveValues([]);
+    }
+  });
+
+  await check('runner output scan rejects literal credentials before sync', async () => {
+    const root = path.join(tmp, 'secret-scan');
+    const secret = 'literal-runner-secret-value';
+    await mkdir(root);
+    await writeFile(path.join(root, 'safe.txt'), 'ordinary output');
+    await assertNoSecretLeaks(root, [secret]);
+    await writeFile(path.join(root, 'leak.txt'), `copied: ${secret}`);
+    await assert.rejects(
+      assertNoSecretLeaks(root, [secret]),
+      (error: unknown) => error instanceof RunnerSecurityError && error.code === 'SECURITY_VIOLATION',
+    );
+  });
+
+  await check('runner output scan detects credentials split across stream chunks', async () => {
+    const root = path.join(tmp, 'secret-scan-boundary');
+    const secret = 'cross-chunk-runner-secret-value';
+    await mkdir(root);
+    const prefix = Buffer.alloc((64 * 1024) - 4, 0x61);
+    await writeFile(path.join(root, 'large-output.bin'), Buffer.concat([
+      prefix,
+      Buffer.from(secret),
+      Buffer.alloc(64 * 1024, 0x62),
+    ]));
+    await assert.rejects(
+      assertNoSecretLeaks(root, [secret]),
+      (error: unknown) => error instanceof RunnerSecurityError && error.code === 'SECURITY_VIOLATION',
+    );
+  });
+
+  await check('runner output scan cannot hide a leak in a nested cache-shaped path', async () => {
+    const root = path.join(tmp, 'secret-scan-nested-cache');
+    const secret = 'nested-cache-runner-secret-value';
+    await mkdir(path.join(root, 'workspace', 'node_modules'), { recursive: true });
+    await mkdir(path.join(root, 'workspace', 'output', '.next'), { recursive: true });
+    await writeFile(path.join(root, 'workspace', 'node_modules', 'ignored.txt'), secret);
+    await writeFile(path.join(root, 'workspace', 'output', '.next', 'leak.txt'), secret);
+    await assert.rejects(
+      assertNoSecretLeaks(root, [secret]),
+      (error: unknown) => error instanceof RunnerSecurityError && error.code === 'SECURITY_VIOLATION',
+    );
+  });
+
   await check('real executor restores worker-group capacity from the wire request', async () => {
     const runtime = getRuntimeById('claude-code');
     const original = runtime.structured;
@@ -310,6 +409,30 @@ try {
     ...overrides,
   });
 
+  await check('security-violation output is never synchronized to factory storage', async () => {
+    const workspace = path.join(sites, 'security-gated-workspace');
+    const invocation = await prepareCodeAgentInvocation(workspace);
+    const request = CodeExecutionRequestSchema.parse({
+      version: RUNNER_PROTOCOL_VERSION,
+      operation: 'code',
+      requestId: invocation.invocationId,
+      runtime: 'codex',
+      capacity: { group: 'build', limit: 2 },
+      model: 'test-model',
+      name: 'security-violation',
+      prompt: 'attempt leak',
+      outputJsonSchema: { type: 'object' },
+      workspace: { root: 'sites', path: 'security-gated-workspace' },
+      invocation: { id: invocation.invocationId, notBeforeMs: invocation.notBeforeMs },
+      options: { terminal: false, timeoutMs: 5_000 },
+    });
+    const response = await gatewayPost(request);
+    const body = await response.json() as { ok: boolean; error?: { code: string } };
+    assert.equal(body.ok, false);
+    assert.equal(body.error?.code, 'SECURITY_VIOLATION');
+    assert.equal(existsSync(path.join(workspace, 'blocked-output.txt')), false);
+  });
+
   await check('gateway rejects unauthorized, invalid and oversized requests', async () => {
     const request = structuredRequest();
     assert.equal((await gatewayPost(request, 'wrong-key')).status, 401);
@@ -341,6 +464,20 @@ try {
       assert.equal(usage.length, 1);
     });
   }
+
+  await check('structured attachments are staged inside the exact sandbox workspace', async () => {
+    const image = path.join(inputs, 'attachment.png');
+    await writeFile(image, 'image fixture');
+    const value = await remoteAgentTransport.structured(
+      'claude-code',
+      'attachment-path',
+      'system',
+      'inspect attachment',
+      z.object({ insideWorkspace: z.boolean(), outsideWorkspace: z.boolean() }),
+      { imagePaths: [image], retries: 0, timeoutMs: 5_000 },
+    );
+    assert.deepEqual(value, { insideWorkspace: true, outsideWorkspace: false });
+  });
 
   await check('caller schema remains authoritative after remote execution', async () => {
     await assert.rejects(

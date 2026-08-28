@@ -35,6 +35,7 @@ import {
 } from './workspace.js';
 import { liveTerminal } from '../agents/tmuxRuntime.js';
 import { TERMINAL_USER, terminalPassword } from '../agents/terminalServer.js';
+import { redactSensitiveText } from '../lib/redaction.js';
 
 interface ActiveExecution {
   requestId: string;
@@ -48,6 +49,10 @@ const activeByWorkspace = new Map<string, ActiveExecution>();
 const workspaceReservations = new Map<string, string>();
 const responseCache = new Map<string, { hash: string; response: ExecutionResponse }>();
 const inFlight = new Map<string, { hash: string; promise: Promise<ExecutionResponse> }>();
+
+function safeError(error: unknown, max = 1_000): string {
+  return redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(0, max);
+}
 
 function authorized(presented: string, expected: string): boolean {
   if (!presented || !expected) return false;
@@ -132,7 +137,10 @@ async function performThroughGateway(
     if (sourceWorkspace) await stageWorkspace(sourceWorkspace, paths.workspace);
     else await mkdir(paths.workspace, { recursive: true });
     if (request.operation === 'structured') {
-      await stageAttachments(request.attachments, paths.root, roots);
+      // Attachments belong to this invocation and must be readable by the
+      // exact-workspace sandbox. Keeping them inside workspace avoids opening
+      // the execution parent (manifest/telemetry/siblings) to Read tools.
+      await stageAttachments(request.attachments, paths.workspace, roots);
     }
     await writeManifest(paths.manifest, {
       version: 1,
@@ -172,7 +180,16 @@ async function performThroughGateway(
   const timer = sourceBuildLog ? setInterval(pump, 1_000) : null;
   timer?.unref?.();
 
-  let response: ExecutionResponse;
+  let response: ExecutionResponse = {
+    version: RUNNER_PROTOCOL_VERSION,
+    requestId: request.requestId,
+    ok: false,
+    error: {
+      code: 'RUNNER_UNAVAILABLE',
+      message: 'runner execution did not produce a response',
+      runtime: request.runtime,
+    },
+  };
   try {
     response = await callExecutor(request);
   } catch (error) {
@@ -182,7 +199,7 @@ async function performThroughGateway(
       ok: false,
       error: {
         code: 'RUNNER_UNAVAILABLE',
-        message: `runner executor unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        message: `runner executor unavailable: ${safeError(error, 1_900)}`,
         runtime: request.runtime,
       },
     };
@@ -190,10 +207,14 @@ async function performThroughGateway(
     if (timer) clearInterval(timer);
     pump();
     await pumpChain;
-    // Code-agent failures may still have produced a valid deliverable. Sync in
-    // every outcome; the factory's invocation-aware recovery decides whether it
-    // is current and independently verifies it.
-    if (request.operation === 'code' && sourceWorkspace) {
+    // Ordinary code-agent failures may still have produced a valid deliverable.
+    // A security-gate failure is different: no byte from that execution may
+    // cross back into factory storage.
+    if (
+      request.operation === 'code'
+      && sourceWorkspace
+      && (response.ok || response.error.code !== 'SECURITY_VIOLATION')
+    ) {
       try {
         const relativeBuildLog = sourceBuildLog
           ? path.relative(sourceWorkspace, sourceBuildLog)
@@ -213,7 +234,7 @@ async function performThroughGateway(
           ok: false,
           error: {
             code: 'RUNNER_UNAVAILABLE',
-            message: `runner could not synchronize workspace: ${error instanceof Error ? error.message : String(error)}`.slice(0, 2_000),
+            message: `runner could not synchronize workspace: ${safeError(error, 1_900)}`,
             runtime: request.runtime,
           },
         };
@@ -296,7 +317,7 @@ export function createGatewayApp(): Hono {
         version: RUNNER_PROTOCOL_VERSION,
         requestId: requestIdFrom(c),
         ok: false,
-        error: { code: 'INVALID_REQUEST', message: String(error).slice(0, 1_000) },
+        error: { code: 'INVALID_REQUEST', message: safeError(error) },
       }, 400);
     }
   });
@@ -315,7 +336,7 @@ export function createGatewayApp(): Hono {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ok: false,
-        error: { code: 'RUNNER_UNAVAILABLE', message: String(error).slice(0, 1_000) },
+        error: { code: 'RUNNER_UNAVAILABLE', message: safeError(error) },
       }, 503);
     }
   });
@@ -334,7 +355,7 @@ export function createGatewayApp(): Hono {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ok: false,
-        error: { code: 'RUNNER_UNAVAILABLE', message: String(error).slice(0, 1_000) },
+        error: { code: 'RUNNER_UNAVAILABLE', message: safeError(error) },
       }, 503);
     }
   });
@@ -375,7 +396,7 @@ export function createGatewayApp(): Hono {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ok: false,
-        error: { code: 'RUNNER_UNAVAILABLE', message: String(error).slice(0, 1_000) },
+        error: { code: 'RUNNER_UNAVAILABLE', message: safeError(error) },
       }, 503);
     }
   });
@@ -398,7 +419,7 @@ export async function startGateway(): Promise<void> {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   void startGateway().catch((error) => {
-    console.error(error);
+    console.error(safeError(error, 2_000));
     process.exit(1);
   });
 }

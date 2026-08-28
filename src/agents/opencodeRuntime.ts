@@ -1,7 +1,7 @@
 /**
  * OpenCode runtime adapter — subscription harness #3.
  *
- * Auth lives in OpenCode's own home (`~/.local/share/opencode/auth.json`,
+ * Auth lives in OpenCode's isolated XDG data volume (`$XDG_DATA_HOME/opencode/auth.json`,
  * managed by `opencode auth login`), so like Codex this adapter injects
  * NO credentials into agent processes (`authEnv()` is empty). Nothing
  * pay-per-token: whatever provider Roman logged in to bills its own
@@ -20,9 +20,11 @@
  *   - an "ask" WITHOUT --auto is AUTO-REJECTED (fail-closed, never hangs) and a
  *     human-readable line lands in stdout between the JSON events;
  *   - with --auto, asks are approved but explicit "deny" rules still hold.
- * So codeAgent() runs --auto under a generated deny-config (the workspace
- * guard below), while structured() runs without --auto behind a config that
- * denies every tool outright — the equivalent of Claude's allowedTools: [].
+ * So codeAgent() runs --auto under a generated deny-config in local development,
+ * while structured() runs without --auto behind a config that denies every
+ * tool outright — the equivalent of Claude's allowedTools: []. Production
+ * rejects OpenCode codeAgent() before launch because those rules are not an OS
+ * sandbox; tool-free structured calls remain enabled.
  */
 import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
@@ -212,13 +214,16 @@ function shortPath(p: string): string {
 export function openCodeGuardConfig(): Record<string, unknown> {
   const sensitiveReads = [
     '**/.ssh/**', '**/.aws/**', '**/.gnupg/**', '**/.kube/**', '**/.docker/**',
-    '**/.claude/**', '**/.codex/**', '**/.config/opencode/**',
+    '**/.claude/**', '**/.codex/**', '**/.config/opencode/**', '**/provider-auth/opencode/**',
     '**/.netrc', '**/.npmrc', '**/.pgpass',
   ];
   return {
     $schema: 'https://opencode.ai/config.json',
     permission: {
       webfetch: 'deny',
+      websearch: 'deny',
+      external_directory: 'deny',
+      task: 'deny',
       read: {
         '*': 'allow',
         ...Object.fromEntries(sensitiveReads.map((p) => [p, 'deny'])),

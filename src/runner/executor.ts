@@ -2,10 +2,9 @@
  * Untrusted-runtime execution service.
  *
  * It sees one staged scratch directory and provider auth, but no factory DB,
- * object storage or business volumes. U8 adds the OS/network confinement around
- * the tool subprocesses; this service is the protocol and lifecycle boundary.
+ * object storage or business volumes. OS/network confinement surrounds every
+ * tool subprocess; this service is the protocol and lifecycle boundary.
  */
-import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
@@ -41,8 +40,24 @@ import {
   submitCode,
 } from '../api/accounts.js';
 import { runLocalAgentCheck } from '../api/checks.js';
-import { loadRunnerCredentials, seedRunnerClaudeCredential } from './credentials.js';
+import {
+  loadRunnerCredentials,
+  refreshRunnerSensitiveValues,
+  runnerSensitiveValues,
+  seedRunnerClaudeCredential,
+} from './credentials.js';
 import { cancelTmuxSession, liveTerminal } from '../agents/tmuxRuntime.js';
+import {
+  assertCodeRuntimeConfined,
+  runConstrainedPackageCommand,
+} from '../agents/confinement.js';
+import {
+  initializeRunnerIsolation,
+  runnerIsolationLive,
+  type RunnerIsolationReport,
+} from './health.js';
+import { redactSensitiveText } from '../lib/redaction.js';
+import { assertNoSecretLeaks, RunnerSecurityError } from './secretScan.js';
 import {
   agentCapacityManager,
   ResizableSemaphore,
@@ -54,6 +69,11 @@ const active = new Map<string, { hash: string; promise: Promise<ExecutionRespons
 const RESPONSE_CACHE_LIMIT = 200;
 /** ttyd exposes one port, so only attachable sessions are globally serialized. */
 const terminalExecutions = new ResizableSemaphore(1);
+let isolationReport: RunnerIsolationReport = {
+  required: true,
+  ready: false,
+  codeRuntimes: { 'claude-code': false, codex: false, opencode: false },
+};
 
 function authorized(presented: string, expected: string): boolean {
   if (!presented || !expected) return false;
@@ -71,7 +91,7 @@ async function parseJson(c: Context): Promise<unknown> {
 }
 
 function serializeError(error: unknown, runtime: AgentRuntimeId): RunnerError {
-  const message = (error instanceof Error ? error.message : String(error)).slice(0, 2_000);
+  const message = redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(0, 2_000);
   if (isRateLimitedError(error)) {
     return {
       code: 'RATE_LIMITED',
@@ -85,42 +105,58 @@ function serializeError(error: unknown, runtime: AgentRuntimeId): RunnerError {
   if (error instanceof AgentSchemaError || (error as { code?: string } | null)?.code === 'NEEDS_HUMAN') {
     return { code: 'NEEDS_HUMAN', message, runtime };
   }
+  if (error instanceof RunnerSecurityError) {
+    return { code: 'SECURITY_VIOLATION', message, runtime };
+  }
   return { code: 'EXECUTION_FAILED', message, runtime };
 }
 
-function installWorkspaceDependencies(cwd: string, timeoutMs: number): Promise<void> {
+function safeError(error: unknown, max = 1_000): string {
+  return redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(0, max);
+}
+
+async function installWorkspaceDependencies(cwd: string, timeoutMs: number): Promise<void> {
   if (!existsSync(path.join(cwd, 'package.json'))) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    const child = spawn('pnpm', ['install', '--frozen-lockfile'], {
-      cwd,
-      env: { ...process.env, CI: '1', NEXT_TELEMETRY_DISABLED: '1' },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let output = '';
-    const onData = (chunk: Buffer): void => {
-      output += chunk.toString();
-      if (output.length > 20_000) output = output.slice(-10_000);
-    };
-    child.stdout.on('data', onData);
-    child.stderr.on('data', onData);
-    const timer = setTimeout(() => child.kill('SIGKILL'), Math.min(timeoutMs, 20 * 60_000));
-    child.on('error', (error) => { clearTimeout(timer); reject(error); });
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      if (code === 0) resolve();
-      else reject(new Error(`runner dependency install exited ${code}: ${output.slice(-1_000)}`));
-    });
-  });
+  const limit = Math.min(timeoutMs, 20 * 60_000);
+  const install = await runConstrainedPackageCommand(
+    cwd,
+    ['pnpm', 'install', '--frozen-lockfile', '--ignore-scripts'],
+    limit,
+  );
+  if (install.timedOut || install.code !== 0) {
+    throw new Error(
+      `runner dependency install ${install.timedOut ? 'timed out' : `exited ${install.code}`}: ` +
+      install.output.slice(-1_000),
+    );
+  }
+  // esbuild's optional platform package is already in the lockfile. Its rebuild
+  // runs after the untrusted graph is present, still inside the same OS sandbox.
+  const rebuild = await runConstrainedPackageCommand(
+    cwd,
+    ['pnpm', 'rebuild', 'esbuild'],
+    limit,
+    false,
+  );
+  if (rebuild.timedOut || rebuild.code !== 0) {
+    throw new Error(
+      `runner dependency rebuild ${rebuild.timedOut ? 'timed out' : `exited ${rebuild.code}`}: ` +
+      rebuild.output.slice(-1_000),
+    );
+  }
 }
 
 async function executeInWorkerGroup(request: ExecutionRequest): Promise<ExecutionResponse> {
   const paths = executionPaths(request.requestId);
   const runtime = getRuntimeById(request.runtime);
-  if (request.claudeCredential) await seedRunnerClaudeCredential(request.claudeCredential);
   let usage: AgentUsage | undefined;
   const onUsage = (value: AgentUsage): void => { usage = value; };
 
   try {
+    if (request.operation === 'code') assertCodeRuntimeConfined(request.runtime);
+    if (request.claudeCredential) await seedRunnerClaudeCredential(request.claudeCredential);
+    // Codex/OpenCode login files may have changed since executor startup. Load
+    // their latest values before any CLI output can reach logs.
+    await refreshRunnerSensitiveValues();
     if (request.operation === 'structured') {
       const value = await runtime.structured(
         request.name,
@@ -130,7 +166,7 @@ async function executeInWorkerGroup(request: ExecutionRequest): Promise<Executio
         {
           ...request.options,
           cwd: paths.workspace,
-          imagePaths: request.attachments.map((attachment) => path.join(paths.root, attachment.target)),
+          imagePaths: request.attachments.map((attachment) => path.join(paths.workspace, attachment.target)),
           buildLogPath: request.buildLog ? paths.buildLog : undefined,
           model: request.model,
           outputJsonSchema: request.outputJsonSchema,
@@ -173,6 +209,7 @@ async function executeInWorkerGroup(request: ExecutionRequest): Promise<Executio
     const value = request.options.terminal
       ? await terminalExecutions.run(`terminal:${request.name}`, run)
       : await run();
+    await assertNoSecretLeaks(paths.root, await runnerSensitiveValues());
     return {
       version: RUNNER_PROTOCOL_VERSION,
       requestId: request.requestId,
@@ -181,11 +218,19 @@ async function executeInWorkerGroup(request: ExecutionRequest): Promise<Executio
       usage,
     };
   } catch (error) {
+    let finalError = error;
+    if (request.operation === 'code') {
+      try {
+        await assertNoSecretLeaks(paths.root, await runnerSensitiveValues());
+      } catch (securityError) {
+        finalError = securityError;
+      }
+    }
     return {
       version: RUNNER_PROTOCOL_VERSION,
       requestId: request.requestId,
       ok: false,
-      error: serializeError(error, request.runtime),
+      error: serializeError(finalError, request.runtime),
       usage,
     };
   }
@@ -226,7 +271,15 @@ async function executeOnce(request: ExecutionRequest): Promise<ExecutionResponse
 
 export function createExecutorApp(): Hono {
   const app = new Hono();
-  app.get('/health', (c) => c.json({ ok: true, role: 'executor', active: active.size }));
+  app.get('/health', async (c) => {
+    const live = await runnerIsolationLive(isolationReport);
+    return c.json({
+      ok: live,
+      role: 'executor',
+      active: active.size,
+      isolation: isolationReport,
+    }, live ? 200 : 503);
+  });
   app.post('/v1/executions', async (c) => {
     if (!authorized(c.req.header('x-executor-key') ?? '', process.env.EXECUTOR_API_KEY ?? '')) {
       return c.json({
@@ -252,7 +305,7 @@ export function createExecutorApp(): Hono {
         version: RUNNER_PROTOCOL_VERSION,
         requestId: randomRequestId(c),
         ok: false,
-        error: { code: 'INVALID_REQUEST', message: String(error).slice(0, 1_000) },
+        error: { code: 'INVALID_REQUEST', message: safeError(error) },
       }, 400);
     }
   });
@@ -267,13 +320,14 @@ export function createExecutorApp(): Hono {
     try {
       const request = AgentCheckRequestSchema.parse(await parseJson(c));
       if (request.claudeCredential) await seedRunnerClaudeCredential(request.claudeCredential);
+      await refreshRunnerSensitiveValues();
       const result = await runLocalAgentCheck(request.provider, request.model);
       return c.json({ version: RUNNER_PROTOCOL_VERSION, ok: true, data: result });
     } catch (error) {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ok: false,
-        error: { code: 'INVALID_REQUEST', message: String(error).slice(0, 1_000) },
+        error: { code: 'INVALID_REQUEST', message: safeError(error) },
       }, 400);
     }
   });
@@ -309,7 +363,7 @@ export function createExecutorApp(): Hono {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ok: false,
-        error: { code: 'INVALID_REQUEST', message: String(error).slice(0, 1_000) },
+        error: { code: 'INVALID_REQUEST', message: safeError(error) },
       }, 400);
     }
   });
@@ -334,7 +388,7 @@ export function createExecutorApp(): Hono {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ok: false,
-        error: { code: 'INVALID_REQUEST', message: String(error).slice(0, 1_000) },
+        error: { code: 'INVALID_REQUEST', message: safeError(error) },
       }, 400);
     }
   });
@@ -348,6 +402,7 @@ function randomRequestId(c: Context): string {
 
 export async function startExecutor(): Promise<void> {
   await loadRunnerCredentials();
+  isolationReport = await initializeRunnerIsolation();
   const roots = runnerRoots();
   const port = Number(process.env.RUNNER_EXECUTOR_PORT ?? 8791);
   serve({ fetch: createExecutorApp().fetch, port, hostname: '0.0.0.0' });
@@ -356,7 +411,7 @@ export async function startExecutor(): Promise<void> {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   void startExecutor().catch((error) => {
-    console.error(error);
+    console.error(safeError(error, 2_000));
     process.exit(1);
   });
 }

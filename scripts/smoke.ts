@@ -3,7 +3,7 @@
  * and without live Google Maps:
  *   campaign -> synthetic candidate -> normalize (dedup) -> fast-qualify
  *   -> website audit (real browser on a controlled local page) -> queue round-trip.
- * Run: pnpm tsx scripts/smoke.ts
+ * Run: pnpm test:smoke:compose
  */
 import { eq } from 'drizzle-orm';
 import http from 'node:http';
@@ -16,6 +16,9 @@ import { readinessHandler } from '../src/workers/readiness.js';
 import { getBoss, register, enqueue } from '../src/orchestrator/queue.js';
 import type { RawCandidate } from '../src/workers/discovery.js';
 import { assertFixtureId } from './e2e/safety.js';
+import { assertFactoryTaskIsolated } from './e2e/isolation.js';
+
+assertFactoryTaskIsolated('smoke');
 
 let failures = 0;
 function check(name: string, ok: boolean, detail?: string) {

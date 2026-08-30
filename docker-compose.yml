@@ -498,7 +498,7 @@ services:
   # Never started by a plain `docker compose up` — it needs `--profile dev-mail`.
   #   SMTP 3025, IMAP 3143, HTTP API 8080 (used to inject a reply in tests).
   greenmail:
-    image: greenmail/standalone:latest
+    image: greenmail/standalone@sha256:9f32971b4f25d32b4de6fa2e297423768441c65e4541f6aecd7631c890a229a7
     profiles: ["dev-mail"]
     restart: "no"
     environment:

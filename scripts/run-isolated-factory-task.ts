@@ -34,6 +34,7 @@ async function runDocker(args: string[]): Promise<number> {
 }
 
 const task = selectedTask(process.argv[2]);
+const taskArgs = process.argv.slice(3);
 const stopExit = await runDocker(['compose', 'stop', 'factory']);
 if (stopExit !== 0) {
   process.exitCode = stopExit;
@@ -43,7 +44,8 @@ if (stopExit !== 0) {
   try {
     taskExit = await runDocker([
       'compose', 'run', '--rm', '--no-deps',
-      'factory', 'pnpm', 'tsx', ...TASKS[task],
+      '-e', 'E2E_FACTORY_ISOLATED=true',
+      'factory', 'pnpm', 'tsx', ...TASKS[task], ...taskArgs,
     ]);
   } finally {
     startExit = await runDocker(['compose', 'up', '-d', '--wait', 'factory']);

@@ -16,9 +16,12 @@
  * impossible without one — the real campaign could not be contacted even by a
  * bug in this script.
  *
- *   pnpm tsx scripts/integration-e2e.ts             # both parts, then clean up
- *   pnpm tsx scripts/integration-e2e.ts --keep      # leave the rows for inspection
- *   pnpm tsx scripts/integration-e2e.ts --no-discovery   # skip the gosom part
+ *   pnpm test:integration:compose                   # both parts, then clean up
+ *   pnpm test:integration:compose -- --keep         # leave fixture rows for inspection
+ *   pnpm test:integration:compose -- --no-discovery # skip the gosom part
+ *
+ * This file invokes handlers directly and therefore fails closed unless the
+ * Compose wrapper has stopped the live core worker first.
  */
 import 'dotenv/config';
 
@@ -31,7 +34,10 @@ import { discoverHandler } from '../src/workers/discovery.js';
 import { normalizeHandler } from '../src/workers/normalize.js';
 import { sendOutreachHandler, sendIdempotencyKey } from '../src/workers/outreach.js';
 import { assertFixtureId, assertFixtureIds, FIXTURE_PREFIX } from './e2e/safety.js';
+import { assertFactoryTaskIsolated } from './e2e/isolation.js';
 import { ensureBuckets, putRaw } from '../src/lib/storage.js';
+
+assertFactoryTaskIsolated('integration-e2e');
 
 const CAMPAIGN_ID = assertFixtureId('e2e-integration-campaign', 'campaign');
 const BUSINESS_ID = assertFixtureId('e2e-integration-fixture-salon', 'business');

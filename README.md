@@ -127,7 +127,7 @@ scripts/smoke.ts детермінований смоук-тест пайплай
 
 ```bash
 pnpm typecheck
-pnpm tsx scripts/smoke.ts   # campaign -> normalize -> dedup -> qualify -> audit -> gaps -> queue
+pnpm test:smoke:compose      # isolated campaign -> normalize -> qualify -> audit -> queue
 pnpm release:gate -- --quick # локальний цикл; не є дозволом на deploy
 pnpm release:gate            # повний release contract + evidence JSON
 

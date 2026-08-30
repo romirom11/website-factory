@@ -24,7 +24,8 @@
  *   or: docker run -d --name factory-greenmail-dev -p 127.0.0.1:3025:3025 \
  *         -p 127.0.0.1:3143:3143 -p 127.0.0.1:8081:8080 \
  *         -e GREENMAIL_OPTS="-Dgreenmail.setup.test.smtp -Dgreenmail.setup.test.imap \
- *         -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled" greenmail/standalone
+ *         -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled" \
+ *         greenmail/standalone@sha256:9f32971b4f25d32b4de6fa2e297423768441c65e4541f6aecd7631c890a229a7
  *
  * Run: pnpm tsx scripts/phaseE-e2e.ts        (add --keep to leave the rows behind)
  */

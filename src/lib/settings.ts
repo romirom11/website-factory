@@ -14,7 +14,10 @@
  *           SETTINGS_MASTER_KEY, ports. Things needed to boot and to decrypt.
  *   DB    → everything operational (tokens, SMTP/IMAP, WAHA, limits, mode).
  *
- * Resolution order at read time: DB value → env var → registry default.
+ * Resolution order at read time: process override → DB value → env var →
+ * registry default.
+ * Process overrides are explicit, scoped and in-memory only; acceptance tools
+ * use them to target local adapters without mutating the operator's DB rows.
  * Env therefore remains a working fallback for a fresh box or a rollback, but
  * once a key is saved in the UI the DB wins.
  *
@@ -409,6 +412,37 @@ export type SettingsLoader = () => Map<string, string>;
 let snapshot = new Map<string, string>();
 let loadedAt = 0;
 let loader: SettingsLoader | null = null;
+let processOverrides = new Map<string, string>();
+
+/**
+ * Temporarily override operational settings in this process only.
+ *
+ * This is the safe boundary for acceptance tools that must point live channel
+ * code at local test adapters while the operator's DB settings remain loaded.
+ * Restorers are LIFO so nested, narrowly-scoped overrides cannot silently
+ * clobber each other.
+ */
+export function overrideSettingsForProcess(
+  values: Readonly<Record<string, string>>,
+): () => void {
+  const previous = processOverrides;
+  const next = new Map(previous);
+  for (const [key, value] of Object.entries(values)) {
+    if (!BY_KEY.has(key)) throw new Error(`unknown process setting override: ${key}`);
+    next.set(key, value);
+  }
+  processOverrides = next;
+
+  let active = true;
+  return () => {
+    if (!active) return;
+    if (processOverrides !== next) {
+      throw new Error('process setting overrides must be restored in LIFO order');
+    }
+    processOverrides = previous;
+    active = false;
+  };
+}
 
 /**
  * Install the synchronous snapshot source. The DB read itself is async, so the
@@ -440,10 +474,12 @@ function current(): Map<string, string> {
 }
 
 /**
- * Effective value for a key: DB → env → registry default.
+ * Effective value for a key: process override → DB → env → registry default.
  * Secrets are decrypted here, so callers only ever see plaintext.
  */
 export function getSetting(key: string): string {
+  const overridden = processOverrides.get(key);
+  if (overridden !== undefined) return overridden;
   const raw = current().get(key);
   if (raw !== undefined && raw !== '') {
     const def = BY_KEY.get(key);
@@ -454,8 +490,9 @@ export function getSetting(key: string): string {
   return BY_KEY.get(key)?.default ?? '';
 }
 
-/** Where the effective value came from — shown in the UI so nothing is magic. */
-export function settingSource(key: string): 'db' | 'env' | 'default' {
+/** Where the effective value came from — shown in diagnostics so nothing is magic. */
+export function settingSource(key: string): 'process' | 'db' | 'env' | 'default' {
+  if (processOverrides.has(key)) return 'process';
   const raw = current().get(key);
   if (raw !== undefined && raw !== '') return 'db';
   const env = process.env[key];

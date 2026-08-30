@@ -4,7 +4,7 @@
  * Covers the three things that would silently break the whole feature:
  *  1. the AES-256-GCM envelope round-trips, and a WRONG master key degrades to
  *     '' instead of throwing (a worker must not die because a key rotated);
- *  2. resolution order really is DB -> env -> default;
+ *  2. resolution order really is process override -> DB -> env -> default;
  *  3. a value written to the DB becomes visible through `config.*` without a
  *     restart — the entire point of the change.
  */
@@ -12,7 +12,7 @@ import { eq } from 'drizzle-orm';
 import { db, schema } from '../src/db/client.js';
 import {
   decryptSecret, encryptSecret, getSetting, maskSecret, masterKeyConfigured,
-  settingSource, SETTINGS,
+  overrideSettingsForProcess, settingSource, SETTINGS,
 } from '../src/lib/settings.js';
 import {
   initSettings, reloadSettings, retireHeartbeat, rowKey, writeHeartbeat, writeSetting,
@@ -64,6 +64,12 @@ await writeSetting(TEST_KEY, '77', 'test');
 await reloadSettings();
 check('DB beats env', getSetting(TEST_KEY) === '77', getSetting(TEST_KEY));
 check('source reported as db', settingSource(TEST_KEY) === 'db');
+
+const restoreProcessOverrides = overrideSettingsForProcess({ [TEST_KEY]: '91' });
+check('process override beats DB', getSetting(TEST_KEY) === '91', getSetting(TEST_KEY));
+check('source reported as process override', settingSource(TEST_KEY) === 'process');
+restoreProcessOverrides();
+check('restoring process overrides reveals DB again', getSetting(TEST_KEY) === '77', getSetting(TEST_KEY));
 
 // ── 3. config getters see it live ────────────────────────────────────────────
 check('config.outreachDailyLimit reflects the DB value', config.outreachDailyLimit === 77, config.outreachDailyLimit);

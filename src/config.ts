@@ -8,7 +8,9 @@
  * and to decrypt.
  *
  * Mechanics: every operational field below is a GETTER over
- * `src/lib/settings.ts`, whose resolution order is DB → env → registry default.
+ * `src/lib/settings.ts`, whose normal resolution order is DB → env → registry
+ * default. Explicit process-scoped overrides sit above DB for local acceptance
+ * adapters and never mutate persisted operator settings.
  * So `config.telegram.botToken` returns the current value at the moment of the
  * call, and the same expression written at module scope would freeze it — do
  * not capture config values into module-level constants. (Grep enforced: the

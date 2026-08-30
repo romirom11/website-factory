@@ -30,27 +30,38 @@
  */
 import 'dotenv/config';
 
-// ── Point every credential at the local test servers BEFORE config is imported.
-// config.ts reads process.env at module load, so this must happen first.
+// ── Point every channel at local test adapters BEFORE the DB client starts its
+// settings refresher. UI settings normally beat env by design, so plain env
+// assignments cannot safely isolate this acceptance process from production.
 const TEST_MAILBOX = 'factory-test@factory.local';
-process.env.SMTP_HOST = process.env.PHASEE_SMTP_HOST ?? '127.0.0.1';
-process.env.SMTP_PORT = process.env.PHASEE_SMTP_PORT ?? '3025';
-process.env.SMTP_SECURE = 'false';
-process.env.SMTP_TLS_REJECT_UNAUTHORIZED = 'false';
-process.env.SMTP_USER = TEST_MAILBOX;
-process.env.SMTP_PASS = 'test';
-process.env.SMTP_FROM = `Roman (factory test) <${TEST_MAILBOX}>`;
-process.env.SMTP_MESSAGE_ID_DOMAIN = 'factory.local';
-process.env.IMAP_HOST = process.env.PHASEE_IMAP_HOST ?? '127.0.0.1';
-process.env.IMAP_PORT = process.env.PHASEE_IMAP_PORT ?? '3143';
-process.env.IMAP_SECURE = 'false';
-process.env.IMAP_TLS_REJECT_UNAUTHORIZED = 'false';
-process.env.IMAP_USER = TEST_MAILBOX;
-process.env.IMAP_PASS = 'test';
-// LIVE on purpose: this is what makes the run meaningful. It is safe because
-// SMTP points at a container on 127.0.0.1 and only the fixture has an approval.
-process.env.FACTORY_MODE = 'live';
-// Telegram intentionally left unset: notifications must degrade to a log line.
+const { overrideSettingsForProcess } = await import('../src/lib/settings.js');
+const restorePhaseESettings = overrideSettingsForProcess({
+  SMTP_HOST: process.env.PHASEE_SMTP_HOST ?? '127.0.0.1',
+  SMTP_PORT: process.env.PHASEE_SMTP_PORT ?? '3025',
+  SMTP_SECURE: 'false',
+  SMTP_TLS_REJECT_UNAUTHORIZED: 'false',
+  SMTP_USER: TEST_MAILBOX,
+  SMTP_PASS: 'test',
+  SMTP_FROM: `Roman (factory test) <${TEST_MAILBOX}>`,
+  SMTP_MESSAGE_ID_DOMAIN: 'factory.local',
+  SMTP_UNSUBSCRIBE_TO: TEST_MAILBOX,
+  IMAP_HOST: process.env.PHASEE_IMAP_HOST ?? '127.0.0.1',
+  IMAP_PORT: process.env.PHASEE_IMAP_PORT ?? '3143',
+  IMAP_SECURE: 'false',
+  IMAP_TLS_REJECT_UNAUTHORIZED: 'false',
+  IMAP_USER: TEST_MAILBOX,
+  IMAP_PASS: 'test',
+  IMAP_MAILBOX: 'INBOX',
+  IMAP_MAX_PER_POLL: '500',
+  // LIVE on purpose: the real adapter path targets GreenMail on loopback.
+  FACTORY_MODE: 'live',
+  OUTREACH_DAILY_LIMIT: '1000',
+  WAHA_URL: process.env.PHASEE_WAHA_URL ?? 'http://127.0.0.1:3001',
+  WAHA_HOOK_HMAC_KEY: '',
+  // A DB-backed real bot must never receive acceptance notifications.
+  TELEGRAM_BOT_TOKEN: '',
+  TELEGRAM_CHAT_ID: '',
+});
 
 const { ImapFlow } = await import('imapflow');
 const nodemailer = (await import('nodemailer')).default;
@@ -139,19 +150,56 @@ async function setupFixtures(): Promise<void> {
 async function cleanup(): Promise<void> {
   const ids = [BIZ_EMAIL, BIZ_BOUNCE, BIZ_OPTOUT, BIZ_WA];
   // Order matters: children before parents (FKs).
+  await pool.query(
+    `delete from workflow_reconciliation_events
+     where run_id in (
+       select id from workflow_job_runs
+       where campaign_id = $1 or business_id = any($2::text[])
+     ) or attempt_id in (
+       select id from workflow_jobs where business_id = any($2::text[])
+     )`,
+    [CAMPAIGN, ids],
+  );
   await db.delete(schema.outreachEvents).where(inArray(schema.outreachEvents.businessId, ids));
   await db.delete(schema.outreachMessages).where(inArray(schema.outreachMessages.businessId, ids));
   await db.delete(schema.deals).where(inArray(schema.deals.businessId, ids));
   await db.delete(schema.approvals).where(inArray(schema.approvals.businessId, ids));
   await db.delete(schema.statusHistory).where(inArray(schema.statusHistory.businessId, ids));
   await db.delete(schema.businessContacts).where(inArray(schema.businessContacts.businessId, ids));
+  await pool.query(
+    `delete from pgboss.job
+     where data->>'campaignId' = $1 or data->>'businessId' = any($2::text[])`,
+    [CAMPAIGN, ids],
+  );
   await db.delete(schema.workflowJobs).where(inArray(schema.workflowJobs.businessId, ids));
+  await pool.query(
+    `delete from workflow_job_runs
+     where campaign_id = $1 or business_id = any($2::text[])`,
+    [CAMPAIGN, ids],
+  );
   await db.delete(schema.businesses).where(inArray(schema.businesses.id, ids));
   await db.delete(schema.campaigns).where(eq(schema.campaigns.id, CAMPAIGN));
   await db.delete(schema.doNotContact)
     .where(inArray(schema.doNotContact.value, [...ids, OPTOUT_TARGET, WA_PHONE]));
   // The fixture's own IMAP cursor must not leak into a real run.
   await db.delete(schema.settings).where(eq(schema.settings.key, 'imap.cursor'));
+
+  const residue = await pool.query<{
+    campaigns: number; businesses: number; boss_jobs: number; workflow_runs: number;
+  }>(
+    `select
+       (select count(*)::int from campaigns where id = $1) as campaigns,
+       (select count(*)::int from businesses where id = any($2::text[])) as businesses,
+       (select count(*)::int from pgboss.job
+         where data->>'campaignId' = $1 or data->>'businessId' = any($2::text[])) as boss_jobs,
+       (select count(*)::int from workflow_job_runs
+         where campaign_id = $1 or business_id = any($2::text[])) as workflow_runs`,
+    [CAMPAIGN, ids],
+  );
+  const counts = residue.rows[0];
+  if (!counts || Object.values(counts).some((count) => count !== 0)) {
+    throw new Error(`phase E fixture cleanup left residue: ${JSON.stringify(counts)}`);
+  }
 }
 
 // ─── mailbox helpers (GreenMail) ─────────────────────────────────────────────
@@ -265,12 +313,16 @@ async function main(): Promise<void> {
   // WAHA's documented HMAC test vector — proves our verification matches theirs.
   const hmacBody = '{"event":"message","session":"default","engine":"WEBJS"}';
   const expectedHmac = createHmac('sha512', 'my-secret-key').update(hmacBody, 'utf8').digest('hex');
-  process.env.WAHA_HOOK_HMAC_KEY = 'my-secret-key';
-  (config.waha as any).hookHmacKey = 'my-secret-key';
-  check('webhook HMAC accepts a correct signature', verifyHmac(hmacBody, expectedHmac));
-  check('webhook HMAC rejects a tampered body', !verifyHmac(hmacBody + ' ', expectedHmac));
-  check('webhook HMAC rejects a missing header', !verifyHmac(hmacBody, undefined));
-  (config.waha as any).hookHmacKey = ''; // off for the rest of the run
+  const restoreHmacSetting = overrideSettingsForProcess({
+    WAHA_HOOK_HMAC_KEY: 'my-secret-key',
+  });
+  try {
+    check('webhook HMAC accepts a correct signature', verifyHmac(hmacBody, expectedHmac));
+    check('webhook HMAC rejects a tampered body', !verifyHmac(hmacBody + ' ', expectedHmac));
+    check('webhook HMAC rejects a missing header', !verifyHmac(hmacBody, undefined));
+  } finally {
+    restoreHmacSetting();
+  }
 
   section('2. fixtures');
   await setupFixtures();
@@ -526,6 +578,7 @@ async function main(): Promise<void> {
     'rows whose business_id starts with the fixture campaign name.\n');
 
   resetTransport();
+  restorePhaseESettings();
   await pool.end();
   process.exit(failed.length ? 1 : 0);
 }
@@ -533,6 +586,8 @@ async function main(): Promise<void> {
 main().catch(async (err) => {
   console.error('\nPHASE E RUN FAILED:', err);
   if (!KEEP) await cleanup().catch(() => {});
+  resetTransport();
+  restorePhaseESettings();
   await pool.end().catch(() => {});
   process.exit(1);
 });

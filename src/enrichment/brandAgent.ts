@@ -42,28 +42,14 @@ import { runCodeAgent, z } from '../agents/codeAgent.js';
 import { createAgentInputWorkspace } from '../agents/transport.js';
 import { log } from '../lib/logger.js';
 import {
-  decodeImage, fromHex, newDecodePage, paletteFromImage, type PaletteEntry, type Rgb,
+  decodeImage, newDecodePage, paletteFromImage,
 } from './colorExtract.js';
+import {
+  checkGrounding, renderInputsMd, sourceIdForFile,
+  type BrandInput, type FileColors,
+} from './brandGrounding.js';
 
 // ── the contract with the agent ─────────────────────────────────────────────
-
-/**
- * One input file, as the agent sees it and as the grounding check resolves it.
- * `sourceId` is the capture that proves the file exists; it becomes the
- * `source_id` of every fact derived from that file.
- */
-export interface BrandInput {
-  /** Filename inside the workspace, e.g. `logo.png`. What the agent cites. */
-  file: string;
-  /** What it is, in the words INPUTS.md uses. */
-  what: string;
-  /** business_sources.id of the capture this file came from. */
-  sourceId: number;
-  /** Bucket + key, so the grounding check can re-read the exact bytes. */
-  bucket: 'raw' | 'assets';
-  objectKey: string;
-  contentType: string;
-}
 
 const PaletteRoleSchema = z.object({
   hex: z.string(),
@@ -157,114 +143,6 @@ ABSOLUTE RULES
   ships to a real business owner.
 - Cite files by their exact INPUTS.md filename. A citation that names no file is dropped.
 - Do not describe the business, write copy, or suggest a redesign. You are naming what exists.`;
-
-// ── grounding ───────────────────────────────────────────────────────────────
-
-/**
- * How far a claimed hex may sit from a colour actually present in the cited
- * file, as Euclidean distance in RGB.
- *
- * 60 units, the same figure `paletteEchoesBrand` uses for the design contract
- * (`src/build/rubric.ts`) and for the same reason: it is roughly "a designer
- * would call these the same colour". A tighter bound would fail honest answers —
- * the agent reads a colour by eye off a downscaled render while the check
- * re-derives it from median-cut centroids, and those two never agree to the
- * byte. A looser one would let "warm beige" pass against a photograph of a room,
- * which is the invention this check exists to catch.
- */
-export const GROUNDING_TOLERANCE_RGB = 60;
-
-/** Colours genuinely present in one file, as the grounding check sees them. */
-export interface FileColors {
-  file: string;
-  palette: PaletteEntry[];
-}
-
-export interface GroundingVerdict {
-  grounded: boolean;
-  /** The nearest real colour in the cited file, when there is one. */
-  nearestHex: string | null;
-  distance: number | null;
-  reason: string | null;
-}
-
-/**
- * Is this hex really in that file?
- *
- * Three ways to fail, and they are distinguished because the fix differs: a
- * malformed hex is an agent bug, an unknown file is a citation that names
- * nothing, and a real-but-distant colour is the invention case.
- */
-export function checkGrounding(
-  claim: { hex: string; file: string },
-  files: readonly FileColors[],
-  tolerance = GROUNDING_TOLERANCE_RGB,
-): GroundingVerdict {
-  const rgb = fromHex(claim.hex);
-  if (!rgb) {
-    return { grounded: false, nearestHex: null, distance: null, reason: `"${claim.hex}" is not a hex colour` };
-  }
-  // Filenames are compared on the basename: the agent sometimes cites
-  // `./logo.png` or a path relative to the workspace, and rejecting a correct
-  // citation over a leading dot would drop a grounded colour.
-  const wanted = path.basename(claim.file.trim()).toLowerCase();
-  const hit = files.find((f) => path.basename(f.file).toLowerCase() === wanted);
-  if (!hit) {
-    return {
-      grounded: false, nearestHex: null, distance: null,
-      reason: `cites "${claim.file}", which is not a file in the workspace`,
-    };
-  }
-  if (hit.palette.length === 0) {
-    return {
-      grounded: false, nearestHex: null, distance: null,
-      reason: `"${hit.file}" yielded no colours to compare against`,
-    };
-  }
-
-  let nearest: { hex: string; d: number } | null = null;
-  for (const c of hit.palette) {
-    const other = fromHex(c.hex);
-    if (!other) continue;
-    const d = rgbDistance(rgb, other);
-    if (!nearest || d < nearest.d) nearest = { hex: c.hex, d };
-  }
-  if (!nearest) {
-    return {
-      grounded: false, nearestHex: null, distance: null,
-      reason: `"${hit.file}" yielded no comparable colours`,
-    };
-  }
-  const distance = Number(nearest.d.toFixed(1));
-  if (nearest.d <= tolerance) {
-    return { grounded: true, nearestHex: nearest.hex, distance, reason: null };
-  }
-  return {
-    grounded: false,
-    nearestHex: nearest.hex,
-    distance,
-    reason: `${claim.hex} is ${distance} RGB units from the nearest colour actually in `
-      + `${hit.file} (${nearest.hex}); tolerance is ${tolerance}`,
-  };
-}
-
-export function rgbDistance(a: Rgb, b: Rgb): number {
-  return Math.hypot(a.r - b.r, a.g - b.g, a.b - b.b);
-}
-
-/**
- * The `source_id` behind a cited file, or null when the citation names nothing.
- *
- * This is the INPUTS.md mapping in code: the agent cites a filename, and every
- * fact derived from it must carry the id of the capture that produced it. Same
- * basename normalisation as `checkGrounding`, so a citation cannot ground
- * against a file and then fail to find its source.
- */
-export function sourceIdForFile(file: string, inputs: readonly BrandInput[]): number | null {
-  const wanted = path.basename(file.trim()).toLowerCase();
-  const hit = inputs.find((i) => path.basename(i.file).toLowerCase() === wanted);
-  return hit ? hit.sourceId : null;
-}
 
 // ── workspace assembly ──────────────────────────────────────────────────────
 
@@ -400,28 +278,6 @@ export async function collectBrandInputs(
   }
 
   return inputs;
-}
-
-/**
- * The file the agent reads first: every input by name, with what it is.
- *
- * Source ids are deliberately NOT in here. The agent's job is to look at
- * pictures and cite filenames; the filename → source_id mapping is code's
- * (`sourceIdForFile`), and putting ids in the prompt would invite the model to
- * quote one it never derived anything from.
- */
-export function renderInputsMd(businessName: string, inputs: readonly BrandInput[]): string {
-  return [
-    `# Brand material for ${businessName}`,
-    '',
-    'Every file below was published by this business and captured as evidence. There is nothing',
-    'else. Read each one before answering, and cite files by the exact names in this list.',
-    '',
-    ...inputs.map((i) => `- \`${i.file}\` — ${i.what}`),
-    '',
-    'When you cite a colour, name the file you read it off. Code re-derives every hex from the',
-    'file you cite and drops the ones that are not really there.',
-  ].join('\n');
 }
 
 // ── the run ─────────────────────────────────────────────────────────────────

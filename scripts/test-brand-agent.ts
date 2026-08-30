@@ -15,7 +15,7 @@
 import {
   GROUNDING_TOLERANCE_RGB, checkGrounding, renderInputsMd, rgbDistance, sourceIdForFile,
   type BrandInput, type FileColors,
-} from '../src/enrichment/brandAgent.js';
+} from '../src/enrichment/brandGrounding.js';
 import { fromHex } from '../src/enrichment/colorExtract.js';
 
 let passed = 0;

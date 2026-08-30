@@ -169,11 +169,7 @@ export const PHYSICAL_QUEUE_NAMES = Object.freeze(
   [...new Set(JOB_DEFINITIONS.map((item) => item.physicalQueue))],
 ) as readonly string[];
 
-/**
- * U1 still writes agent jobs to their legacy logical queues. Creating both the
- * logical and target physical queues makes that compatibility explicit until
- * U3 switches writers and drains the legacy queues.
- */
+/** Logical queues remain for non-agent work and bounded pre-migration drainers. */
 export const REQUIRED_QUEUE_NAMES = Object.freeze(
   [...new Set<string>([...JOB_NAMES, ...PHYSICAL_QUEUE_NAMES])],
 ) as readonly string[];

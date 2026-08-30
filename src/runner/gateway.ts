@@ -2,7 +2,7 @@
  * Trusted runner gateway: validates factory requests, stages one workspace,
  * forwards execution, streams telemetry, then synchronizes allowed outputs.
  */
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { mkdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -15,7 +15,6 @@ import {
   AgentCheckRequestSchema,
   ControlResponseSchema,
   TerminalControlRequestSchema,
-  RUNNER_MAX_REQUEST_BYTES,
   RUNNER_PROTOCOL_VERSION,
   type ExecutionRequest,
   type ExecutionResponse,
@@ -35,7 +34,11 @@ import {
 } from './workspace.js';
 import { liveTerminal } from '../agents/tmuxRuntime.js';
 import { TERMINAL_USER, terminalPassword } from '../agents/terminalServer.js';
-import { redactSensitiveText } from '../lib/redaction.js';
+import {
+  parseRunnerJson,
+  runnerCredentialAuthorized,
+  safeRunnerError,
+} from './httpBoundary.js';
 
 interface ActiveExecution {
   requestId: string;
@@ -49,25 +52,6 @@ const activeByWorkspace = new Map<string, ActiveExecution>();
 const workspaceReservations = new Map<string, string>();
 const responseCache = new Map<string, { hash: string; response: ExecutionResponse }>();
 const inFlight = new Map<string, { hash: string; promise: Promise<ExecutionResponse> }>();
-
-function safeError(error: unknown, max = 1_000): string {
-  return redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(0, max);
-}
-
-function authorized(presented: string, expected: string): boolean {
-  if (!presented || !expected) return false;
-  const left = Buffer.from(presented);
-  const right = Buffer.from(expected);
-  return left.length === right.length && timingSafeEqual(left, right);
-}
-
-async function parseJson(c: Context): Promise<unknown> {
-  const declared = Number(c.req.header('content-length') ?? 0);
-  if (declared > RUNNER_MAX_REQUEST_BYTES) throw new Error('request body too large');
-  const text = await c.req.text();
-  if (Buffer.byteLength(text) > RUNNER_MAX_REQUEST_BYTES) throw new Error('request body too large');
-  return JSON.parse(text);
-}
 
 function requestHash(request: ExecutionRequest): string {
   return createHash('sha256').update(JSON.stringify(request)).digest('hex');
@@ -199,7 +183,7 @@ async function performThroughGateway(
       ok: false,
       error: {
         code: 'RUNNER_UNAVAILABLE',
-        message: `runner executor unavailable: ${safeError(error, 1_900)}`,
+        message: `runner executor unavailable: ${safeRunnerError(error, 1_900)}`,
         runtime: request.runtime,
       },
     };
@@ -234,7 +218,7 @@ async function performThroughGateway(
           ok: false,
           error: {
             code: 'RUNNER_UNAVAILABLE',
-            message: `runner could not synchronize workspace: ${safeError(error, 1_900)}`,
+            message: `runner could not synchronize workspace: ${safeRunnerError(error, 1_900)}`,
             runtime: request.runtime,
           },
         };
@@ -293,7 +277,7 @@ export function createGatewayApp(): Hono {
     return c.json({ ok: executor, role: 'gateway', executor, active: activeByRequest.size }, executor ? 200 : 503);
   });
   app.post('/v1/executions', async (c) => {
-    if (!authorized(c.req.header('x-runner-key') ?? '', process.env.RUNNER_API_KEY ?? '')) {
+    if (!runnerCredentialAuthorized(c.req.header('x-runner-key') ?? '', process.env.RUNNER_API_KEY ?? '')) {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         requestId: requestIdFrom(c),
@@ -302,7 +286,7 @@ export function createGatewayApp(): Hono {
       }, 401);
     }
     try {
-      const parsed = ExecutionRequestSchema.safeParse(await parseJson(c));
+      const parsed = ExecutionRequestSchema.safeParse(await parseRunnerJson(c));
       if (!parsed.success) {
         return c.json({
           version: RUNNER_PROTOCOL_VERSION,
@@ -317,12 +301,12 @@ export function createGatewayApp(): Hono {
         version: RUNNER_PROTOCOL_VERSION,
         requestId: requestIdFrom(c),
         ok: false,
-        error: { code: 'INVALID_REQUEST', message: safeError(error) },
+        error: { code: 'INVALID_REQUEST', message: safeRunnerError(error) },
       }, 400);
     }
   });
   app.post('/v1/checks', async (c) => {
-    if (!authorized(c.req.header('x-runner-key') ?? '', process.env.RUNNER_API_KEY ?? '')) {
+    if (!runnerCredentialAuthorized(c.req.header('x-runner-key') ?? '', process.env.RUNNER_API_KEY ?? '')) {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ok: false,
@@ -330,18 +314,18 @@ export function createGatewayApp(): Hono {
       }, 401);
     }
     try {
-      const request = AgentCheckRequestSchema.parse(await parseJson(c));
+      const request = AgentCheckRequestSchema.parse(await parseRunnerJson(c));
       return c.json(await proxyControl('/v1/checks', request));
     } catch (error) {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ok: false,
-        error: { code: 'RUNNER_UNAVAILABLE', message: safeError(error) },
+        error: { code: 'RUNNER_UNAVAILABLE', message: safeRunnerError(error) },
       }, 503);
     }
   });
   app.post('/v1/accounts', async (c) => {
-    if (!authorized(c.req.header('x-runner-key') ?? '', process.env.RUNNER_API_KEY ?? '')) {
+    if (!runnerCredentialAuthorized(c.req.header('x-runner-key') ?? '', process.env.RUNNER_API_KEY ?? '')) {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ok: false,
@@ -349,18 +333,18 @@ export function createGatewayApp(): Hono {
       }, 401);
     }
     try {
-      const request = AccountControlRequestSchema.parse(await parseJson(c));
+      const request = AccountControlRequestSchema.parse(await parseRunnerJson(c));
       return c.json(await proxyControl('/v1/accounts', request));
     } catch (error) {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ok: false,
-        error: { code: 'RUNNER_UNAVAILABLE', message: safeError(error) },
+        error: { code: 'RUNNER_UNAVAILABLE', message: safeRunnerError(error) },
       }, 503);
     }
   });
   app.post('/v1/terminals', async (c) => {
-    if (!authorized(c.req.header('x-runner-key') ?? '', process.env.RUNNER_API_KEY ?? '')) {
+    if (!runnerCredentialAuthorized(c.req.header('x-runner-key') ?? '', process.env.RUNNER_API_KEY ?? '')) {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ok: false,
@@ -368,7 +352,7 @@ export function createGatewayApp(): Hono {
       }, 401);
     }
     try {
-      const request = TerminalControlRequestSchema.parse(await parseJson(c));
+      const request = TerminalControlRequestSchema.parse(await parseRunnerJson(c));
       const current = activeByWorkspace.get(`${request.workspace.root}:${request.workspace.path}`);
       if (!current) {
         return c.json({ version: RUNNER_PROTOCOL_VERSION, ok: true, data: null });
@@ -396,7 +380,7 @@ export function createGatewayApp(): Hono {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ok: false,
-        error: { code: 'RUNNER_UNAVAILABLE', message: safeError(error) },
+        error: { code: 'RUNNER_UNAVAILABLE', message: safeRunnerError(error) },
       }, 503);
     }
   });
@@ -419,7 +403,7 @@ export async function startGateway(): Promise<void> {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   void startGateway().catch((error) => {
-    console.error(safeError(error, 2_000));
+    console.error(safeRunnerError(error, 2_000));
     process.exit(1);
   });
 }

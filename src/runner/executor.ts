@@ -6,7 +6,7 @@
  * tool subprocess; this service is the protocol and lifecycle boundary.
  */
 import { existsSync } from 'node:fs';
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Hono, type Context } from 'hono';
@@ -17,7 +17,6 @@ import {
   AccountControlRequestSchema,
   AgentCheckRequestSchema,
   ExecutorTerminalRequestSchema,
-  RUNNER_MAX_REQUEST_BYTES,
   RUNNER_PROTOCOL_VERSION,
   type ExecutionRequest,
   type ExecutionResponse,
@@ -59,6 +58,11 @@ import {
 import { redactSensitiveText } from '../lib/redaction.js';
 import { assertNoSecretLeaks, RunnerSecurityError } from './secretScan.js';
 import {
+  parseRunnerJson,
+  runnerCredentialAuthorized,
+  safeRunnerError,
+} from './httpBoundary.js';
+import {
   agentCapacityManager,
   ResizableSemaphore,
   withAgentWorkerGroup,
@@ -74,21 +78,6 @@ let isolationReport: RunnerIsolationReport = {
   ready: false,
   codeRuntimes: { 'claude-code': false, codex: false, opencode: false },
 };
-
-function authorized(presented: string, expected: string): boolean {
-  if (!presented || !expected) return false;
-  const left = Buffer.from(presented);
-  const right = Buffer.from(expected);
-  return left.length === right.length && timingSafeEqual(left, right);
-}
-
-async function parseJson(c: Context): Promise<unknown> {
-  const declared = Number(c.req.header('content-length') ?? 0);
-  if (declared > RUNNER_MAX_REQUEST_BYTES) throw new Error('request body too large');
-  const text = await c.req.text();
-  if (Buffer.byteLength(text) > RUNNER_MAX_REQUEST_BYTES) throw new Error('request body too large');
-  return JSON.parse(text);
-}
 
 function serializeError(error: unknown, runtime: AgentRuntimeId): RunnerError {
   const message = redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(0, 2_000);
@@ -109,10 +98,6 @@ function serializeError(error: unknown, runtime: AgentRuntimeId): RunnerError {
     return { code: 'SECURITY_VIOLATION', message, runtime };
   }
   return { code: 'EXECUTION_FAILED', message, runtime };
-}
-
-function safeError(error: unknown, max = 1_000): string {
-  return redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(0, max);
 }
 
 async function installWorkspaceDependencies(cwd: string, timeoutMs: number): Promise<void> {
@@ -281,7 +266,7 @@ export function createExecutorApp(): Hono {
     }, live ? 200 : 503);
   });
   app.post('/v1/executions', async (c) => {
-    if (!authorized(c.req.header('x-executor-key') ?? '', process.env.EXECUTOR_API_KEY ?? '')) {
+    if (!runnerCredentialAuthorized(c.req.header('x-executor-key') ?? '', process.env.EXECUTOR_API_KEY ?? '')) {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         requestId: randomRequestId(c),
@@ -290,7 +275,7 @@ export function createExecutorApp(): Hono {
       }, 401);
     }
     try {
-      const parsed = ExecutionRequestSchema.safeParse(await parseJson(c));
+      const parsed = ExecutionRequestSchema.safeParse(await parseRunnerJson(c));
       if (!parsed.success) {
         return c.json({
           version: RUNNER_PROTOCOL_VERSION,
@@ -305,12 +290,12 @@ export function createExecutorApp(): Hono {
         version: RUNNER_PROTOCOL_VERSION,
         requestId: randomRequestId(c),
         ok: false,
-        error: { code: 'INVALID_REQUEST', message: safeError(error) },
+        error: { code: 'INVALID_REQUEST', message: safeRunnerError(error) },
       }, 400);
     }
   });
   app.post('/v1/checks', async (c) => {
-    if (!authorized(c.req.header('x-executor-key') ?? '', process.env.EXECUTOR_API_KEY ?? '')) {
+    if (!runnerCredentialAuthorized(c.req.header('x-executor-key') ?? '', process.env.EXECUTOR_API_KEY ?? '')) {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ok: false,
@@ -318,7 +303,7 @@ export function createExecutorApp(): Hono {
       }, 401);
     }
     try {
-      const request = AgentCheckRequestSchema.parse(await parseJson(c));
+      const request = AgentCheckRequestSchema.parse(await parseRunnerJson(c));
       if (request.claudeCredential) await seedRunnerClaudeCredential(request.claudeCredential);
       await refreshRunnerSensitiveValues();
       const result = await runLocalAgentCheck(request.provider, request.model);
@@ -327,12 +312,12 @@ export function createExecutorApp(): Hono {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ok: false,
-        error: { code: 'INVALID_REQUEST', message: safeError(error) },
+        error: { code: 'INVALID_REQUEST', message: safeRunnerError(error) },
       }, 400);
     }
   });
   app.post('/v1/accounts', async (c) => {
-    if (!authorized(c.req.header('x-executor-key') ?? '', process.env.EXECUTOR_API_KEY ?? '')) {
+    if (!runnerCredentialAuthorized(c.req.header('x-executor-key') ?? '', process.env.EXECUTOR_API_KEY ?? '')) {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ok: false,
@@ -340,7 +325,7 @@ export function createExecutorApp(): Hono {
       }, 401);
     }
     try {
-      const request = AccountControlRequestSchema.parse(await parseJson(c));
+      const request = AccountControlRequestSchema.parse(await parseRunnerJson(c));
       if (request.operation === 'start') {
         return c.json({ version: RUNNER_PROTOCOL_VERSION, ok: true, data: { ok: true, session: startSession(request.provider) } });
       }
@@ -363,12 +348,12 @@ export function createExecutorApp(): Hono {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ok: false,
-        error: { code: 'INVALID_REQUEST', message: safeError(error) },
+        error: { code: 'INVALID_REQUEST', message: safeRunnerError(error) },
       }, 400);
     }
   });
   app.post('/v1/terminals', async (c) => {
-    if (!authorized(c.req.header('x-executor-key') ?? '', process.env.EXECUTOR_API_KEY ?? '')) {
+    if (!runnerCredentialAuthorized(c.req.header('x-executor-key') ?? '', process.env.EXECUTOR_API_KEY ?? '')) {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ok: false,
@@ -376,7 +361,7 @@ export function createExecutorApp(): Hono {
       }, 401);
     }
     try {
-      const request = ExecutorTerminalRequestSchema.parse(await parseJson(c));
+      const request = ExecutorTerminalRequestSchema.parse(await parseRunnerJson(c));
       const marker = await liveTerminal(executionPaths(request.requestId).workspace);
       if (marker) await cancelTmuxSession(marker.session);
       return c.json({
@@ -388,7 +373,7 @@ export function createExecutorApp(): Hono {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ok: false,
-        error: { code: 'INVALID_REQUEST', message: safeError(error) },
+        error: { code: 'INVALID_REQUEST', message: safeRunnerError(error) },
       }, 400);
     }
   });
@@ -411,7 +396,7 @@ export async function startExecutor(): Promise<void> {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   void startExecutor().catch((error) => {
-    console.error(safeError(error, 2_000));
+    console.error(safeRunnerError(error, 2_000));
     process.exit(1);
   });
 }

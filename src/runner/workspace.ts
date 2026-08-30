@@ -1,9 +1,11 @@
 /** Safe staging and synchronization for runner workspaces. */
 import {
+  appendFile,
   copyFile,
   cp,
   lstat,
   mkdir,
+  open,
   readFile,
   readdir,
   realpath,
@@ -247,10 +249,18 @@ export async function pumpBuildLog(
   destination: string,
   offset: number,
 ): Promise<number> {
-  const content = await readFile(scratch).catch(() => null);
-  if (!content || content.length <= offset) return offset;
-  await mkdir(path.dirname(destination), { recursive: true });
-  const { appendFile } = await import('node:fs/promises');
-  await appendFile(destination, content.subarray(offset));
-  return content.length;
+  const handle = await open(scratch, 'r').catch(() => null);
+  if (!handle) return offset;
+  try {
+    const size = (await handle.stat()).size;
+    if (size <= offset) return offset;
+    const delta = Buffer.allocUnsafe(size - offset);
+    const { bytesRead } = await handle.read(delta, 0, delta.length, offset);
+    if (bytesRead === 0) return offset;
+    await mkdir(path.dirname(destination), { recursive: true });
+    await appendFile(destination, delta.subarray(0, bytesRead));
+    return offset + bytesRead;
+  } finally {
+    await handle.close();
+  }
 }

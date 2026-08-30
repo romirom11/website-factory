@@ -8,6 +8,7 @@
  * `finally` and must become healthy before the gate can continue.
  */
 import { spawn } from 'node:child_process';
+import { FACTORY_ISOLATION_ENV } from './e2e/isolation.js';
 
 const TASKS = {
   smoke: ['scripts/smoke.ts'],
@@ -44,7 +45,7 @@ if (stopExit !== 0) {
   try {
     taskExit = await runDocker([
       'compose', 'run', '--rm', '--no-deps',
-      '-e', 'E2E_FACTORY_ISOLATED=true',
+      '-e', `${FACTORY_ISOLATION_ENV}=true`,
       'factory', 'pnpm', 'tsx', ...TASKS[task], ...taskArgs,
     ]);
   } finally {

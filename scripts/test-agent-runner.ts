@@ -62,6 +62,7 @@ const {
 } = await import('../src/runner/protocol.js');
 const {
   executionPaths,
+  pumpBuildLog,
   pruneRunnerWork,
   stageWorkspace,
   syncWorkspace,
@@ -257,6 +258,18 @@ try {
     await utimes(oldRoot, old, old);
     assert.equal(await pruneRunnerWork(undefined, 1_000), 1);
     assert.equal(existsSync(oldRoot), false);
+  });
+
+  await check('build-log pump appends only bytes after its durable offset', async () => {
+    const scratch = path.join(tmp, 'pump-scratch.ndjson');
+    const destination = path.join(tmp, 'pump-destination.ndjson');
+    await writeFile(scratch, 'first\n');
+    const firstOffset = await pumpBuildLog(scratch, destination, 0);
+    await appendFile(scratch, 'second\n');
+    const secondOffset = await pumpBuildLog(scratch, destination, firstOffset);
+    assert.equal(firstOffset, 6);
+    assert.equal(secondOffset, 13);
+    assert.equal(await readFile(destination, 'utf8'), 'first\nsecond\n');
   });
 
   await check('production runtime gate disables unconfinable OpenCode tools', () => {

@@ -98,7 +98,7 @@ async function ensureCampaign(): Promise<void> {
     // normalizeHandler derives `${country}-${city}-${name}`. Using a fixture
     // country makes every real gosom candidate safe to materialize and clean.
     country: 'e2e',
-    city: 'Integration',
+    city: 'Patras',
     niche: 'beauty',
     language: 'el',
     // ONE tiny query: this hits the real Google Maps through gosom, so it is
@@ -320,22 +320,42 @@ async function partApproval(): Promise<void> {
 }
 
 // ── run ─────────────────────────────────────────────────────────────────────
-if (args.has('--clean')) {
-  await clean();
-} else {
-  await clean();               // start from a known-empty fixture
-  await ensureCampaign();
-  if (!SKIP_DISCOVERY) await partDiscovery();
-  else console.log('\n── part 1 skipped (--no-discovery) ──');
-  await partApproval();
+const CLEAN_ONLY = args.has('--clean');
+let runError: unknown;
+let runFailed = false;
+try {
+  if (CLEAN_ONLY) {
+    await clean();
+  } else {
+    await clean();               // start from a known-empty fixture
+    await ensureCampaign();
+    if (!SKIP_DISCOVERY) await partDiscovery();
+    else console.log('\n── part 1 skipped (--no-discovery) ──');
+    await partApproval();
+  }
+} catch (error) {
+  runFailed = true;
+  runError = error;
+} finally {
+  if (!CLEAN_ONLY && (!KEEP || runFailed)) {
+    try {
+      await clean();
+    } catch (cleanupError) {
+      console.error(`fixture cleanup failed: ${String(cleanupError).slice(0, 400)}`);
+      if (!runFailed) {
+        runFailed = true;
+        runError = cleanupError;
+      }
+    }
+  }
+  await pool.end();
+}
 
+if (runFailed) throw runError;
+if (!CLEAN_ONLY) {
   if (KEEP) console.log(`\n(--keep) fixture rows left in campaign ${CAMPAIGN_ID}`);
-  else await clean();
-
   console.log(failures === 0
     ? '\n🏭 INTEGRATION E2E PASSED'
     : `\n💥 INTEGRATION E2E FAILED — ${failures} check(s)`);
 }
-
-await pool.end();
 process.exit(failures === 0 ? 0 : 1);

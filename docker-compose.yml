@@ -61,6 +61,11 @@ services:
       - "8080"
     ports:
       - "127.0.0.1:8085:8080"   # dev only: factory runs on the host via pnpm
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 4 bash -c 'echo >/dev/tcp/127.0.0.1/8080'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 
   # Factory core: discovery/normalize/qualify/assets/audit/readiness, enrichment,
   # deploy + approval + outreach, plus the internal API and the demo static server.
@@ -78,7 +83,7 @@ services:
       minio:
         condition: service_started
       gosom:
-        condition: service_started
+        condition: service_healthy
       agent-runner-gateway:
         condition: service_healthy
     # `.env` carries INFRA only (DATABASE_URL, S3_*, UI_*, SETTINGS_MASTER_KEY,

@@ -14,7 +14,7 @@ import { fastQualifyHandler } from '../src/workers/fastQualify.js';
 import { auditHandler } from '../src/workers/audit.js';
 import { readinessHandler } from '../src/workers/readiness.js';
 import { getBoss, register, enqueue } from '../src/orchestrator/queue.js';
-import type { RawCandidate } from '../src/workers/discovery.js';
+import type { RawCandidate } from '../src/discovery/candidate.js';
 import { assertFixtureId } from './e2e/safety.js';
 import { assertFactoryTaskIsolated } from './e2e/isolation.js';
 

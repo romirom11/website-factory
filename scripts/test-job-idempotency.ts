@@ -13,6 +13,8 @@ import { getJobDefinition } from '../src/orchestrator/jobDefinitions.js';
 import { OutreachDecisionService } from '../src/orchestrator/outreachDecisionService.js';
 import { sendIdempotencyKey } from '../src/outreach/idempotency.js';
 import { CampaignCommandService } from '../src/orchestrator/campaignCommandService.js';
+import { NormalizationService } from '../src/orchestrator/normalizationService.js';
+import type { RawCandidate } from '../src/discovery/candidate.js';
 import {
   WorkflowRunStore,
   type BossSender,
@@ -206,6 +208,95 @@ await withDisposableFactoryDatabase(async ({ pool, db: testDb, boss }) => {
       `select count(*) from workflow_job_runs where job_type = 'discover' and idempotency_key = $1`,
       [`discover:${campaignId}`],
     ), 1);
+  });
+
+  await check('candidate normalization, evidence, and qualification commit exactly once', async () => {
+    const suffix = randomUUID();
+    const campaignId = `campaign-normalize-${suffix}`;
+    await testDb.insert(schema.campaigns).values({
+      id: campaignId,
+      country: 'GR',
+      city: 'Patras',
+      niche: 'test',
+      language: 'el',
+      queries: ['test'],
+      geofence: { lat: 38.2, lng: 21.7, radiusKm: 1 },
+    });
+    const candidate: RawCandidate = {
+      name: `Atomic Salon ${suffix}`,
+      category: 'beauty salon',
+      address: 'Test street',
+      phone: '+30 2610 123456',
+      email: `owner-${suffix}@example.test`,
+      websiteUrl: null,
+      listingUrl: `https://maps.example.test/${suffix}`,
+      placeId: `place-${suffix}`,
+      rating: 4.8,
+      reviewCount: 30,
+      lat: 38.2,
+      lng: 21.7,
+      rawObjectKey: `raw/${suffix}`,
+      query: 'beauty patras',
+    };
+    const service = new NormalizationService(store);
+    const results = await Promise.all(
+      Array.from({ length: 20 }, () => service.normalize(campaignId, candidate)),
+    );
+    assert.equal(results.filter((result) => result.kind === 'created').length, 1);
+    assert.equal(results.filter((result) => result.kind === 'duplicate').length, 19);
+    const businessId = results[0]!.businessId;
+    assert.equal(new Set(results.map((result) => result.businessId)).size, 1);
+    assert.equal(await count(`select count(*) from businesses where id = $1`, [businessId]), 1);
+    assert.equal(await count(`select count(*) from business_sources where business_id = $1`, [businessId]), 1);
+    assert.equal(await count(`select count(*) from business_contacts where business_id = $1`, [businessId]), 2);
+    assert.equal(await count(`select count(*) from status_history where business_id = $1`, [businessId]), 1);
+    assert.equal(await count(
+      `select count(*) from workflow_job_runs where business_id = $1 and job_type = 'fast-qualify'`,
+      [businessId],
+    ), 1);
+  });
+
+  await check('qualification enqueue failure leaves no partial normalized business', async () => {
+    const suffix = randomUUID();
+    const campaignId = `campaign-normalize-rollback-${suffix}`;
+    await testDb.insert(schema.campaigns).values({
+      id: campaignId,
+      country: 'GR',
+      city: 'Patras',
+      niche: 'test',
+      language: 'el',
+      queries: ['test'],
+      geofence: { lat: 38.2, lng: 21.7, radiusKm: 1 },
+    });
+    const candidate: RawCandidate = {
+      name: `Rollback Salon ${suffix}`,
+      category: 'beauty salon',
+      address: null,
+      phone: null,
+      email: null,
+      websiteUrl: null,
+      listingUrl: `https://maps.example.test/rollback/${suffix}`,
+      placeId: `rollback-place-${suffix}`,
+      rating: null,
+      reviewCount: null,
+      lat: 38.2,
+      lng: 21.7,
+      rawObjectKey: `raw/rollback/${suffix}`,
+      query: 'beauty patras',
+    };
+    const failingStore = new WorkflowRunStore(pool, {
+      send: async () => { throw new Error('normalize qualification injection'); },
+    });
+    await assert.rejects(
+      new NormalizationService(failingStore).normalize(campaignId, candidate),
+      /normalize qualification injection/,
+    );
+    assert.equal(await count(`select count(*) from businesses where place_id = $1`, [candidate.placeId]), 0);
+    assert.equal(await count(`select count(*) from business_sources where raw_object_key = $1`, [candidate.rawObjectKey]), 0);
+    assert.equal(await count(
+      `select count(*) from workflow_job_runs where idempotency_key like $1`,
+      [`fast-qualify:%rollback-salon%`],
+    ), 0);
   });
 
   await check('approval, status transition, and send job commit exactly once', async () => {

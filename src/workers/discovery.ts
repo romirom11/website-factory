@@ -27,23 +27,9 @@ import { enqueue, type JobPayload } from '../orchestrator/queue.js';
 import { config } from '../config.js';
 import { log } from '../lib/logger.js';
 import { notifyTelegram } from '../telegram/notify.js';
+import type { RawCandidate } from '../discovery/candidate.js';
 
-export interface RawCandidate {
-  name: string;
-  category: string | null;
-  address: string | null;
-  phone: string | null;
-  email: string | null;
-  websiteUrl: string | null;
-  listingUrl: string;
-  placeId: string | null;
-  rating: number | null;
-  reviewCount: number | null;
-  lat: number | null;
-  lng: number | null;
-  rawObjectKey: string;
-  query: string;
-}
+export type { RawCandidate } from '../discovery/candidate.js';
 
 export interface GosomJobData {
   keywords: string[];

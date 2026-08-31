@@ -21,6 +21,7 @@ import {
   WorkflowRunStore,
   type EnqueueResult,
   type EnqueueMutation,
+  type EnqueueTransactionPlanner,
 } from './workflowRunStore.js';
 import {
   failEnrichmentBranchInTransaction,
@@ -100,6 +101,20 @@ export async function enqueueWithMutation(
     ...payload,
   });
   return result;
+}
+
+/**
+ * Commit a multi-write stage decision and all continuation jobs together.
+ *
+ * Workers use this boundary when the next payload depends on a row created in
+ * the same transaction (for example a new site-project id), or when a stage
+ * can legitimately finish without enqueueing a continuation.
+ */
+export async function commitWorkflow(
+  plan: EnqueueTransactionPlanner,
+): Promise<EnqueueResult[]> {
+  const b = await getBoss();
+  return new WorkflowRunStore(pool, b).enqueueTransaction(plan);
 }
 
 export async function processJob(

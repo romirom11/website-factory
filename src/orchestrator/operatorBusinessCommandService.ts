@@ -9,6 +9,7 @@ import {
   requireBusinessStatus,
 } from './statuses.js';
 import type { EnqueueResult, WorkflowRunStore } from './workflowRunStore.js';
+import { normalizeDoNotContactValue } from '../outreach/doNotContact.js';
 
 const ACTIVE_PROJECT_STATES = [
   'pending', 'brief', 'building', 'qa', 'ready', 'needs_human_review',
@@ -72,11 +73,15 @@ export class OperatorBusinessCommandService {
       }).from(schema.businessContacts)
         .where(eq(schema.businessContacts.businessId, businessId));
       const addressRows = contacts.flatMap((contact) => {
-        const matchType = contact.channel === 'email'
+        const matchType: 'email' | 'phone' | null = contact.channel === 'email'
           ? 'email'
           : ['phone', 'whatsapp', 'viber'].includes(contact.channel) ? 'phone' : null;
         return matchType
-          ? [{ matchType, value: contact.value, reason: `do_not_contact ${businessId}` }]
+          ? [{
+              matchType,
+              value: normalizeDoNotContactValue(matchType, contact.value),
+              reason: `do_not_contact ${businessId}`,
+            }]
           : [];
       });
       await tx.insert(schema.doNotContact).values([

@@ -17,7 +17,7 @@
  * `manual_pending`, and Roman's "I sent it" command is committed by
  * `OutreachDecisionService` together with status, audit and follow-up jobs.
  */
-import { and, eq, desc } from 'drizzle-orm';
+import { and, eq, desc, or, sql } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { config } from '../config.js';
 import { requireBusinessStatus } from '../orchestrator/statuses.js';
@@ -38,6 +38,7 @@ import {
   followupIdempotencyKey,
   sendIdempotencyKey,
 } from '../outreach/idempotency.js';
+import { normalizeDoNotContactValue } from '../outreach/doNotContact.js';
 
 export { followupIdempotencyKey, sendIdempotencyKey } from '../outreach/idempotency.js';
 
@@ -66,14 +67,29 @@ async function outreachModeForBusiness(businessId: string): Promise<'dry_run' | 
 
 /** DNC is checked against the business id and the concrete address being used. */
 async function isDoNotContact(businessId: string, toAddress: string): Promise<string | null> {
-  const rows = await db.select().from(schema.doNotContact);
-  const digits = toAddress.replace(/[^\d]/g, '');
-  for (const d of rows) {
-    if (d.matchType === 'business_id' && d.value === businessId) return `business_id:${businessId}`;
-    if (d.matchType === 'email' && d.value.toLowerCase() === toAddress.toLowerCase()) return `email:${d.value}`;
-    if (d.matchType === 'phone' && digits && d.value.replace(/[^\d]/g, '') === digits) return `phone:${d.value}`;
-  }
-  return null;
+  const email = normalizeDoNotContactValue('email', toAddress);
+  const phone = normalizeDoNotContactValue('phone', toAddress);
+  const [match] = await db.select({
+    matchType: schema.doNotContact.matchType,
+    value: schema.doNotContact.value,
+  }).from(schema.doNotContact)
+    .where(or(
+      and(
+        eq(schema.doNotContact.matchType, 'business_id'),
+        eq(schema.doNotContact.value, businessId),
+      ),
+      and(
+        eq(schema.doNotContact.matchType, 'email'),
+        sql`lower(trim(${schema.doNotContact.value})) = ${email}`,
+      ),
+      and(
+        eq(schema.doNotContact.matchType, 'phone'),
+        sql`${phone} <> ''`,
+        sql`regexp_replace(${schema.doNotContact.value}, '[^0-9]', '', 'g') = ${phone}`,
+      ),
+    ))
+    .limit(1);
+  return match ? `${match.matchType}:${match.value}` : null;
 }
 
 function errorDetail(error: unknown): string {

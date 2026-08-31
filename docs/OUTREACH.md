@@ -206,7 +206,9 @@ WAHA сама постить кожне вхідне повідомлення н
 
 **Умови зупинки перевіряються двічі** і це навмисно:
 
-1. `cancelFollowups()` скасовує заплановані pg-boss jobs при reply/opt-out/bounce;
+1. `InboundOutreachService` одним commit записує reply/opt-out/bounce і закриває
+   відповідні `workflow_jobs` та `workflow_job_runs`; фізичне скасування pg-boss
+   виконується після commit як best effort;
 2. `followupSkipReason()` перевіряє все заново **в момент виконання**.
 
 Скасування pg-boss — best effort. Другий рівень і є справжнім гейтом: пропущене
@@ -217,6 +219,10 @@ WAHA сама постить кожне вхідне повідомлення н
 
 Для ручних каналів follow-up = **картка в Telegram** з deep link і готовим
 текстом, а не автовідправка.
+
+Provider message ID перетворюється на унікальний inbound idempotency key.
+Повторна доставка того самого IMAP/WAHA event не дублює audit, статус, deal або
+сповіщення оператору.
 
 ---
 

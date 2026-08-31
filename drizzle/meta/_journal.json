@@ -134,6 +134,13 @@
       "when": 1788186406567,
       "tag": "0019_outreach_delivery_state",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1788186406568,
+      "tag": "0020_inbound_outreach_state",
+      "breakpoints": true
     }
   ]
 }

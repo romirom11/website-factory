@@ -12,6 +12,7 @@ import * as schema from '../src/db/schema.js';
 import { getJobDefinition } from '../src/orchestrator/jobDefinitions.js';
 import { OutreachDecisionService } from '../src/orchestrator/outreachDecisionService.js';
 import { OutreachDeliveryService } from '../src/orchestrator/outreachDeliveryService.js';
+import { InboundOutreachService } from '../src/orchestrator/inboundOutreachService.js';
 import { sendIdempotencyKey } from '../src/outreach/idempotency.js';
 import { CampaignCommandService } from '../src/orchestrator/campaignCommandService.js';
 import { NormalizationService } from '../src/orchestrator/normalizationService.js';
@@ -703,6 +704,109 @@ await withDisposableFactoryDatabase(async ({ pool, db: testDb, boss }) => {
       dailyLimit: 1000,
     });
     assert.equal(blockedRetry.kind, 'duplicate');
+  });
+
+  await check('inbound events atomically close followups and deduplicate provider retries', async () => {
+    const suffix = randomUUID();
+    const campaignId = `campaign-inbound-${suffix}`;
+    const replyBusinessId = `e2e-inbound-reply-${suffix}`;
+    const optOutBusinessId = `e2e-inbound-optout-${suffix}`;
+    await testDb.insert(schema.campaigns).values({
+      id: campaignId,
+      country: 'GR',
+      city: 'Patras',
+      niche: 'test',
+      language: 'el',
+      queries: ['test'],
+      geofence: { lat: 38.2, lng: 21.7, radiusKm: 1 },
+    });
+    await testDb.insert(schema.businesses).values([
+      {
+        id: replyBusinessId,
+        campaignId,
+        name: 'Inbound Reply Test',
+        normalizedName: 'inbound reply test',
+        status: 'contacted',
+      },
+      {
+        id: optOutBusinessId,
+        campaignId,
+        name: 'Inbound Optout Test',
+        normalizedName: 'inbound optout test',
+        status: 'contacted',
+      },
+    ]);
+    const followups = await Promise.all([1, 2].map((index) => store.enqueue({
+      name: 'send-followup',
+      payload: {
+        businessId: replyBusinessId,
+        approvalId: 9000,
+        followupIndex: index,
+        idempotencyKey: `inbound-followup:${suffix}:${index}`,
+      },
+      options: { startAfterSeconds: index * 3600 },
+    })));
+    const physicallyCancelled: string[] = [];
+    const service = new InboundOutreachService(testDb, async (bossJobIds) => {
+      physicallyCancelled.push(...bossJobIds);
+    });
+    const replies = await Promise.all(Array.from({ length: 20 }, () => service.recordReply({
+      businessId: replyBusinessId,
+      messageId: null,
+      idempotencyKey: `inbound:email:provider-${suffix}`,
+      channel: 'email',
+      detail: { preview: 'Interested', providerMessageId: `provider-${suffix}` },
+    })));
+    assert.equal(replies.filter((result) => result.applied).length, 1);
+    assert.equal(await count(
+      `select count(*) from outreach_events where business_id = $1 and event = 'replied'`,
+      [replyBusinessId],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from businesses where id = $1 and status = 'replied'`,
+      [replyBusinessId],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from deals where business_id = $1 and state = 'replied'`,
+      [replyBusinessId],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from workflow_jobs where business_id = $1 and job_type = 'send-followup' and status = 'cancelled'`,
+      [replyBusinessId],
+    ), 2);
+    assert.equal(await count(
+      `select count(*) from workflow_job_runs where business_id = $1 and job_type = 'send-followup' and status = 'cancelled'`,
+      [replyBusinessId],
+    ), 2);
+    assert.deepEqual(
+      new Set(physicallyCancelled),
+      new Set(followups.flatMap((result) => result.bossJobId ? [result.bossJobId] : [])),
+    );
+
+    const optOuts = await Promise.all(Array.from({ length: 20 }, () => service.recordOptOut({
+      businessId: optOutBusinessId,
+      messageId: null,
+      idempotencyKey: `inbound:whatsapp:provider-optout-${suffix}`,
+      channel: 'whatsapp',
+      fromAddress: '+30 (2610) 12-34-56',
+      phrase: 'stop',
+    })));
+    assert.equal(optOuts.filter((result) => result.applied).length, 1);
+    assert.equal(await count(
+      `select count(*) from businesses where id = $1 and status = 'do_not_contact'`,
+      [optOutBusinessId],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from do_not_contact where match_type = 'phone' and value = '302610123456'`,
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from do_not_contact where match_type = 'business_id' and value = $1`,
+      [optOutBusinessId],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from outreach_events where business_id = $1 and event = 'opted_out'`,
+      [optOutBusinessId],
+    ), 1);
   });
 
   await check('manual build transition and content handoff commit exactly once', async () => {

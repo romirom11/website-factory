@@ -299,10 +299,11 @@ export const outreachEvents = pgTable('outreach_events', {
   id: serial('id').primaryKey(),
   businessId: text('business_id').notNull().references(() => businesses.id),
   messageId: integer('message_id').references(() => outreachMessages.id),
+  idempotencyKey: text('idempotency_key'),
   event: text('event').notNull(), // sent | delivered | bounced | replied | opted_out | failed | delivery_unknown
   detail: jsonb('detail'),
   at: timestamp('at').notNull().defaultNow(),
-});
+}, (t) => [uniqueIndex('outreach_event_idem_idx').on(t.idempotencyKey)]);
 
 export const deals = pgTable('deals', {
   id: serial('id').primaryKey(),
@@ -321,7 +322,13 @@ export const doNotContact = pgTable('do_not_contact', {
   value: text('value').notNull(),
   reason: text('reason'),
   at: timestamp('at').notNull().defaultNow(),
-}, (t) => [uniqueIndex('dnc_idx').on(t.matchType, t.value)]);
+}, (t) => [
+  uniqueIndex('dnc_idx').on(t.matchType, t.value),
+  index('dnc_email_normalized_idx').on(sql`lower(trim(${t.value}))`)
+    .where(sql`${t.matchType} = 'email'`),
+  index('dnc_phone_normalized_idx').on(sql`regexp_replace(${t.value}, '[^0-9]', '', 'g')`)
+    .where(sql`${t.matchType} = 'phone'`),
+]);
 
 // ─── Jobs: logical commands + physical pg-boss attempts ─────────────────────
 

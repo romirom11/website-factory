@@ -158,17 +158,16 @@ BUILD-TASK.md           жорсткі правила — пише КОД
 - **Скролбек зберігається.** Перед killом сесії повна історія pane пишеться у
   `terminal.log` поруч із build-log — це те, що Роман читає постфактум.
 
-Веб-термінал (`src/agents/terminalServer.ts`): один `ttyd` на процес (білд-воркер
-і так тримає одну агентну сесію), basic auth з паролем, **похідним** від
+Веб-термінал (`src/agents/terminalServer.ts`): один `ttyd` в runner executor;
+attachable сесії серіалізуються окремо від headless-викликів. Basic auth з паролем, **похідним** від
 `INTERNAL_API_KEY` (не самим ключем), і `tmux attach -r` — тільки перегляд.
 `BUILD_TERMINAL_WRITABLE=true` знімає `-r` і дає друкувати живому агенту; типово
 **вимкнено**, бо такий дотик змінює демо клієнта без approval і без сліду в
 історії, тоді як усі інші зміни у фабриці мають і те, і те.
 
-Оскільки tmux живе в `factory-build`, а API відповідає з `factory`,
-`tmux has-session` звідти завжди сказав би «немає». Тому факт живої сесії їде
-маркером `terminal-session.json` через спільний том `sitesdata` — тим самим
-каналом, що й `build-log.ndjson`. Маркер має heartbeat: якщо воркер убили,
+Оскільки tmux живе в `agent-runner-executor`, а API відповідає з `factory`,
+статус іде через authenticated runner gateway. Він читає маркер
+`terminal-session.json` тільки з per-invocation scratch. Маркер має heartbeat: якщо executor убили,
 застарілий маркер читається як «сесії немає», а не як вічне посилання в нікуди.
 
 **Після агента код перевіряє:**
@@ -243,7 +242,7 @@ health check б'є по ньому. Конфлікту немає в обидв�
 ## 7. Медіа (§2.5)
 
 ```text
-FlowKit/Veo кліп з РЕАЛЬНОГО фото → ffmpeg Ken Burns mp4 → CSS/GSAP Ken Burns
+Завантажений wow-кліп → ffmpeg Ken Burns MP4 з РЕАЛЬНОГО фото → CSS/GSAP Ken Burns
 ```
 
 Останній рівень не потребує нічого зовнішнього, тому пайплайн проходить end-to-end
@@ -269,7 +268,7 @@ FlowKit/Veo кліп з РЕАЛЬНОГО фото → ffmpeg Ken Burns mp4 →
 | `BUILDER_MODE` | tmux | `tmux` — до збірки можна підключитись; `sdk` — безголова сесія. Без tmux на хості → автоматично `sdk` |
 | `BUILD_TERMINAL_WEB` | true | піднімати ttyd на час збірки |
 | `BUILD_TERMINAL_BASE_URL` | — | куди веде кнопка «Відкрити термінал». Порожньо = кнопки немає, тільки SSH |
-| `BUILD_TERMINAL_PORT` | 7681 | порт ttyd усередині `factory-build` |
+| `BUILD_TERMINAL_PORT` | 7681 | порт ttyd усередині `agent-runner-executor` |
 | `BUILD_TERMINAL_WRITABLE` | false | дозволити друкувати живому агенту (див. застереження вище) |
 | `BUILDER_MAX_TURNS` | 200 | стеля ходів свіжого білда |
 | `BUILDER_FIX_MAX_TURNS` | 120 | стеля ходів QA-фікса |
@@ -293,7 +292,9 @@ pnpm phasec:deploy-check               # traversal, лістинг, noindex, hea
 pnpm phasec:workspace <bizId>          # workspace без жодного агента
 pnpm phasec:qa <outDir> <bizId> --shots <dir>   # детерміновані гейти на готовому export
 pnpm phasec:critic-check <shotsDir> "<name>"    # тільки мультимодальний критик
-pnpm phasec:fixture --seed             # чесний синтетичний бізнес
+pnpm phasec:fixture --seed             # лише seed fixture evidence
+docker compose exec factory pnpm tsx scripts/phaseC-fixture.ts --run
+                                          # F1 через central enqueue + живі workers/runner
 pnpm phasec:run <bizId> --all          # реальний прогін 9→12
 pnpm phasec:run <bizId> --stage 11     # тільки QA поточного export (без ребілду)
 pnpm phasec:fixture --clean            # прибрати фікстуру
@@ -301,7 +302,21 @@ pnpm test:tmux-agent                   # гард-паритет, ttyd argv, м�
 pnpm test:tmux-agent --live            # + одна СПРАВЖНЯ сесія claude у tmux (потрібен tmux і підписка)
 ```
 
-## 11. Відомі обмеження
+## 11. Logical run і physical attempts
+
+Stage 9–12 не викликаються acceptance-скриптом вручну. F1 створює один
+`content-and-design` command через центральний `enqueue`; далі production
+workers володіють усіма successor stages. Один `workflow_job_runs` рядок — це
+логічна команда, а `workflow_jobs` — append-only attempts. Rate-limit не
+перезапускає старий ledger row: він додає successor attempt під тим самим run.
+Concurrent duplicate command пригнічується active unique index, а count/time
+видно у System UI.
+
+Це прибирає колишню acceptance race, коли прямий виклик handler-а одночасно
+enqueue-ив successor, якого міг claim-нути живий worker у тому самому
+workspace.
+
+## 12. Операційні властивості
 
 **Групи воркерів — ВИРІШЕНО і реалізовано.** `AGENT_CONCURRENCY` + `withAgentSlot`
 — FIFO-черга **в межах процесу**. Коли один процес хостить усі типи jobs,
@@ -323,12 +338,14 @@ pnpm workers --only=build         # контейнер factory-build
 WORKER_GROUPS=build pnpm workers  # те саме через env (docker-compose)
 ```
 
-Семафор лишається **на процес**; процес, що хостить рівно одну агентну групу,
-бере її власний ліміт (`AGENT_CONCURRENCY_BUILD` / `AGENT_CONCURRENCY_ENRICH`).
+Factory передає worker-group і актуальний ліміт у версіонованому runner-протоколі;
+executor відновлює окремі семафори `core` / `enrich` / `build`, тому централізація
+CLI не повертає одну спільну FIFO-чергу.
 Розклади (`poll-replies`, `daily-summary`) реєструє тільки `core`, щоб два
 процеси не дублювали їх. У `docker-compose` це два сервіси з одного образу:
 `factory` (core+enrich, плюс API і демо-сервер) і `factory-build` (build,
-`command: pnpm workers`). Обидва монтують спільні `sites/` і `deploys/`.
+`command: pnpm workers`). Обидва монтують спільні `sites/` і `deploys/`, але не
+provider credentials: workspace копіює trusted gateway, CLI запускає executor.
 
 Перемикання `AGENT_RUNTIME=codex` у UI кладе всі агентні етапи, включно з
 білдом, на підписку ChatGPT. Прихованих per-stage runtime override немає: UI є
@@ -473,10 +490,11 @@ typeAsDesign 2, photoTreatment 1, microInteraction 1, performanceReducedMotion 3
    `wowVerdict()`: <9/18 або heroMotion 0 → high-severity issue категорії `wow`
    з текстом «дефолтний AI-шаблон» і конкретним фіксом.
 
-Старі детерміновані гейти лишились без змін: overflow, console/pageerror, failed
-requests, розтягнуті й биті картинки, `clippedText`, `inkPer1000px`,
-placeholders, контакти, noindex, reduced-motion invisible. Ліміт ітерацій той
-самий.
+Детерміновані гейти: overflow, console/pageerror, failed requests,
+розтягнуті й биті картинки, `clippedText`, placeholders, контакти,
+noindex, reduced-motion invisible, щільність контенту, співвідношення
+висоти до копірайту та частка площі реальних evidence-фото. Ліміт ітерацій
+той самий.
 
 ### Workspace
 
@@ -488,19 +506,17 @@ placeholders, контакти, noindex, reduced-motion invisible. Ліміт і
 reduced-motion, правило EB_Garamond для грецького italic і два нові пункти
 Definition of done («герой рухається», «всі механіки реально анімуються»).
 
-### Лишається відкритим
+### Production thresholds
 
-- **Пороги калібровані на малій вибірці.** `inkPer1000px ≥ 14` — здогад по двох
-  сторінках; піксельні пороги 1.5%/0.4% перевірені на одному демо з відео-героєм
-  (Pagoulatos: вхід 46.8%, утримання 12.8%); поріг амбіції 10/15 відкалібрований
-  по одній відхиленій сторінці (7/15). Перекалібрувати на 5-10 демо.
-- **Вартість критика.** Один прогін — ~10 хв і ~$1 підписки, 24-25 turns з
-  13 зображеннями. Плюс `closeness`/`wow` тепер округлюються, а не відхиляються:
-  критик відповів `5.5` і схема з `.int()` спалила цілий retry.
-- **Фото мають нести секцію** (§12 п.4 старої версії): `mediaAreaRatio` уже
-  рахується, гейту на нього досі немає.
-- **Висота сторінки vs обсяг контенту**: 7276px на ~1680 символів — забагато;
-  порогу px/символ немає.
-- **≥3 компоненти пулу реально анімуються** — вимога є в BUILD-TASK.md і в
-  промпті критика, але детермінованого гейту на неї немає (є лише
-  `transformedAtRest` у метриках).
+- `inkPer1000px >= 14` на desktop; додатково сторінка вища за 4500px з
+  щонайменше 800 символами не може перевищувати 4px висоти на символ.
+- Якщо evidence package має реальні фото, вони мають займати щонайменше 8%
+  desktop-page area. Враховуються лише URL реальних snapshot assets, а не SVG,
+  згенеровані фони чи іконки.
+- Кожна з 3-4 механік контракту отримує `implemented | partial | absent` verdict з
+  посиланням на motion-frame. `absent` блокує як high, `partial` — як medium;
+  без повного виконання всього scene map QA не проходить.
+- Числові пороги живуть у `src/build/layoutQuality.ts` та мають швидкий
+  regression у `scripts/test-layout-quality.ts`; QA report зберігає сирі метрики.
+- Дробові оцінки критика округлюються схемою. Це не послаблює гейти і не
+  спалює цілий agent retry через відповідь на кшталт `5.5`.

@@ -7,30 +7,36 @@
  * nothing.
  *
  * structured(): `codex exec --output-schema <schema.json> --output-last-message <file>`
- *               in a read-only sandbox — the last agent message is the JSON.
- * codeAgent():  `codex exec --cd <workspace> --sandbox workspace-write`; the
- *               agent writes result.json, the same contract as every adapter.
+ *               in the exact-root read-only profile.
+ * codeAgent():  `codex exec --cd <workspace>` in the exact-root tool profile;
+ *               the agent writes result.json, the same contract as every adapter.
  */
 import { spawn } from 'node:child_process';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { ZodType } from 'zod';
 import { config } from '../config.js';
 import { log } from '../lib/logger.js';
-import { zodToJsonSchema, extractJson, jsonOnlyInstruction } from './schema.js';
+import { outputJsonSchema, extractJson, jsonOnlyInstruction } from './schema.js';
 import { withAgentSlot } from './semaphore.js';
 import { codeAgentEnv } from './sandbox.js';
 import { withStructuredRetries } from './retry.js';
 import { looksRateLimited, rateLimitedFromText } from './ratelimit.js';
 import { effectiveModel } from './modelPolicy.js';
-import { readAndValidateResult, resultPathIn } from './result.js';
+import { readAndValidateResult } from './result.js';
 import { kickoffLine, PROMPT_FILE } from './tmuxRuntime.js';
+import {
+  CODEX_READ_ONLY_PROFILE,
+  CODEX_TOOL_PROFILE,
+  codexExecConfinementArgs,
+} from './confinement.js';
 import {
   RateLimitedError,
   RUNTIME_LABELS,
   type AgentRuntime,
+  type CodeAgentInvocationContext,
   type CodeAgentOptions,
   type StructuredOptions,
   type TerminalLaunchSpec,
@@ -41,12 +47,13 @@ const DEFAULT_CODE_TIMEOUT_MS = 60 * 60_000;
 
 interface ExecResult { code: number | null; stdout: string; stderr: string; timedOut: boolean }
 
-function runCodex(args: string[], cwd: string, timeoutMs: number): Promise<ExecResult> {
+async function runCodex(args: string[], cwd: string, timeoutMs: number): Promise<ExecResult> {
+  await mkdir(path.join(cwd, '.factory-tmp'), { recursive: true });
   return new Promise((resolve, reject) => {
     // Same allowlist as the Claude adapter: factory credentials (SMTP/IMAP/
     // Telegram/S3/DATABASE_URL) never reach an agent process, and no
     // pay-per-token API key is passed either.
-    const env = codeAgentEnv();
+    const env = codeAgentEnv(undefined, cwd);
 
     const child = spawn(config.agents.codexBin, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
@@ -84,11 +91,11 @@ export const codexRuntime: AgentRuntime = {
   terminalLaunch(opts: CodeAgentOptions, _context: { settingsPath: string }): TerminalLaunchSpec {
     const args = [
       'exec',
-      '--sandbox', 'workspace-write',
+      ...codexExecConfinementArgs(CODEX_TOOL_PROFILE, 'workspace-write'),
       '--skip-git-repo-check',
       '--cd', opts.cwd,
     ];
-    const model = effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
+    const model = opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
     if (model) args.push('--model', model);
     args.push(kickoffLine(PROMPT_FILE));
     return { command: config.agents.codexBin, args, needsKickoff: false, interactive: false };
@@ -106,11 +113,11 @@ export const codexRuntime: AgentRuntime = {
     const scratch = await mkdtemp(path.join(tmpdir(), 'factory-codex-'));
     const schemaPath = path.join(scratch, 'schema.json');
     const lastMessagePath = path.join(scratch, 'last-message.txt');
-    await writeFile(schemaPath, JSON.stringify(zodToJsonSchema(schema), null, 2), 'utf8');
+    await writeFile(schemaPath, JSON.stringify(outputJsonSchema(schema, opts.outputJsonSchema), null, 2), 'utf8');
 
     const imageArgs = (opts.imagePaths ?? []).flatMap((p) => ['--image', p]);
-    const prompt = `${systemPrompt}\n\n---\n\n${userContent}${jsonOnlyInstruction(schema)}`;
-    const model = effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
+    const prompt = `${systemPrompt}\n\n---\n\n${userContent}${jsonOnlyInstruction(schema, opts.outputJsonSchema)}`;
+    const model = opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
 
     try {
       return await withStructuredRetries({
@@ -118,7 +125,7 @@ export const codexRuntime: AgentRuntime = {
         attempt: (attempt) => withAgentSlot(`structured:${name}`, async () => {
           const args = [
             'exec',
-            '--sandbox', 'read-only',
+            ...codexExecConfinementArgs(CODEX_READ_ONLY_PROFILE, 'read-only'),
             '--skip-git-repo-check',
             '--ephemeral',
             '--cd', opts.cwd ?? scratch,
@@ -153,23 +160,26 @@ export const codexRuntime: AgentRuntime = {
     }
   },
 
-  async codeAgent<T>(opts: CodeAgentOptions, resultSchema: ZodType<T>): Promise<T> {
+  async codeAgent<T>(
+    opts: CodeAgentOptions,
+    resultSchema: ZodType<T>,
+    invocation: CodeAgentInvocationContext,
+  ): Promise<T> {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_CODE_TIMEOUT_MS;
-    const resultPath = resultPathIn(opts.cwd);
 
     return withAgentSlot(`code:${opts.name}`, async () => {
       const prompt =
         `${opts.appendSystemPrompt ? `${opts.appendSystemPrompt}\n\n---\n\n` : ''}${opts.prompt}\n\n` +
         `MANDATORY FINAL STEP: write a file named result.json in the workspace root (${opts.cwd}) ` +
-        `matching this JSON Schema, then stop:\n${JSON.stringify(zodToJsonSchema(resultSchema), null, 2)}`;
+        `matching this JSON Schema, then stop:\n${JSON.stringify(outputJsonSchema(resultSchema, opts.outputJsonSchema), null, 2)}`;
 
       const args = [
         'exec',
-        '--sandbox', 'workspace-write',
+        ...codexExecConfinementArgs(CODEX_TOOL_PROFILE, 'workspace-write'),
         '--skip-git-repo-check',
         '--cd', opts.cwd,
       ];
-      const model = effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
+      const model = opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
       if (model) args.push('--model', model);
       args.push(prompt);
 
@@ -179,7 +189,7 @@ export const codexRuntime: AgentRuntime = {
       if (res.code !== 0) {
         throw new Error(`codex code agent "${opts.name}" exited ${res.code}: ${res.stderr.slice(-400)}`);
       }
-      return readAndValidateResult(resultPath, opts.name, resultSchema);
+      return readAndValidateResult(invocation.resultPath, opts.name, resultSchema, invocation);
     });
   },
 };

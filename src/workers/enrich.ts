@@ -21,8 +21,13 @@ import { eq, and } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { getObject } from '../lib/storage.js';
 import { runAgent, z } from '../agents/agent.js';
-import { transition } from '../orchestrator/statuses.js';
-import { enqueue, type JobPayload } from '../orchestrator/queue.js';
+import {
+  businessTransitions,
+  canContinueAfterTransition,
+  requireBusinessStatus,
+} from '../orchestrator/statuses.js';
+import type { JobPayload } from '../orchestrator/queue.js';
+import { getEnrichmentBarrier } from '../orchestrator/enrichmentBarrierRuntime.js';
 import { log } from '../lib/logger.js';
 import { config } from '../config.js';
 import {
@@ -220,11 +225,18 @@ export async function enrichHandler(payload: JobPayload): Promise<void> {
   const businessId = payload.businessId!;
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   if (!biz) throw new Error(`business not found: ${businessId}`);
-  if (!ENRICHABLE.has(biz.status)) {
+  const expectedStatus = requireBusinessStatus(biz.status, `business ${businessId}`);
+  if (!ENRICHABLE.has(expectedStatus)) {
     log.info('enrichment skipped: business has already moved past this stage', { businessId, status: biz.status });
     return;
   }
-  await transition(businessId, 'enriching', 'enrich-worker');
+  const started = await businessTransitions.normal({
+    businessId,
+    expectedStatus,
+    to: 'enriching',
+    actor: 'enrich-worker',
+  });
+  if (!canContinueAfterTransition(started, { businessId, actor: 'enrich-worker' })) return;
 
   // Re-running enrichment must not duplicate rows (jobs retry, spec §7).
   await db.delete(schema.businessFacts).where(eq(schema.businessFacts.businessId, businessId));
@@ -295,7 +307,14 @@ export async function enrichHandler(payload: JobPayload): Promise<void> {
   }
 
   if (!gosom && captured.length === 0) {
-    await transition(businessId, 'needs_review', 'enrich-worker', 'no evidence available (no gosom record, no page capturable)');
+    const transitioned = await businessTransitions.normal({
+      businessId,
+      expectedStatus: 'enriching',
+      to: 'needs_review',
+      actor: 'enrich-worker',
+      reason: 'no evidence available (no gosom record, no page capturable)',
+    });
+    canContinueAfterTransition(transitioned, { businessId, actor: 'enrich-worker' });
     return;
   }
 
@@ -520,8 +539,8 @@ export async function enrichHandler(payload: JobPayload): Promise<void> {
   // evidence it reads. `collect-assets` has not run yet at this point, so this
   // pass sees the captured PAGES but no downloaded logo file — the site's
   // declared colours, the profile avatar and the voice, which is the half that
-  // photographs cannot supply. `collectAssetsHandler` re-runs the colour half
-  // the moment the logo lands, which is what upgrades the palette from
+  // photographs cannot supply. The asset worker explicitly refreshes the
+  // colour half once when a logo lands, which upgrades the palette from
   // photo-derived to logo-derived.
   //
   // Non-fatal by construction: `extractBrandIdentity` never throws for ordinary
@@ -596,11 +615,18 @@ export async function enrichHandler(payload: JobPayload): Promise<void> {
     gaps: result.gaps.length,
   });
 
-  // Stage 5 + 6 run next; the audit worker chains into scoring.
-  await enqueue('collect-assets', {
+  // Stage 5 + 6 are one durable generation; the barrier alone owns scoring.
+  const stillCurrent = await businessTransitions.normal({
+    businessId,
+    expectedStatus: 'enriching',
+    to: 'enriching',
+    actor: 'enrich-worker',
+  });
+  if (!canContinueAfterTransition(stillCurrent, { businessId, actor: 'enrich-worker' })) return;
+  const barrier = await getEnrichmentBarrier();
+  await barrier.start({
     businessId,
     campaignId: biz.campaignId,
     imageUrls: [...mined.imageOffers, ...pageImages] as unknown as Record<string, unknown>[],
   });
-  await enqueue('audit-website', { businessId, campaignId: biz.campaignId });
 }

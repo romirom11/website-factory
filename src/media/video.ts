@@ -26,14 +26,14 @@ import path from 'node:path';
 import { config } from '../config.js';
 import { log } from '../lib/logger.js';
 
-export type HeroClipSource = 'ken_burns_mock';
+export type HeroClipSource = 'ken_burns';
 
 export interface GenerateHeroClipOptions {
   /** Absolute path to a REAL business photo (evidence asset). Required. */
   imagePath: string;
-  /** Motion description; recorded in provenance, the mock does not read it. */
+  /** Motion description recorded in provenance; the deterministic renderer does not interpret it. */
   prompt: string;
-  /** Clip length; the mock honours it exactly. */
+  /** Clip length; the renderer honours it exactly. */
   durationSec?: number;
   /** Directory for the produced mp4. Created if missing. */
   outDir: string;
@@ -186,8 +186,8 @@ export async function generateHeroClip(opts: GenerateHeroClipOptions): Promise<H
   const outFile = path.join(opts.outDir, `${base}.mp4`);
 
   const startedAt = Date.now();
-  const mock = await kenBurnsClip({ imagePath: opts.imagePath, outFile, durationSec });
-  if (!mock) {
+  const clip = await kenBurnsClip({ imagePath: opts.imagePath, outFile, durationSec });
+  if (!clip) {
     log.warn('ken burns clip unavailable (no ffmpeg); caller should use fallbackHeroMedia()', {
       ffmpegBin: config.media.ffmpegBin,
     });
@@ -195,11 +195,11 @@ export async function generateHeroClip(opts: GenerateHeroClipOptions): Promise<H
   }
 
   return {
-    filePath: mock.filePath,
-    bytes: mock.bytes,
+    filePath: clip.filePath,
+    bytes: clip.bytes,
     contentType: 'video/mp4',
     durationSec,
-    source: 'ken_burns_mock',
+    source: 'ken_burns',
     prompt: opts.prompt,
     sourceImagePath: path.resolve(opts.imagePath),
     durationMs: Date.now() - startedAt,

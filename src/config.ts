@@ -8,7 +8,9 @@
  * and to decrypt.
  *
  * Mechanics: every operational field below is a GETTER over
- * `src/lib/settings.ts`, whose resolution order is DB → env → registry default.
+ * `src/lib/settings.ts`, whose normal resolution order is DB → env → registry
+ * default. Explicit process-scoped overrides sit above DB for local acceptance
+ * adapters and never mutate persisted operator settings.
  * So `config.telegram.botToken` returns the current value at the moment of the
  * call, and the same expression written at module scope would freeze it — do
  * not capture config values into module-level constants. (Grep enforced: the
@@ -66,9 +68,28 @@ export const config = {
   },
   // Agent layer — SUBSCRIPTION ONLY (spec §2.3, decision #10).
   // No ANTHROPIC_API_KEY anywhere: Claude Code runs on Roman's Pro/Max login
-  // (`claude setup-token` -> pasted into the UI's settings page; locally the
-  // CLI login is used), Codex runs on the ChatGPT subscription (`codex login`).
+  // (`claude setup-token` in the runner account flow; locally the CLI login is
+  // used), Codex runs on the ChatGPT subscription (`codex login`).
   agents: {
+    /**
+     * Production is fail-closed on the remote runner. Direct execution exists
+     * only when a developer explicitly opts into it; the runner executor calls
+     * adapters directly and does not use this public transport switch.
+     */
+    get executionMode(): 'remote' | 'local-development' {
+      return process.env.AGENT_EXECUTION_MODE === 'local-development'
+        ? 'local-development'
+        : 'remote';
+    },
+    get runnerGatewayUrl(): string {
+      return (process.env.RUNNER_GATEWAY_URL ?? 'http://agent-runner-gateway:8790').replace(/\/+$/, '');
+    },
+    get runnerApiKey(): string { return process.env.RUNNER_API_KEY ?? ''; },
+    /** Roots shared with the runner gateway; paths outside both are rejected. */
+    get runnerSitesRoot(): string { return process.env.RUNNER_SITES_ROOT ?? 'sites'; },
+    get runnerInputsRoot(): string {
+      return process.env.RUNNER_INPUTS_ROOT ?? '/tmp/websites-factory-agent-inputs';
+    },
     /**
      * Read PER CALL by both runtimes, so pasting a token in the UI is picked up
      * by an already-running worker within the settings TTL — no restart.
@@ -163,7 +184,7 @@ export const config = {
      * nothing on the mac. Wow-video is uploaded from the business card instead.
      */
     get heroClipSeconds(): number { return Number(process.env.HERO_CLIP_DURATION_SECONDS ?? 8); },
-    /** ffmpeg is only needed for the mock/Ken Burns path; absence degrades, never crashes. */
+    /** ffmpeg renders the deterministic Ken Burns clip; absence degrades, never crashes. */
     get ffmpegBin(): string { return process.env.FFMPEG_BIN ?? 'ffmpeg'; },
     /**
      * Generate one decorative background per demo (phase C build prep).

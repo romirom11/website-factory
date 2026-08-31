@@ -604,9 +604,6 @@ export async function prepareWorkspace(opts: {
     buildTaskDoc({ snapshot, brief, design, verdict, heroMedia, skills, niche, referenceFiles, galleryFiles }),
   );
 
-  // A stale result.json from a previous iteration would be read as this run's output.
-  await rm(path.join(dir, 'result.json'), { force: true });
-
   log.info('workspace prepared', {
     businessId: snapshot.businessId, projectId, dir, fresh,
     assets: assetFiles.length, generated: generatedFiles.length, skills: skills.length,

@@ -9,16 +9,19 @@
  *           one `simulated` outreach message + a Telegram notify line with the
  *           demo link. Then a second send attempt proves the idempotency key.
  *
- * Everything created lives under campaign `integration-e2e` (business ids
- * prefixed `gr-integration-`) and is deleted at the end, so the real
+ * Everything created lives under campaign `e2e-integration-campaign` (business
+ * ids prefixed `e2e-integration-`) and is deleted at the end, so the real
  * `gr-patras-beauty` and `legacy-website-offers` rows are never touched.
  * The fixture business is the ONLY one with an approvals row, and a send is
  * impossible without one — the real campaign could not be contacted even by a
  * bug in this script.
  *
- *   pnpm tsx scripts/integration-e2e.ts             # both parts, then clean up
- *   pnpm tsx scripts/integration-e2e.ts --keep      # leave the rows for inspection
- *   pnpm tsx scripts/integration-e2e.ts --no-discovery   # skip the gosom part
+ *   pnpm test:integration:compose                   # both parts, then clean up
+ *   pnpm test:integration:compose -- --keep         # leave fixture rows for inspection
+ *   pnpm test:integration:compose -- --no-discovery # skip the gosom part
+ *
+ * This file invokes handlers directly and therefore fails closed unless the
+ * Compose wrapper has stopped the live core worker first.
  */
 import 'dotenv/config';
 
@@ -30,9 +33,14 @@ import { db, schema, pool } from '../src/db/client.js';
 import { discoverHandler } from '../src/workers/discovery.js';
 import { normalizeHandler } from '../src/workers/normalize.js';
 import { sendOutreachHandler, sendIdempotencyKey } from '../src/workers/outreach.js';
+import { assertFixtureId, assertFixtureIds, FIXTURE_PREFIX } from './e2e/safety.js';
+import { assertFactoryTaskIsolated } from './e2e/isolation.js';
+import { ensureBuckets, putRaw } from '../src/lib/storage.js';
 
-const CAMPAIGN_ID = 'integration-e2e';
-const BUSINESS_ID = 'gr-integration-fixture-salon';
+assertFactoryTaskIsolated('integration-e2e');
+
+const CAMPAIGN_ID = assertFixtureId('e2e-integration-campaign', 'campaign');
+const BUSINESS_ID = assertFixtureId('e2e-integration-fixture-salon', 'business');
 const args = new Set(process.argv.slice(2));
 const KEEP = args.has('--keep');
 const SKIP_DISCOVERY = args.has('--no-discovery');
@@ -53,10 +61,17 @@ async function clean(): Promise<void> {
     'select id from businesses where campaign_id = $1', [CAMPAIGN_ID],
   );
   const businessIds = ids.rows.map((r) => r.id);
+  assertFixtureIds(businessIds, 'business');
   if (businessIds.length) {
+    await pool.query(
+      `delete from workflow_reconciliation_events
+       where run_id in (select id from workflow_job_runs where business_id = any($1::text[]))
+          or attempt_id in (select id from workflow_jobs where business_id = any($1::text[]))`,
+      [businessIds],
+    ).catch(() => {});
     for (const table of [
       'outreach_events', 'outreach_messages', 'approvals', 'deals',
-      'production_gaps', 'qualifications', 'website_audits', 'business_contacts',
+      'enrichment_runs', 'production_gaps', 'qualifications', 'website_audits', 'business_contacts',
       'business_facts', 'assets', 'site_projects', 'workflow_jobs',
       'status_history', 'business_sources',
     ]) {
@@ -64,9 +79,16 @@ async function clean(): Promise<void> {
         `delete from ${table} where business_id = any($1::text[])`, [businessIds],
       ).catch(() => {});
     }
+    await pool.query('delete from workflow_job_runs where business_id = any($1::text[])', [businessIds]).catch(() => {});
     await pool.query('delete from businesses where campaign_id = $1', [CAMPAIGN_ID]).catch(() => {});
   }
   await pool.query('delete from workflow_jobs where campaign_id = $1', [CAMPAIGN_ID]).catch(() => {});
+  await pool.query(
+    `delete from workflow_reconciliation_events
+     where run_id in (select id from workflow_job_runs where campaign_id = $1)`,
+    [CAMPAIGN_ID],
+  ).catch(() => {});
+  await pool.query('delete from workflow_job_runs where campaign_id = $1', [CAMPAIGN_ID]).catch(() => {});
   // pg-boss keeps its own copy of every queued job; leaving those behind would
   // make a live workers process pick up fixture candidates after cleanup.
   await pool.query(
@@ -79,7 +101,9 @@ async function clean(): Promise<void> {
 async function ensureCampaign(): Promise<void> {
   await db.insert(schema.campaigns).values({
     id: CAMPAIGN_ID,
-    country: 'gr',
+    // normalizeHandler derives `${country}-${city}-${name}`. Using a fixture
+    // country makes every real gosom candidate safe to materialize and clean.
+    country: 'e2e',
     city: 'Patras',
     niche: 'beauty',
     language: 'el',
@@ -140,6 +164,7 @@ async function partDiscovery(): Promise<void> {
 
   const rows = await db.select().from(schema.businesses)
     .where(eq(schema.businesses.campaignId, CAMPAIGN_ID));
+  assertFixtureIds(rows.map((row) => row.id), 'business');
   check('candidates written to the DB', rows.length > 0, `${rows.length} businesses`);
 
   // Raw evidence: every candidate must point at an immutable stored object.
@@ -189,10 +214,23 @@ async function partApproval(): Promise<void> {
     set: { status: 'site_ready' },
   });
 
+  await ensureBuckets();
+  const fixtureRawKey = await putRaw('e2e-integration', Buffer.from(
+    'Controlled outreach fixture evidence for Integration Fixture Salon.',
+  ), 'text/plain');
+  const [source] = await db.insert(schema.businessSources).values({
+    businessId: BUSINESS_ID,
+    sourceType: 'fixture',
+    url: 'https://example.invalid/e2e-integration-fixture-salon',
+    method: 'integration_fixture',
+    rawObjectKey: fixtureRawKey,
+  }).returning({ id: schema.businessSources.id });
+
   await db.insert(schema.businessContacts).values({
     businessId: BUSINESS_ID,
     channel: 'email',
     value: 'integration-fixture@factory.local',
+    sourceId: source!.id,
     verified: true,
   }).onConflictDoNothing();
 
@@ -270,8 +308,9 @@ async function partApproval(): Promise<void> {
   // A business with NO approval must be unsendable — the core invariant.
   const [victim] = await db.select().from(schema.businesses)
     .where(and(eq(schema.businesses.campaignId, CAMPAIGN_ID),
-      like(schema.businesses.id, 'gr-integration-%')));
+      like(schema.businesses.id, `${FIXTURE_PREFIX}integration-%`)));
   if (victim && victim.id !== BUSINESS_ID) {
+    assertFixtureId(victim.id, 'business');
     let refused = false;
     await sendOutreachHandler({
       businessId: victim.id,
@@ -287,22 +326,42 @@ async function partApproval(): Promise<void> {
 }
 
 // ── run ─────────────────────────────────────────────────────────────────────
-if (args.has('--clean')) {
-  await clean();
-} else {
-  await clean();               // start from a known-empty fixture
-  await ensureCampaign();
-  if (!SKIP_DISCOVERY) await partDiscovery();
-  else console.log('\n── part 1 skipped (--no-discovery) ──');
-  await partApproval();
+const CLEAN_ONLY = args.has('--clean');
+let runError: unknown;
+let runFailed = false;
+try {
+  if (CLEAN_ONLY) {
+    await clean();
+  } else {
+    await clean();               // start from a known-empty fixture
+    await ensureCampaign();
+    if (!SKIP_DISCOVERY) await partDiscovery();
+    else console.log('\n── part 1 skipped (--no-discovery) ──');
+    await partApproval();
+  }
+} catch (error) {
+  runFailed = true;
+  runError = error;
+} finally {
+  if (!CLEAN_ONLY && (!KEEP || runFailed)) {
+    try {
+      await clean();
+    } catch (cleanupError) {
+      console.error(`fixture cleanup failed: ${String(cleanupError).slice(0, 400)}`);
+      if (!runFailed) {
+        runFailed = true;
+        runError = cleanupError;
+      }
+    }
+  }
+  await pool.end();
+}
 
+if (runFailed) throw runError;
+if (!CLEAN_ONLY) {
   if (KEEP) console.log(`\n(--keep) fixture rows left in campaign ${CAMPAIGN_ID}`);
-  else await clean();
-
   console.log(failures === 0
     ? '\n🏭 INTEGRATION E2E PASSED'
     : `\n💥 INTEGRATION E2E FAILED — ${failures} check(s)`);
 }
-
-await pool.end();
 process.exit(failures === 0 ? 0 : 1);

@@ -99,6 +99,48 @@
       "when": 1787616000002,
       "tag": "0014_project_design_mirror",
       "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1787810000000,
+      "tag": "0015_workflow_job_runs",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1787810000001,
+      "tag": "0016_workflow_reconciliation_events",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1787810000002,
+      "tag": "0017_enrichment_runs",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1787810000003,
+      "tag": "0018_workflow_duplicate_observability",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1788186406567,
+      "tag": "0019_outreach_delivery_state",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1788186406568,
+      "tag": "0020_inbound_outreach_state",
+      "breakpoints": true
     }
   ]
 }

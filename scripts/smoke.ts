@@ -3,7 +3,7 @@
  * and without live Google Maps:
  *   campaign -> synthetic candidate -> normalize (dedup) -> fast-qualify
  *   -> website audit (real browser on a controlled local page) -> queue round-trip.
- * Run: pnpm tsx scripts/smoke.ts
+ * Run: pnpm test:smoke:compose
  */
 import { eq } from 'drizzle-orm';
 import http from 'node:http';
@@ -14,6 +14,11 @@ import { fastQualifyHandler } from '../src/workers/fastQualify.js';
 import { auditHandler } from '../src/workers/audit.js';
 import { readinessHandler } from '../src/workers/readiness.js';
 import { getBoss, register, enqueue } from '../src/orchestrator/queue.js';
+import type { RawCandidate } from '../src/discovery/candidate.js';
+import { assertFixtureId } from './e2e/safety.js';
+import { assertFactoryTaskIsolated } from './e2e/isolation.js';
+
+assertFactoryTaskIsolated('smoke');
 
 let failures = 0;
 function check(name: string, ok: boolean, detail?: string) {
@@ -21,32 +26,93 @@ function check(name: string, ok: boolean, detail?: string) {
   if (!ok) failures++;
 }
 
-await ensureBuckets();
+const CID = assertFixtureId('e2e-smoke-campaign', 'campaign');
+const EVIDENCE_PREFIXES = ['smoke/%', 'e2e-smoke/%'] as const;
 
-// clean slate for the smoke campaign
-const CID = 'smoke-test-campaign';
-const BIZ_PREFIX = 'gr-smoketown';
-await db.execute(`delete from status_history where business_id like '${BIZ_PREFIX}%'` as any).catch(() => {});
-for (const table of ['production_gaps', 'qualifications', 'website_audits', 'business_contacts', 'business_facts', 'business_sources', 'workflow_jobs']) {
-  await pool.query(`delete from ${table} where business_id like $1`, [`${BIZ_PREFIX}%`]).catch(() => {});
+async function cleanSmoke(): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    // Older smoke runs could attach their source to a real business through the
+    // production dedup policy. Remove only rows backed by the unmistakable smoke
+    // evidence namespace; never remove the business they happened to target.
+    await client.query(
+      `delete from business_facts
+       where source_id in (
+         select id from business_sources where raw_object_key like any($1::text[])
+       )`,
+      [EVIDENCE_PREFIXES],
+    );
+    await client.query(
+      `delete from business_contacts
+       where source_id in (
+         select id from business_sources where raw_object_key like any($1::text[])
+       )`,
+      [EVIDENCE_PREFIXES],
+    );
+    await client.query(
+      'delete from business_sources where raw_object_key like any($1::text[])',
+      [EVIDENCE_PREFIXES],
+    );
+
+    const ids = (await client.query<{ id: string }>(
+      'select id from businesses where campaign_id = $1',
+      [CID],
+    )).rows.map((row) => assertFixtureId(row.id, 'business'));
+    await client.query(
+      `delete from workflow_reconciliation_events
+       where run_id in (select id from workflow_job_runs where campaign_id = $1)
+          or attempt_id in (select id from workflow_jobs where campaign_id = $1)`,
+      [CID],
+    );
+    for (const table of [
+      'enrichment_runs', 'production_gaps', 'qualifications', 'website_audits',
+      'business_contacts', 'business_facts', 'business_sources', 'workflow_jobs',
+      'status_history',
+    ]) {
+      await client.query(`delete from ${table} where business_id = any($1::text[])`, [ids]);
+    }
+    await client.query('delete from workflow_jobs where campaign_id = $1', [CID]);
+    await client.query('delete from workflow_job_runs where campaign_id = $1', [CID]);
+    await client.query(
+      `delete from pgboss.job
+       where data->>'campaignId' = $1 or data->>'businessId' = any($2::text[])`,
+      [CID, ids],
+    );
+    await client.query('delete from businesses where id = any($1::text[])', [ids]);
+    await client.query('delete from campaigns where id = $1', [CID]);
+    await client.query('commit');
+  } catch (error) {
+    await client.query('rollback').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 }
-await pool.query(`delete from status_history where business_id like $1`, [`${BIZ_PREFIX}%`]);
-await pool.query(`delete from businesses where id like $1`, [`${BIZ_PREFIX}%`]);
-await pool.query(`delete from campaigns where id = $1`, [CID]);
+
+const server = http.createServer((_req, res) => {
+  res.writeHead(200, { 'content-type': 'text/html' });
+  res.end(`<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Smoke Salon</title></head>
+  <body><h1>Smoke Salon</h1><p>${'Beauty services in Smoketown. '.repeat(30)}</p></body></html>`);
+});
+let serverListening = false;
+let queueStarted = false;
+
+try {
+await ensureBuckets();
+await cleanSmoke();
 
 await db.insert(schema.campaigns).values({
-  id: CID, country: 'gr', city: 'Smoketown', niche: 'beauty', language: 'el',
+  // The deterministic normalizer derives ids as country-city-name. A fixture
+  // country is intentional: every created business is fail-closed under e2e-*.
+  id: CID, country: 'e2e', city: 'Smoketown', niche: 'beauty', language: 'el',
   queries: ['nail salon'], geofence: { lat: 38, lng: 21, radiusKm: 10 }, targetCount: 5,
 });
 check('campaign created', true);
 
 // local demo website for the audit stage (controlled, no external network)
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'content-type': 'text/html' });
-  res.end(`<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Smoke Salon</title></head>
-  <body><h1>Smoke Salon</h1><p>${'Beauty services in Smoketown. '.repeat(30)}</p></body></html>`);
-});
 await new Promise<void>((r) => server.listen(4567, r));
+serverListening = true;
 
 // ── normalize + dedup ──
 //
@@ -57,25 +123,36 @@ await new Promise<void>((r) => server.listen(4567, r));
 // fact. This was a hardcoded `'smoke/raw-1'` that was never stored; it stayed
 // invisible only because the gate samples ten businesses and the real ones
 // crowded the smoke rows out of the query.
-const smokeRawKey = await putRaw('smoke', Buffer.from(
-  '<!doctype html><html><body>smoke fixture listing: Smoke Nails Studio, '
-  + '1 Test St, Smoketown, +30 261 000 0000, hello@smokenails.gr</body></html>',
+const runToken = `${Date.now()}-${process.pid}`;
+const fixtureName = `E2E Smoke Nails ${runToken}`;
+const fixturePhone = `+30 999 ${runToken}`;
+const fixtureEmail = `e2e-smoke-${runToken}@example.invalid`;
+const fixturePlaceId = `e2e-smoke-place-${runToken}`;
+const smokeRawKey = await putRaw('e2e-smoke', Buffer.from(
+  `<html><body>fixture listing: ${fixtureName}, 1 Test St, Smoketown, `
+  + `${fixturePhone}, ${fixtureEmail}</body></html>`,
 ), 'text/html');
 
 const candidate = {
-  name: 'Smoke Nails Studio', category: 'Nail salon', address: '1 Test St, Smoketown',
-  phone: '+30 261 000 0000', email: 'hello@smokenails.gr', websiteUrl: 'http://localhost:4567',
-  listingUrl: 'https://maps.google.com/maps/place/smoke-nails?x=!19sChIJsmoke123', placeId: 'ChIJsmoke123',
+  name: fixtureName, category: 'Nail salon', address: '1 Test St, Smoketown',
+  phone: fixturePhone, email: fixtureEmail,
+  // A shared localhost domain would itself be a global dedup key. The audit
+  // target is attached only after this fixture has materialized safely.
+  websiteUrl: null,
+  listingUrl: `https://maps.google.com/maps/place/e2e-smoke?x=!19s${fixturePlaceId}`,
+  placeId: fixturePlaceId,
   rating: 4.8, reviewCount: 52, lat: 38.0, lng: 21.0,
   rawObjectKey: smokeRawKey, query: 'nail salon',
-};
-await normalizeHandler({ campaignId: CID, candidate: candidate as any });
+} satisfies RawCandidate;
+await normalizeHandler({ campaignId: CID, candidate });
 let bizRows = await pool.query(`select * from businesses where campaign_id = $1`, [CID]);
 check('normalize materialized business', bizRows.rowCount === 1, bizRows.rows[0]?.id);
+if (bizRows.rowCount !== 1) throw new Error('smoke normalizer did not create exactly one fixture business');
 const businessId = bizRows.rows[0].id as string;
+assertFixtureId(businessId, 'business');
 
 // dedup: same placeId again must NOT create a second business
-await normalizeHandler({ campaignId: CID, candidate: { ...candidate, name: 'Smoke Nails Studio DUPLICATE' } as any });
+await normalizeHandler({ campaignId: CID, candidate: { ...candidate, name: `${fixtureName} DUPLICATE` } });
 bizRows = await pool.query(`select * from businesses where campaign_id = $1`, [CID]);
 check('dedup by place_id', bizRows.rowCount === 1);
 const srcCount = await pool.query(`select count(*)::int n from business_sources where business_id = $1`, [businessId]);
@@ -121,9 +198,16 @@ let biz = (await pool.query(`select * from businesses where id = $1`, [businessI
 check('fast-qualify -> prequalified', biz.status === 'prequalified', biz.status);
 
 // illegal transition guard
-const { transition } = await import('../src/orchestrator/statuses.js');
+const { businessTransitions } = await import('../src/orchestrator/statuses.js');
 let threw = false;
-try { await transition(businessId, 'contacted', 'smoke-worker'); } catch { threw = true; }
+try {
+  await businessTransitions.normal({
+    businessId,
+    expectedStatus: 'prequalified',
+    to: 'contacted',
+    actor: 'smoke-worker',
+  });
+} catch { threw = true; }
 check('illegal transition blocked', threw);
 
 // ── website audit (domain=localhost won't parse; set domain manually) ──
@@ -134,14 +218,21 @@ check('audit produced verdict', !!audit?.verdict, audit?.verdict);
 check('audit took screenshots', !!audit?.desktop_screenshot_key && !!audit?.mobile_screenshot_key);
 
 // ── readiness gate: no facts/assets yet -> must record gaps, not pass ──
-await pool.query(`update businesses set status = 'qualified' where id = $1`, [businessId]);
+await businessTransitions.override({
+  businessId,
+  expectedStatus: 'prequalified',
+  to: 'qualified',
+  actor: 'smoke-test',
+  reason: 'exercise readiness gate',
+});
 await readinessHandler({ businessId });
 const gaps = await pool.query(`select gap from production_gaps where business_id = $1 and resolved = false`, [businessId]);
 check('readiness gate blocks incomplete package', gaps.rowCount! >= 3, gaps.rows.map((g: any) => g.gap).join(','));
 
 // ── queue round-trip ──
+queueStarted = true;
 await register('daily-summary', (await import('../src/workers/summary.js')).dailySummaryHandler);
-await enqueue('daily-summary', { idempotencyKey: `smoke-summary-${Date.now()}`, silent: true });
+await enqueue('daily-summary', { idempotencyKey: `e2e-smoke-summary-${Date.now()}`, silent: true });
 await new Promise((r) => setTimeout(r, 5000));
 const jobRow = await pool.query(`select status from workflow_jobs where job_type = 'daily-summary' order by created_at desc limit 1`);
 check('pg-boss queue round-trip', jobRow.rows[0]?.status === 'succeeded', jobRow.rows[0]?.status);
@@ -149,11 +240,32 @@ check('pg-boss queue round-trip', jobRow.rows[0]?.status === 'succeeded', jobRow
 // status history is append-only and complete
 const history = await pool.query(`select to_status from status_history where business_id = $1 order by at`, [businessId]);
 check('status history recorded', history.rowCount! >= 2, history.rows.map((h: any) => h.to_status).join(' -> '));
-
-server.close();
-const boss = await getBoss();
-await boss.stop({ close: true, timeout: 2000 });
-await pool.end();
+} catch (error) {
+  failures++;
+  console.error('❌ smoke execution failed', error);
+} finally {
+  if (serverListening) {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    }).catch((error) => {
+      failures++;
+      console.error('❌ smoke HTTP server cleanup failed', error);
+    });
+  }
+  if (queueStarted) {
+    await getBoss()
+      .then((boss) => boss.stop({ close: true, timeout: 2000 }))
+      .catch((error) => {
+        failures++;
+        console.error('❌ smoke queue cleanup failed', error);
+      });
+  }
+  await cleanSmoke().catch((error) => {
+    failures++;
+    console.error('❌ smoke fixture cleanup failed', error);
+  });
+  await pool.end();
+}
 
 console.log(failures === 0 ? '\n🏭 SMOKE TEST PASSED' : `\n💥 ${failures} smoke checks failed`);
-process.exit(failures === 0 ? 0 : 1);
+process.exitCode = failures === 0 ? 0 : 1;

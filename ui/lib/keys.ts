@@ -2,17 +2,9 @@
  * Pure key/link helpers. Kept out of `actions.ts` because a `'use server'`
  * module may only export async functions.
  *
- * These MUST stay identical to `src/workers/outreach.ts` — the idempotency key
- * is the contract between the UI's Approve and the worker's insert.
+ * Outreach idempotency is factory-owned; the UI submits domain commands and
+ * never derives queue keys itself.
  */
-
-export function sendIdempotencyKey(approvalId: number): string {
-  return `send-outreach:approval:${approvalId}`;
-}
-
-export function followupIdempotencyKey(approvalId: number, index: number): string {
-  return `followup:approval:${approvalId}:${index}`;
-}
 
 export const MANUAL_CHANNELS: ReadonlySet<string> = new Set(['instagram', 'viber']);
 

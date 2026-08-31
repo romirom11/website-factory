@@ -15,8 +15,9 @@ import { prepareWorkspace } from '../src/build/workspace.js';
 import { chooseDirection } from '../src/build/rubric.js';
 import { loadMotionIndex } from '../src/build/motionRefs.js';
 import type { ArtDirection, ContentBrief, DirectionScore } from '../src/build/schemas.js';
+import { assertFixtureId } from './e2e/safety.js';
 
-const businessId = process.argv[2] ?? 'gr-fixture-anemi-studio';
+const businessId = assertFixtureId(process.argv[2] ?? 'e2e-phasec-anemi-studio', 'business ID');
 const PROJECT_ID = 999999; // sentinel: never collides with a real project
 
 let failures = 0;

@@ -27,23 +27,9 @@ import { enqueue, type JobPayload } from '../orchestrator/queue.js';
 import { config } from '../config.js';
 import { log } from '../lib/logger.js';
 import { notifyTelegram } from '../telegram/notify.js';
+import type { RawCandidate } from '../discovery/candidate.js';
 
-export interface RawCandidate {
-  name: string;
-  category: string | null;
-  address: string | null;
-  phone: string | null;
-  email: string | null;
-  websiteUrl: string | null;
-  listingUrl: string;
-  placeId: string | null;
-  rating: number | null;
-  reviewCount: number | null;
-  lat: number | null;
-  lng: number | null;
-  rawObjectKey: string;
-  query: string;
-}
+export type { RawCandidate } from '../discovery/candidate.js';
 
 export interface GosomJobData {
   keywords: string[];
@@ -112,7 +98,26 @@ export async function waitForGosomJob(id: string): Promise<GosomJob> {
   const deadline = Date.now() + config.gosom.jobTimeoutSeconds * 1000;
   let last = '';
   for (;;) {
-    const job = await getGosomJob(id);
+    let job: GosomJob;
+    try {
+      job = await getGosomJob(id);
+    } catch (error) {
+      if (!(error instanceof DiscoveryUnavailableError)) throw error;
+      if (Date.now() > deadline) {
+        throw new DiscoveryUnavailableError(
+          `gosom job ${id} could not be polled for ${config.gosom.jobTimeoutSeconds}s: ${error.message}`,
+        );
+      }
+      if (last !== 'unreachable') {
+        log.warn('gosom job polling temporarily unavailable', {
+          jobId: id,
+          error: error.message.slice(0, 300),
+        });
+        last = 'unreachable';
+      }
+      await sleep(config.gosom.pollIntervalSeconds * 1000);
+      continue;
+    }
     if (job.Status !== last) {
       log.info('gosom job status', { jobId: id, status: job.Status });
       last = job.Status;

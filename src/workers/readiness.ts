@@ -9,11 +9,18 @@
  *
  * Pure code. No agent decides this.
  */
-import { eq, and } from 'drizzle-orm';
+import { eq, and, desc } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
-import { transition } from '../orchestrator/statuses.js';
-import { advance } from '../orchestrator/router.js';
-import type { JobPayload } from '../orchestrator/queue.js';
+import {
+  businessTransitions,
+  requireBusinessStatus,
+} from '../orchestrator/statuses.js';
+import { commitWorkflow, type JobPayload } from '../orchestrator/queue.js';
+import {
+  buildJobPriority,
+  isAutoBuildEligible,
+  normalizeBuildPolicy,
+} from '../orchestrator/buildPolicy.js';
 import { log } from '../lib/logger.js';
 import { config } from '../config.js';
 
@@ -72,16 +79,17 @@ export function evaluateReadiness(input: {
 }
 
 /** Statuses from which the gate can still move a business forward. */
-const GATEABLE = new Set(['qualified', 'needs_review', 'enriching']);
+const GATEABLE = new Set(['qualified', 'needs_review']);
 
 export async function readinessHandler(payload: JobPayload): Promise<void> {
   const businessId = payload.businessId!;
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   if (!biz) throw new Error(`business not found: ${businessId}`);
+  const expectedStatus = requireBusinessStatus(biz.status, `business ${businessId}`);
   // A terminal business (rejected/duplicate/...) can still have a stale gate job
   // queued from an earlier run. Re-gating it would attempt an illegal transition,
   // so the job succeeds as a no-op instead of failing the queue.
-  if (!GATEABLE.has(biz.status)) {
+  if (!GATEABLE.has(expectedStatus)) {
     log.info('readiness gate skipped: business is not in a gateable status', { businessId, status: biz.status });
     return;
   }
@@ -92,25 +100,81 @@ export async function readinessHandler(payload: JobPayload): Promise<void> {
 
   const report = evaluateReadiness({ facts, contacts, assets: assetRows });
 
-  // Idempotent: a re-run supersedes the previous hard gaps rather than stacking.
-  await db.update(schema.productionGaps)
-    .set({ resolved: true })
-    .where(and(
-      eq(schema.productionGaps.businessId, businessId),
-      eq(schema.productionGaps.blockerLevel, 'hard'),
-      eq(schema.productionGaps.resolved, false),
-    ));
+  let committed = false;
+  await commitWorkflow(async (tx) => {
+    const [locked] = await tx.select({
+      status: schema.businesses.status,
+      campaignId: schema.businesses.campaignId,
+      score: schema.businesses.score,
+    }).from(schema.businesses)
+      .where(eq(schema.businesses.id, businessId))
+      .limit(1)
+      .for('update');
+    if (!locked) throw new Error(`business not found: ${businessId}`);
+    const lockedStatus = requireBusinessStatus(locked.status, `business ${businessId}`);
+    if (!GATEABLE.has(lockedStatus)) return [];
 
-  if (report.gaps.length > 0) {
-    for (const gap of report.gaps) {
-      await db.insert(schema.productionGaps).values({ businessId, gap, blockerLevel: 'hard' });
+    // A re-run supersedes old hard gaps. The gap set, status, history and any
+    // build continuation are one decision rather than independently visible.
+    await tx.update(schema.productionGaps)
+      .set({ resolved: true })
+      .where(and(
+        eq(schema.productionGaps.businessId, businessId),
+        eq(schema.productionGaps.blockerLevel, 'hard'),
+        eq(schema.productionGaps.resolved, false),
+      ));
+    if (report.gaps.length) {
+      await tx.insert(schema.productionGaps).values(
+        report.gaps.map((gap) => ({ businessId, gap, blockerLevel: 'hard' })),
+      );
     }
-    log.info('not production ready', { businessId, ...report });
-    await transition(businessId, 'needs_review', 'readiness-gate', `gaps: ${report.gaps.join(',')}`);
+
+    const target = report.gaps.length ? 'needs_review' : 'production_ready';
+    const transitioned = await businessTransitions.normalInTransaction(tx, {
+      businessId,
+      expectedStatus: lockedStatus,
+      to: target,
+      actor: 'readiness-gate',
+      reason: report.gaps.length
+        ? `gaps: ${report.gaps.join(',')}`
+        : `all gates passed (${report.counts.services} services, ${report.counts.assets} assets)`,
+    });
+    if (transitioned.kind !== 'moved' && transitioned.kind !== 'already_at_target') {
+      throw new Error(`readiness gate lost its locked transition for ${businessId}`);
+    }
+    committed = true;
+    if (target !== 'production_ready') return [];
+
+    const [campaign] = await tx.select({ autoBuild: schema.campaigns.autoBuild })
+      .from(schema.campaigns)
+      .where(eq(schema.campaigns.id, locked.campaignId))
+      .limit(1);
+    const [audit] = await tx.select({ verdict: schema.websiteAudits.verdict })
+      .from(schema.websiteAudits)
+      .where(eq(schema.websiteAudits.businessId, businessId))
+      .orderBy(desc(schema.websiteAudits.auditedAt))
+      .limit(1);
+    const policy = normalizeBuildPolicy(campaign?.autoBuild);
+    const decision = isAutoBuildEligible({ policy, latestVerdict: audit?.verdict });
+    if (!decision.eligible) return [];
+    return [{
+      name: 'content-and-design',
+      payload: {
+        businessId,
+        campaignId: locked.campaignId,
+        idempotencyKey: `content-and-design:${businessId}`,
+      },
+      options: {
+        priority: buildJobPriority({ latestVerdict: audit?.verdict, score: locked.score }),
+      },
+    }];
+  });
+  if (!committed) {
+    log.info('readiness result discarded: business already advanced', { businessId });
     return;
   }
-
-  log.info('production ready', { businessId, ...report.counts });
-  await transition(businessId, 'production_ready', 'readiness-gate', `all gates passed (${report.counts.services} services, ${report.counts.assets} assets)`);
-  await advance(businessId); // -> content-and-design (phase C)
+  log.info(
+    report.gaps.length ? 'not production ready' : 'production ready',
+    { businessId, ...(report.gaps.length ? report : report.counts) },
+  );
 }

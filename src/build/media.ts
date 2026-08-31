@@ -23,7 +23,7 @@ import {
 } from '../media/index.js';
 import { getObject } from '../lib/storage.js';
 import { writeFile } from 'node:fs/promises';
-import { and, eq } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { config } from '../config.js';
 import { log } from '../lib/logger.js';
@@ -39,8 +39,8 @@ async function findGeneratedAsset(businessId: string, kind: string) {
     eq(schema.assets.businessId, businessId),
     eq(schema.assets.intendedUsage, kind),
     eq(schema.assets.aiGenerated, true),
-  ));
-  return rows.at(-1) ?? null;
+  )).orderBy(desc(schema.assets.capturedAt), desc(schema.assets.id)).limit(1);
+  return rows[0] ?? null;
 }
 
 /**

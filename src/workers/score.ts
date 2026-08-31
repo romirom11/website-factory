@@ -13,9 +13,12 @@
 import { eq, desc } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { runAgent, z } from '../agents/agent.js';
-import { transition } from '../orchestrator/statuses.js';
-import { advance } from '../orchestrator/router.js';
-import type { JobPayload } from '../orchestrator/queue.js';
+import {
+  businessTransitions,
+  requireBusinessStatus,
+} from '../orchestrator/statuses.js';
+import { NeedsHumanError, type JobPayload } from '../orchestrator/queue.js';
+import { getEnrichmentBarrier } from '../orchestrator/enrichmentBarrierRuntime.js';
 import { log } from '../lib/logger.js';
 import { translateQaNotes } from '../lib/translateNotes.js';
 
@@ -66,8 +69,27 @@ export async function scoreAndQaHandler(payload: JobPayload): Promise<void> {
   const businessId = payload.businessId!;
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   if (!biz) throw new Error(`business not found: ${businessId}`);
+  const expectedStatus = requireBusinessStatus(biz.status, `business ${businessId}`);
   if (!SCOREABLE.has(biz.status)) {
     log.info('scoring skipped: business is not in a scoreable status', { businessId, status: biz.status });
+    return;
+  }
+  if (typeof payload.enrichmentRunId !== 'string') {
+    await businessTransitions.normal({
+      businessId,
+      expectedStatus,
+      to: 'needs_review',
+      actor: 'score-worker',
+      reason: 'legacy score job has no enrichment barrier; evidence completeness is unknown',
+    });
+    throw new NeedsHumanError(`score job for ${businessId} has no enrichmentRunId`);
+  }
+  const barrier = await getEnrichmentBarrier();
+  if (!await barrier.isScoreCurrent({ runId: payload.enrichmentRunId, businessId })) {
+    log.info('stale score generation skipped', {
+      businessId,
+      enrichmentRunId: payload.enrichmentRunId,
+    });
     return;
   }
 
@@ -160,16 +182,6 @@ export async function scoreAndQaHandler(payload: JobPayload): Promise<void> {
     `fact-check findings about "${biz.name}", a ${biz.category ?? 'local business'}`,
   );
 
-  await db.insert(schema.qualifications).values({
-    businessId, stage: 'full', qualified, reasons, score, scoreBreakdown: breakdown,
-    qaPassed, qaNotes, qaNotesUk,
-  });
-  await db.update(schema.businesses)
-    .set({ score, scoreBreakdown: breakdown, updatedAt: new Date() })
-    .where(eq(schema.businesses.id, businessId));
-
-  log.info('scored', { businessId, score, breakdown, qualified, qaPassed });
-
   // ── code decides the transition; the agent only explained ────────────────
   //
   // Stage 7 never hard-rejects. The spec assigns `rejected` to stage 3, where
@@ -179,18 +191,52 @@ export async function scoreAndQaHandler(payload: JobPayload): Promise<void> {
   // business he wants anyway, and `rejected` is terminal with no way back.
   // So a stage-7 no goes to `needs_review` with the reason recorded, and the
   // decision stays reversible in the UI.
-  if (!qualified) {
-    await transition(businessId, 'needs_review', 'score-worker', `not qualified: ${reasons.join(',')}`);
+  const target = !qualified || qaPassed !== true ? 'needs_review' : 'qualified';
+  const transitionReason = !qualified
+    ? `not qualified: ${reasons.join(',')}`
+    : qaPassed === false
+      ? `QA failed: ${qaNotes.slice(0, 250)}`
+      : qaPassed === null
+        ? 'QA agent unavailable — package not independently verified'
+        : `score=${score}`;
+  let transitioned: Awaited<ReturnType<typeof businessTransitions.normal>> | null = null;
+  const committed = await barrier.commitScore(
+    { runId: payload.enrichmentRunId, businessId },
+    async (tx) => {
+      transitioned = await businessTransitions.normalInTransaction(tx, {
+        businessId,
+        expectedStatus,
+        to: target,
+        actor: 'score-worker',
+        reason: transitionReason,
+      });
+      if (transitioned.kind === 'conflict') return [];
+      await tx.insert(schema.qualifications).values({
+        businessId, stage: 'full', qualified, reasons, score, scoreBreakdown: breakdown,
+        qaPassed, qaNotes, qaNotesUk,
+      });
+      await tx.update(schema.businesses)
+        .set({ score, scoreBreakdown: breakdown, updatedAt: new Date() })
+        .where(eq(schema.businesses.id, businessId));
+      return target === 'qualified'
+        ? [{
+            name: 'readiness-gate',
+            payload: {
+              businessId,
+              campaignId: biz.campaignId,
+              idempotencyKey: `readiness-gate:${businessId}`,
+            },
+          }]
+        : [];
+    },
+  );
+  if (!committed) {
+    log.info('score result discarded because its enrichment generation was superseded', {
+      businessId,
+      enrichmentRunId: payload.enrichmentRunId,
+    });
     return;
   }
-  if (qaPassed === false) {
-    await transition(businessId, 'needs_review', 'score-worker', `QA failed: ${qaNotes.slice(0, 250)}`);
-    return;
-  }
-  if (qaPassed === null) {
-    await transition(businessId, 'needs_review', 'score-worker', 'QA agent unavailable — package not independently verified');
-    return;
-  }
-  await transition(businessId, 'qualified', 'score-worker', `score=${score}`);
-  await advance(businessId); // -> readiness-gate
+  if (!transitioned) throw new Error(`score transition result missing for ${businessId}`);
+  log.info('scored', { businessId, score, breakdown, qualified, qaPassed });
 }

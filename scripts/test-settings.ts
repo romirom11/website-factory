@@ -4,7 +4,7 @@
  * Covers the three things that would silently break the whole feature:
  *  1. the AES-256-GCM envelope round-trips, and a WRONG master key degrades to
  *     '' instead of throwing (a worker must not die because a key rotated);
- *  2. resolution order really is DB -> env -> default;
+ *  2. resolution order really is process override -> DB -> env -> default;
  *  3. a value written to the DB becomes visible through `config.*` without a
  *     restart — the entire point of the change.
  */
@@ -12,9 +12,11 @@ import { eq } from 'drizzle-orm';
 import { db, schema } from '../src/db/client.js';
 import {
   decryptSecret, encryptSecret, getSetting, maskSecret, masterKeyConfigured,
-  settingSource, SETTINGS,
+  overrideSettingsForProcess, settingSource, SETTINGS,
 } from '../src/lib/settings.js';
-import { initSettings, reloadSettings, writeSetting, rowKey } from '../src/lib/settingsStore.js';
+import {
+  initSettings, reloadSettings, retireHeartbeat, rowKey, writeHeartbeat, writeSetting,
+} from '../src/lib/settingsStore.js';
 import { config } from '../src/config.js';
 
 let failures = 0;
@@ -63,6 +65,12 @@ await reloadSettings();
 check('DB beats env', getSetting(TEST_KEY) === '77', getSetting(TEST_KEY));
 check('source reported as db', settingSource(TEST_KEY) === 'db');
 
+const restoreProcessOverrides = overrideSettingsForProcess({ [TEST_KEY]: '91' });
+check('process override beats DB', getSetting(TEST_KEY) === '91', getSetting(TEST_KEY));
+check('source reported as process override', settingSource(TEST_KEY) === 'process');
+restoreProcessOverrides();
+check('restoring process overrides reveals DB again', getSetting(TEST_KEY) === '77', getSetting(TEST_KEY));
+
 // ── 3. config getters see it live ────────────────────────────────────────────
 check('config.outreachDailyLimit reflects the DB value', config.outreachDailyLimit === 77, config.outreachDailyLimit);
 await writeSetting(TEST_KEY, '5', 'test');
@@ -83,6 +91,23 @@ check('clearing a secret deletes the row (falls back to env/default)',
 // ── 4. registry sanity ───────────────────────────────────────────────────────
 check('no duplicate keys in the registry', new Set(SETTINGS.map((s) => s.key)).size === SETTINGS.length);
 check('every secret has a group and label', SETTINGS.every((s) => s.group && s.label));
+
+// ── 5. retired topology heartbeats ───────────────────────────────────────────
+const HEARTBEAT_GROUP = 'e2e-retired';
+const heartbeatKey = `heartbeat:${HEARTBEAT_GROUP}`;
+await writeHeartbeat(HEARTBEAT_GROUP, { fixture: true });
+check('fixture heartbeat exists before retirement',
+  (await db.select().from(schema.settings).where(eq(schema.settings.key, heartbeatKey))).length === 1);
+await retireHeartbeat(HEARTBEAT_GROUP);
+check('retiring a worker topology removes its exact heartbeat',
+  (await db.select().from(schema.settings).where(eq(schema.settings.key, heartbeatKey))).length === 0);
+let invalidHeartbeatRejected = false;
+try {
+  await retireHeartbeat('../workers');
+} catch {
+  invalidHeartbeatRejected = true;
+}
+check('retirement rejects an invalid heartbeat group', invalidHeartbeatRejected);
 
 // restore
 delete process.env[TEST_KEY];

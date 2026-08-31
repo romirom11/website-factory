@@ -19,7 +19,10 @@ import 'dotenv/config';
 import { eq, and, inArray } from 'drizzle-orm';
 import { db, schema, pool } from '../src/db/client.js';
 import { getBoss } from '../src/orchestrator/queue.js';
-import { transition } from '../src/orchestrator/statuses.js';
+import {
+  businessTransitions,
+  requireBusinessStatus,
+} from '../src/orchestrator/statuses.js';
 
 const businessId = process.argv[2];
 const APPLY = process.argv.includes('--apply');
@@ -110,8 +113,16 @@ for (const project of projects) {
 // machine only ever moves forward from there), so it is recorded as Roman's
 // decision, which is what it is.
 if (biz.status === 'site_in_progress') {
-  await transition(businessId, 'production_ready', 'roman', REASON, { force: true });
-  console.log(`business ${businessId} -> production_ready`);
+  const result = await businessTransitions.recover({
+    businessId,
+    expectedStatus: requireBusinessStatus(biz.status, `business ${businessId}`),
+    to: 'production_ready',
+    actor: 'roman',
+    reason: REASON,
+  });
+  console.log(result.kind === 'conflict'
+    ? `business ${businessId} already moved to ${result.currentStatus}; status not overwritten`
+    : `business ${businessId} -> production_ready`);
 }
 
 console.log('\ndone');

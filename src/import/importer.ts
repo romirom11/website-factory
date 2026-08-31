@@ -19,7 +19,7 @@ import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { and, eq, isNotNull } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
-import { normalizePhone, extractDomain, normalizeName, slugify } from '../workers/normalize.js';
+import { normalizePhone, extractDomain, normalizeName, slugify } from '../discovery/normalization.js';
 import { log } from '../lib/logger.js';
 import { listLegacyClientIds, readLegacyClient, resolveRawRef } from './legacyReader.js';
 import { ensureImportBuckets, guessContentType, putLegacyObject } from './storage.js';

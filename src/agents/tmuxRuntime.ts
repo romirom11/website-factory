@@ -57,13 +57,14 @@ import type { ZodType } from 'zod';
 import { config } from '../config.js';
 import { log } from '../lib/logger.js';
 import { appendBuildLog, clip } from '../build/buildLog.js';
-import { zodToJsonSchema } from './schema.js';
+import { outputJsonSchema } from './schema.js';
 import { withAgentSlot } from './semaphore.js';
 import { codeAgentEnv } from './sandbox.js';
-import { readAndValidateResult, resultPathIn } from './result.js';
+import { readAndValidateResult } from './result.js';
 import { startTerminalServer, stopTerminalServer } from './terminalServer.js';
 import type {
   AgentRuntime,
+  CodeAgentInvocationContext,
   CodeAgentOptions,
 } from './types.js';
 
@@ -154,7 +155,7 @@ async function sendKickoffVerified(
   const hint = /select login method|sign in|log in to continue|api key/i.test(raw)
     ? ' CLI просить логін — токен Claude Code не дійшов або недійсний: перепідключи його в /settings → Акаунти.'
     : /choose the text style|dark mode.*light mode|to get started/i.test(raw)
-      ? ' CLI показує первинний майстер налаштування — образ factory-build старий (фікс preTrustWorkspace ще не задеплоєний): онови деплой.'
+      ? ' CLI показує первинний майстер налаштування — образ agent-runner-executor старий (фікс preTrustWorkspace ще не задеплоєний): онови деплой.'
       : '';
   throw new Error(
     `tmux session ${session}: kickoff line never reached the input box.${hint} On screen: ${tail || '(порожня панель)'}`,
@@ -199,11 +200,9 @@ export const TERMINAL_LOG = 'terminal.log';
 /**
  * Marker announcing "a terminal for this project is live right now".
  *
- * It exists because the two things that need to agree live in DIFFERENT
- * CONTAINERS: tmux runs in `factory-build`, while the API that answers the UI
- * runs in `factory`, and `tmux has-session` in the latter would always say no.
- * The transport is the one they already share — the `sitesdata` volume — which
- * is exactly how `build-log.ndjson` crosses the same boundary.
+ * In production tmux runs in the isolated executor while the API answers from
+ * factory. The gateway reads this marker from the per-invocation scratch and
+ * returns only the terminal metadata; local-development mode reads it directly.
  *
  * Written when the session starts, deleted when it ends, including on failure.
  * A stale marker (host killed mid-build) is handled by the reader, which treats
@@ -316,6 +315,14 @@ async function killSession(session: string): Promise<void> {
   await exec('tmux', ['kill-session', '-t', session], { timeoutMs: 10_000 });
 }
 
+/** Trusted runner control-plane cancellation for one known live session. */
+export async function cancelTmuxSession(session: string): Promise<void> {
+  if (!/^build-[A-Za-z0-9_-]{1,120}$/.test(session)) {
+    throw new Error('invalid tmux session name');
+  }
+  await killSession(session);
+}
+
 /**
  * The one line typed into the session.
  *
@@ -419,8 +426,9 @@ async function waitForResult(
 /**
  * Run one workspace agent session inside tmux and return its validated result.
  *
- * Signature-compatible with any adapter's `codeAgent()` on purpose: the builder
- * does not branch, `runCodeAgent()` picks the runtime and passes the object.
+ * It fulfils the same artifact contract as an adapter's `codeAgent()`; the
+ * additional runtime/session arguments are transport dependencies supplied by
+ * `runCodeAgent()`, so the builder itself never branches.
  */
 export async function runCodeAgentTmux<T>(
   opts: CodeAgentOptions,
@@ -429,8 +437,10 @@ export async function runCodeAgentTmux<T>(
   session = sessionName(path.basename(opts.cwd)),
   /** The selected subscription runtime. Its capabilities drive launch, guard and rate-limit handling. */
   runtime: AgentRuntime,
+  /** Shared lease created by runCodeAgent() before transport selection. */
+  invocation: CodeAgentInvocationContext,
 ): Promise<T> {
-  const resultPath = resultPathIn(opts.cwd);
+  const resultPath = invocation.resultPath;
   const promptPath = path.join(opts.cwd, PROMPT_FILE);
   const settingsPath = path.join(opts.cwd, SETTINGS_FILE);
   const terminalLogPath = path.join(opts.cwd, TERMINAL_LOG);
@@ -438,11 +448,6 @@ export async function runCodeAgentTmux<T>(
 
   return withAgentSlot(`tmux:${opts.name}`, async () => {
     await mkdir(opts.cwd, { recursive: true });
-
-    // A stale result.json from a previous iteration would be read as this run's
-    // answer within one poll tick. Removing it is what makes the artifact a
-    // completion SIGNAL rather than just a file that happens to exist.
-    await rm(resultPath, { force: true });
 
     // The prompt file carries the same text the SDK path sends as the prompt,
     // including the mandatory result.json instruction — the contract is
@@ -452,7 +457,7 @@ export async function runCodeAgentTmux<T>(
       promptPath,
       `${prompt}\n\n` +
       `MANDATORY FINAL STEP: write a file named result.json in the workspace root (${opts.cwd}) ` +
-      `matching this JSON Schema, then stop:\n${JSON.stringify(zodToJsonSchema(resultSchema), null, 2)}\n`,
+      `matching this JSON Schema, then stop:\n${JSON.stringify(outputJsonSchema(resultSchema, opts.outputJsonSchema), null, 2)}\n`,
       'utf8',
     );
     // Per-runtime workspace/host preparation — guard wiring, trust seeding,
@@ -485,7 +490,7 @@ export async function runCodeAgentTmux<T>(
     // beats the option.
     args.push(';', 'set-option', '-w', '-t', session, 'remain-on-exit', 'on');
 
-    const env = codeAgentEnv(runtime.authEnv());
+    const env = codeAgentEnv(runtime.authEnv(), opts.cwd);
     const started = await exec('tmux', args, { env, timeoutMs: 30_000 });
     if (started.code !== 0) {
       throw new Error(
@@ -495,8 +500,12 @@ export async function runCodeAgentTmux<T>(
 
     // The spectator seat. Best-effort by construction: a build must not fail
     // because ttyd is missing or its port is busy.
-    const writable = config.build.terminalWritable && launch.interactive;
-    const served = await startTerminalServer(session, { writable }).catch(() => false);
+    const writable = (opts.terminalWritable ?? config.build.terminalWritable) && launch.interactive;
+    const served = await startTerminalServer(session, {
+      enabled: opts.terminalWeb,
+      port: opts.terminalPort,
+      writable,
+    }).catch(() => false);
     const markerPath = path.join(opts.cwd, TERMINAL_MARKER);
     const startedAtIso = new Date().toISOString();
     const writeMarker = async (): Promise<void> => {
@@ -563,7 +572,7 @@ export async function runCodeAgentTmux<T>(
       summary: `Агент завершив роботу в терміналі за ${Math.round(outcome.elapsedMs / 60_000)} хв`,
     });
 
-    return readAndValidateResult(resultPath, opts.name, resultSchema);
+    return readAndValidateResult(resultPath, opts.name, resultSchema, invocation);
   });
 }
 

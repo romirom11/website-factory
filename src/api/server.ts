@@ -8,14 +8,13 @@
  *  2. Demo static server (demoPort): serves built demo sites with noindex.
  *     The UI's approval preview iframes DEMO_BASE_URL, which points here.
  */
-import { timingSafeEqual } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { and, desc, eq, inArray } from 'drizzle-orm';
-import { db, schema } from '../db/client.js';
+import { db, pool, schema } from '../db/client.js';
 import { ensureDemoServer, registerPreview, startDemoServer } from '../lib/serveDir.js';
 import { writeQaIssues } from '../build/workspace.js';
 import { buildLogPath, readBuildLog } from '../build/buildLog.js';
@@ -32,8 +31,29 @@ import {
   startSession, submitCode, telegramChats,
 } from './accounts.js';
 import { reloadSettings } from '../lib/settingsStore.js';
+import { writeSetting } from '../lib/settingsStore.js';
+import { usesRemoteAgentTransport } from '../agents/transport.js';
+import { remoteAgentTransport } from '../agents/remoteTransport.js';
+import { ensureQueues, enqueue, getBoss } from '../orchestrator/queue.js';
+import { createInternalAuth } from './internalAuth.js';
+import { registerJobCommandRoute } from './jobCommands.js';
+import { registerBusinessTransitionCommandRoute } from './businessTransitionCommands.js';
+import { businessTransitions } from '../orchestrator/statuses.js';
+import { registerBuildFailureCommandRoute } from './buildFailureCommands.js';
+import { stopFailedBuild } from '../orchestrator/buildFailureDecision.js';
+import { registerBuildReviewCommandRoute } from './buildReviewCommands.js';
+import { registerOutreachDecisionCommandRoutes } from './outreachDecisionCommands.js';
+import { OutreachDecisionService } from '../orchestrator/outreachDecisionService.js';
+import { WorkflowRunStore } from '../orchestrator/workflowRunStore.js';
+import { registerCampaignCommandRoutes } from './campaignCommands.js';
+import { CampaignCommandService } from '../orchestrator/campaignCommandService.js';
+import { registerOperatorBusinessCommandRoutes } from './operatorBusinessCommands.js';
+import { OperatorBusinessCommandService } from '../orchestrator/operatorBusinessCommandService.js';
 
 export async function startApi(): Promise<void> {
+  // Queue creation is part of readiness. In API-only mode there may be no
+  // worker process to prepare build/agent queues on our behalf.
+  await ensureQueues();
   const app = new Hono();
 
   app.get('/health', (c) => c.json({ ok: true, mode: config.mode }));
@@ -50,18 +70,35 @@ export async function startApi(): Promise<void> {
   // Secret: INTERNAL_API_KEY, falling back to UI_SESSION_SECRET / UI_PASSWORD,
   // so a working setup needs no extra .env line. Empty secret = the endpoints
   // refuse everything rather than opening up.
-  const internalAuth = async (c: any, next: any) => {
-    const expected = config.ui.internalApiKey;
-    if (!expected) return c.json({ ok: false, error: 'internal api disabled (no secret configured)' }, 503);
-    const given = c.req.header('x-internal-key') ?? '';
-    const a = Buffer.from(given);
-    const b = Buffer.from(expected);
-    if (a.length !== b.length || !timingSafeEqual(a, b)) {
-      log.warn('internal api rejected', { path: c.req.path });
-      return c.json({ ok: false, error: 'unauthorized' }, 401);
-    }
-    await next();
-  };
+  const internalAuth = createInternalAuth();
+  const workflowRunStore = new WorkflowRunStore(pool, await getBoss());
+  registerJobCommandRoute(app, internalAuth, enqueue);
+  registerBusinessTransitionCommandRoute(
+    app,
+    internalAuth,
+    (command) => businessTransitions.override(command),
+  );
+  registerBuildFailureCommandRoute(app, internalAuth, stopFailedBuild);
+  registerBuildReviewCommandRoute(app, internalAuth);
+  registerOutreachDecisionCommandRoutes(
+    app,
+    internalAuth,
+    new OutreachDecisionService(
+      workflowRunStore,
+      db,
+      () => config.followupDays,
+    ),
+  );
+  registerCampaignCommandRoutes(
+    app,
+    internalAuth,
+    new CampaignCommandService(workflowRunStore, () => config.mode),
+  );
+  registerOperatorBusinessCommandRoutes(
+    app,
+    internalAuth,
+    new OperatorBusinessCommandService(workflowRunStore, db),
+  );
 
   /**
    * Run one connectivity check and report the REAL result (never a throw).
@@ -129,10 +166,27 @@ export async function startApi(): Promise<void> {
   // Same internal-key protection as the checks: these SPAWN processes and STORE
   // credentials, so they are strictly more sensitive than a read.
 
+  async function remoteAccount(
+    operation: 'start' | 'status' | 'submit-code' | 'cancel' | 'disconnect',
+    provider: 'claude' | 'codex',
+    code?: string,
+  ) {
+    try {
+      return await remoteAgentTransport.account(operation, provider, code);
+    } catch (error) {
+      log.warn('remote account control failed', { operation, provider, error });
+      return {
+        ok: false,
+        message: `Runner акаунтів недоступний: ${error instanceof Error ? error.message : String(error)}`.slice(0, 500),
+      };
+    }
+  }
+
   /** Begin a flow. Returns the first snapshot; the UI then polls /status. */
   app.post('/internal/accounts/:provider/start', internalAuth, async (c) => {
     const p = c.req.param('provider');
     if (!isAccountProvider(p)) return c.json({ ok: false, message: `невідомий провайдер: ${p}` }, 400);
+    if (usesRemoteAgentTransport()) return c.json(await remoteAccount('start', p));
     return c.json({ ok: true, session: startSession(p) });
   });
 
@@ -144,6 +198,7 @@ export async function startApi(): Promise<void> {
   app.get('/internal/accounts/:provider/status', internalAuth, async (c) => {
     const p = c.req.param('provider');
     if (!isAccountProvider(p)) return c.json({ ok: false, message: `невідомий провайдер: ${p}` }, 400);
+    if (usesRemoteAgentTransport()) return c.json(await remoteAccount('status', p));
     return c.json({ ok: true, session: activeSession(p) });
   });
 
@@ -152,20 +207,30 @@ export async function startApi(): Promise<void> {
     const p = c.req.param('provider');
     if (!isAccountProvider(p)) return c.json({ ok: false, message: `невідомий провайдер: ${p}` }, 400);
     const body = await c.req.json().catch(() => null) as { code?: string } | null;
+    if (usesRemoteAgentTransport()) {
+      return c.json(await remoteAccount('submit-code', p, String(body?.code ?? '')));
+    }
     return c.json({ ok: true, session: submitCode(p, String(body?.code ?? '')) });
   });
 
   app.post('/internal/accounts/:provider/cancel', internalAuth, async (c) => {
     const p = c.req.param('provider');
     if (!isAccountProvider(p)) return c.json({ ok: false, message: `невідомий провайдер: ${p}` }, 400);
+    if (usesRemoteAgentTransport()) return c.json(await remoteAccount('cancel', p));
     return c.json({ ok: true, session: cancelSession(p) });
   });
 
-  /** "Відключити": drop the stored credential (see accounts.ts for the asymmetry). */
+  /** "Відключити": ask the runtime owner to remove the provider credential. */
   app.post('/internal/accounts/:provider/disconnect', internalAuth, async (c) => {
     const p = c.req.param('provider');
     if (!isAccountProvider(p)) return c.json({ ok: false, message: `невідомий провайдер: ${p}` }, 400);
-    const res = await disconnect(p);
+    const res = usesRemoteAgentTransport()
+      ? await remoteAccount('disconnect', p)
+      : await disconnect(p);
+    if (usesRemoteAgentTransport() && p === 'claude' && res.ok) {
+      await writeSetting('CLAUDE_CODE_OAUTH_TOKEN', '', 'runner-disconnect').catch(() => undefined);
+      await reloadSettings().catch(() => undefined);
+    }
     // The cached chip would otherwise keep saying «підключено» for up to ten
     // minutes about a credential that has just been deleted.
     if (isCheckKind(p)) await invalidateCheck(p);
@@ -336,10 +401,18 @@ ${previous || '(попередніх автоматичних зауважень
     const tail = await readBuildLog(buildLogPath(businessId), after);
 
     // Whether Roman can attach to the REAL terminal of this build right now.
-    // Read off the shared volume rather than from tmux, because tmux runs in
-    // `factory-build` and this endpoint answers from `factory` — see
-    // TERMINAL_MARKER in src/agents/tmuxRuntime.ts.
-    const marker = project?.dir ? await liveTerminal(project.dir) : null;
+    // Production asks the runner gateway because tmux lives in the isolated
+    // executor; explicit local-development mode reads the marker directly.
+    const marker = project?.dir
+      ? usesRemoteAgentTransport()
+        ? await remoteAgentTransport.terminal('status', project.dir).catch((error) => {
+            log.warn('runner terminal status unavailable', {
+              businessId, err: String(error).slice(0, 200),
+            });
+            return null;
+          })
+        : await liveTerminal(project.dir)
+      : null;
 
     return c.json({
       ok: true,
@@ -370,8 +443,12 @@ ${previous || '(попередніх автоматичних зауважень
             // password, and anyone holding INTERNAL_API_KEY can derive this
             // value themselves. Withheld when no server is up, so the pair is
             // never handed out for a terminal that does not exist.
-            user: marker.served ? TERMINAL_USER : null,
-            password: marker.served ? terminalPassword() || null : null,
+            user: marker.served
+              ? ('user' in marker ? marker.user : TERMINAL_USER) ?? null
+              : null,
+            password: marker.served
+              ? ('password' in marker ? marker.password : terminalPassword()) || null
+              : null,
           }
         : null,
       active: job?.status === 'running' || job?.status === 'retry_wait',

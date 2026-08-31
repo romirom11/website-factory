@@ -28,18 +28,20 @@ import { query, type Options, type SDKMessage } from '@anthropic-ai/claude-agent
 import type { ZodType } from 'zod';
 import { config } from '../config.js';
 import { log } from '../lib/logger.js';
-import { zodToJsonSchema, extractJson, jsonOnlyInstruction } from './schema.js';
+import { outputJsonSchema, extractJson, jsonOnlyInstruction } from './schema.js';
 import { appendBuildLog, summarizeSdkMessage } from '../build/buildLog.js';
 import { withAgentSlot } from './semaphore.js';
 import { codeAgentEnv, buildPreToolUseGuard } from './sandbox.js';
 import { withStructuredRetries } from './retry.js';
 import { looksRateLimited, rateLimitedFromInfo, rateLimitedFromText } from './ratelimit.js';
 import { effectiveModel } from './modelPolicy.js';
-import { readAndValidateResult, resultPathIn } from './result.js';
+import { readAndValidateResult } from './result.js';
+import { claudeToolSandbox } from './confinement.js';
 import {
   RateLimitedError,
   RUNTIME_LABELS,
   type AgentRuntime,
+  type CodeAgentInvocationContext,
   type AgentUsage,
   type CodeAgentOptions,
   type StructuredOptions,
@@ -256,6 +258,7 @@ export async function preTrustWorkspace(cwd: string): Promise<void> {
  */
 export function guardSettings(workspace: string, tsxBin: string): unknown {
   return {
+    sandbox: claudeToolSandbox(workspace),
     hooks: {
       PreToolUse: [
         {
@@ -308,7 +311,7 @@ export const claudeCodeRuntime: AgentRuntime = {
   terminalLaunch(opts: CodeAgentOptions, { settingsPath }: { settingsPath: string }): TerminalLaunchSpec {
     const args = [
       '--dangerously-skip-permissions',
-      '--model', effectiveModel(this.id, opts.heavy, config.agents.modelInputs()),
+      '--model', opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs()),
       '--settings', settingsPath,
       '--setting-sources', 'project',
       '--name', opts.name,
@@ -333,7 +336,7 @@ export const claudeCodeRuntime: AgentRuntime = {
   ): Promise<T> {
     const retries = opts.retries ?? 2;
     const timeoutMs = opts.timeoutMs ?? DEFAULT_STRUCTURED_TIMEOUT_MS;
-    const jsonSchema = zodToJsonSchema(schema);
+    const jsonSchema = outputJsonSchema(schema, opts.outputJsonSchema);
 
     // Images are handed over as file paths the agent reads itself (multimodal
     // Read); this keeps everything inside the subscription runtime.
@@ -343,7 +346,7 @@ export const claudeCodeRuntime: AgentRuntime = {
       : '';
 
     const cwd = opts.cwd ?? await mkdtemp(path.join(tmpdir(), 'factory-agent-'));
-    const model = effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
+    const model = opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
 
     return withStructuredRetries({
       name, runtime: this.id, retries,
@@ -364,13 +367,17 @@ export const claudeCodeRuntime: AgentRuntime = {
           allowDangerouslySkipPermissions: true,
           systemPrompt: { type: 'preset', preset: 'claude_code', append: systemPrompt },
           settingSources: [],
+          ...(needsRead ? {
+            hooks: { PreToolUse: [{ hooks: [buildPreToolUseGuard(cwd, name)] }] },
+          } : {}),
+          sandbox: claudeToolSandbox(cwd),
           outputFormat: { type: 'json_schema', schema: jsonSchema },
           // No tools here, but there is still no reason to expose factory
           // secrets to a model processing scraped third-party text.
-          env: codeAgentEnv(this.authEnv()),
+          env: codeAgentEnv(this.authEnv(), cwd),
         };
 
-        const prompt = `${userContent}${imageBlock}${jsonOnlyInstruction(schema)}`;
+        const prompt = `${userContent}${imageBlock}${jsonOnlyInstruction(schema, opts.outputJsonSchema)}`;
         const startedAt = Date.now();
         const run = await collectRun(options, prompt, timeoutMs, `structured:${name}`, {
           logPath: opts.buildLogPath, agent: name,
@@ -413,10 +420,13 @@ export const claudeCodeRuntime: AgentRuntime = {
     });
   },
 
-  async codeAgent<T>(opts: CodeAgentOptions, resultSchema: ZodType<T>): Promise<T> {
+  async codeAgent<T>(
+    opts: CodeAgentOptions,
+    resultSchema: ZodType<T>,
+    invocation: CodeAgentInvocationContext,
+  ): Promise<T> {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_CODE_TIMEOUT_MS;
-    const resultPath = resultPathIn(opts.cwd);
-    const model = effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
+    const model = opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
 
     return withAgentSlot(`code:${opts.name}`, async () => {
       const options: Options = {
@@ -433,6 +443,7 @@ export const claudeCodeRuntime: AgentRuntime = {
         // is not consulted under bypassPermissions (SDK emits
         // CLAUDE_SDK_CAN_USE_TOOL_SHADOWED), verified empirically.
         hooks: { PreToolUse: [{ hooks: [buildPreToolUseGuard(opts.cwd, opts.name)] }] },
+        sandbox: claudeToolSandbox(opts.cwd),
         systemPrompt: { type: 'preset', preset: 'claude_code', append: opts.appendSystemPrompt },
         // Deliberate asymmetry with structured(), which pins settingSources: [].
         // The workspace agent NEEDS its own `<cwd>/.claude/` (that is where the
@@ -448,13 +459,13 @@ export const claudeCodeRuntime: AgentRuntime = {
         ...(opts.skills ? { skills: opts.skills } : {}),
         // Allowlist only: the builder never needs SMTP/IMAP/Telegram/S3/DB creds,
         // and must not be able to exfiltrate them via `echo $SMTP_PASS`.
-        env: codeAgentEnv(this.authEnv()),
+        env: codeAgentEnv(this.authEnv(), opts.cwd),
       };
 
       const prompt =
         `${opts.prompt}\n\n` +
         `MANDATORY FINAL STEP: write a file named result.json in the workspace root (${opts.cwd}) ` +
-        `matching this JSON Schema, then stop:\n${JSON.stringify(zodToJsonSchema(resultSchema), null, 2)}`;
+        `matching this JSON Schema, then stop:\n${JSON.stringify(outputJsonSchema(resultSchema, opts.outputJsonSchema), null, 2)}`;
 
       const startedAt = Date.now();
       const run = await collectRun(options, prompt, timeoutMs, `code:${opts.name}`, {
@@ -463,10 +474,12 @@ export const claudeCodeRuntime: AgentRuntime = {
       reportUsage(opts.onUsage, run, model, startedAt);
 
       // A session can end on error_max_turns having ALREADY written a valid
-      // result.json. The artifact on disk is the contract, so check it before
-      // declaring failure — but only trust it if it validates.
+      // result.json. The current invocation's artifact is the contract, so
+      // check it before declaring failure — but only trust it if it validates.
       if (!run.success) {
-        const salvaged = await readAndValidateResult(resultPath, opts.name, resultSchema).catch(() => undefined);
+        const salvaged = await readAndValidateResult(
+          invocation.resultPath, opts.name, resultSchema, invocation,
+        ).catch(() => undefined);
         if (salvaged !== undefined) {
           log.warn('code agent wrote a valid result.json despite a failed session subtype', {
             name: opts.name, subtype: run.errorSubtype, turns: run.numTurns,
@@ -478,7 +491,7 @@ export const claudeCodeRuntime: AgentRuntime = {
           `${[run.threwAfterResult, run.resultText, ...run.errors].filter(Boolean).join(' ').slice(0, 300)}`,
         );
       }
-      return readAndValidateResult(resultPath, opts.name, resultSchema);
+      return readAndValidateResult(invocation.resultPath, opts.name, resultSchema, invocation);
     });
   },
 };

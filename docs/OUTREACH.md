@@ -194,13 +194,21 @@ WAHA сама постить кожне вхідне повідомлення н
 
 ## 6. Follow-ups (етап 15)
 
-Плануються в момент відправки першого повідомлення (`scheduleFollowups`) на
-`FOLLOWUP_SCHEDULE_DAYS` (за замовчуванням +3 і +7 днів), кожен зі своїм
-idempotency key `followup:approval:<id>:<n>`.
+Плануються атомарно з фіксацією першого повідомлення через
+`OutreachDeliveryService` на `FOLLOWUP_SCHEDULE_DAYS` (за замовчуванням +3 і
++7 днів), кожен зі своїм idempotency key `followup:approval:<id>:<n>`.
+
+Перед автоматичною відправкою сервіс у транзакції резервує message intent і
+слот денного ліміту. Тому паралельні воркери не можуть перевищити ліміт. Якщо
+провайдер міг прийняти live-повідомлення, але локальну фіналізацію не вдалося
+підтвердити, message переходить у `delivery_unknown`: автоматичний повтор
+заборонений, доки оператор не звірить канал вручну.
 
 **Умови зупинки перевіряються двічі** і це навмисно:
 
-1. `cancelFollowups()` скасовує заплановані pg-boss jobs при reply/opt-out/bounce;
+1. `InboundOutreachService` одним commit записує reply/opt-out/bounce і закриває
+   відповідні `workflow_jobs` та `workflow_job_runs`; фізичне скасування pg-boss
+   виконується після commit як best effort;
 2. `followupSkipReason()` перевіряє все заново **в момент виконання**.
 
 Скасування pg-boss — best effort. Другий рівень і є справжнім гейтом: пропущене
@@ -211,6 +219,10 @@ idempotency key `followup:approval:<id>:<n>`.
 
 Для ручних каналів follow-up = **картка в Telegram** з deep link і готовим
 текстом, а не автовідправка.
+
+Provider message ID перетворюється на унікальний inbound idempotency key.
+Повторна доставка того самого IMAP/WAHA event не дублює audit, статус, deal або
+сповіщення оператору.
 
 ---
 
@@ -279,7 +291,7 @@ pnpm phasee:e2e
 ```
 
 `scripts/phaseE-e2e.ts` проганяє повний цикл на фікстурній кампанії
-`phaseE-fixture-<ts>`: approval → live SMTP → лист фізично в скриньці (перевірка
+`e2e-phasee-<ts>`: approval → live SMTP → лист фізично в скриньці (перевірка
 через IMAP) → відповідь → `poll-replies` → `outreach_events`/deal/status →
 follow-up відмовляється відправлятись. Плюс bounce, opt-out, WAHA-вебхук,
 exactly-once, HMAC. Наприкінці фікстури видаляються (`--keep` щоб лишити).

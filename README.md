@@ -4,10 +4,12 @@
 
 Code-first мультиагентна система: **PostgreSQL = state machine і джерело істини, pg-boss = черга jobs, агенти = workers для нечітких етапів**. Оркеструє детермінований код, не LLM.
 
-Агентний шар працює **тільки по підписці, без API-білінгу** (спека §2.3, рішення №10) — деталі в [docs/AGENT-RUNTIME.md](docs/AGENT-RUNTIME.md). Етапи 9-12 (brief → дизайн → збірка → QA → приватний деплой) описані в [docs/BUILD-PIPELINE.md](docs/BUILD-PIPELINE.md). Два взаємозамінні рантайми (`AGENT_RUNTIME`):
+Агентний шар працює **тільки по підписці, без API-білінгу** (спека §2.3, рішення №10) — деталі в [docs/AGENT-RUNTIME.md](docs/AGENT-RUNTIME.md). Етапи 9-12 (brief → дизайн → збірка → QA → приватний деплой) описані в [docs/BUILD-PIPELINE.md](docs/BUILD-PIPELINE.md). Production builder має два повністю ізольовані взаємозамінні рантайми (`AGENT_RUNTIME`):
 
 - **claude-code (default)**: Claude Code по підписці Pro/Max. Два режими виклику — headless structured (enrichment, brief, дизайн-напрямки, QA, текст outreach) і code agent з workspace (builder + QA-fix loop): ізольований Next.js-шаблон, immutable snapshot, brief, design contract і локальні assets; агент сам пише код, сам ганяє `pnpm install`/`pnpm build`, сам фіксить помилки. QA-issues повертаються в той самий workspace.
 - **codex**: те саме через Codex CLI по підписці ChatGPT; один вибір у UI застосовується до всіх агентних етапів.
+
+OpenCode також реалізує tool-free structured-виклики. Його tool-enabled builder у production fail-closed вимкнений, бо pinned CLI не має OS sandbox для subprocess tools; вибір OpenCode для збірки дає явний `needs_human`, а не слабший security mode.
 
 `ANTHROPIC_API_KEY` не потрібен ніде.
 
@@ -37,7 +39,7 @@ build-site (builder agent у Next.js workspace; код перевіряє build 
    ↓
 deploy-demo (неугадуваний URL, noindex, health check)
    ↓
-request-approval (Telegram-картка: Approve / Reject / Changes)
+request-approval (Telegram-лінк → Approve / Reject / Changes у Web UI)
    ↓ ТІЛЬКИ після Approve
 send-outreach (месенджери -> email; WAHA, НЕ Cloud API | manual card)
    ↓
@@ -49,7 +51,7 @@ follow-ups за розкладом · poll-replies (IMAP) · daily summary
 ## Швидкий старт
 
 ```bash
-cp .env.example .env        # заповни TELEGRAM_*, SMTP_* (див. нижче); API-ключі не потрібні
+cp .env.example .env        # лише infra/secrets для boot; operational config заповнюється в UI
 docker compose up -d postgres minio
 pnpm install
 pnpm db:migrate
@@ -81,13 +83,13 @@ pnpm import:legacy --dir /root/website-offers
 
 | Ключ | Для чого | Без нього |
 |---|---|---|
-| Логін підпискою: на сервері `claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN`, локально — логін самого `claude` CLI | всі агенти (enrichment, brief, дизайн, builder, QA) | агентні етапи падають у needs_human |
-| `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | approval-картки, алерти, daily summary | approvals лишаються в dashboard/БД |
+| Логін підпискою через `/settings/accounts` → runner credential volume; локально — логін самого CLI | всі агенти (enrichment, brief, дизайн, builder, QA) | агентні етапи падають у needs_human |
+| `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | сповіщення з UI-лінками, алерти, daily summary | approvals лишаються в UI/БД |
 | `SMTP_*` + `IMAP_*` | email outreach + reply detection | email-канал недоступний |
 | `WAHA_API_KEY` + QR-логін окремого номера | автоматичний WhatsApp через self-hosted WAHA (рішення №2, НЕ Meta Cloud API) | картка з wa.me-лінком (ручний тап) |
 | `FACTORY_MODE=live` | реальні відправки | `dry_run`: весь флоу працює, send симулюється |
 
-Instagram DM не автоматизується принципово (бан акаунта): фабрика готує текст і шле картку в Telegram.
+Instagram DM не автоматизується принципово (бан акаунта): фабрика готує текст і показує deep link у UI; Telegram лише сповіщає.
 
 ## Правила, які вбудовані в код (не в документацію)
 
@@ -108,15 +110,16 @@ Instagram DM не автоматизується принципово (бан а
 src/
   db/            schema (17 таблиць), клієнт, міграції
   orchestrator/  statuses (state machine), queue (pg-boss), router (переходи етапів)
-  agents/        agent harness: structured output через forced tool use + zod
+  agents/        спільний runtime API + remote transport до ізольованого runner
+  runner/        gateway/executor protocol, workspace sync, health і secret gate
   enrichment/    gosomEvidence (майнінг CSV доказів), messengers (детекція
                  каналів), capture (Playwright + immutable raw), grounding
                  (анти-галюцинаційна перевірка тверджень агента)
   workers/       discovery, normalize, fastQualify, enrich, assets, audit,
                  score, readiness, contentDesign, snapshot, builder, visualQa,
                  deploy, approval, outreach, replies, summary
-  telegram/      approval bot + notifications
-  api/           dashboard + JSON API + demo static server + WhatsApp webhook
+  telegram/      notification-only повідомлення з лінками у Web UI
+  api/           internal commands/checks + JSON API + demo server + WhatsApp webhook
 scripts/smoke.ts детермінований смоук-тест пайплайна
 ```
 
@@ -124,7 +127,9 @@ scripts/smoke.ts детермінований смоук-тест пайплай
 
 ```bash
 pnpm typecheck
-pnpm tsx scripts/smoke.ts   # campaign -> normalize -> dedup -> qualify -> audit -> gaps -> queue
+pnpm test:smoke:compose      # isolated campaign -> normalize -> qualify -> audit -> queue
+pnpm release:gate -- --quick # локальний цикл; не є дозволом на deploy
+pnpm release:gate            # повний release contract + evidence JSON
 
 # етапи 2-8 (фаза B), без мережі й без агентів:
 pnpm tsx scripts/phaseB-test-detect.ts       # 29 тестів: месенджери/соцмережі
@@ -142,8 +147,9 @@ pnpm tsx scripts/phaseB-sample-evidence.ts <businessId>
 ```
 
 Деталі етапів 2-8: [`docs/PIPELINE-STAGES-2-8.md`](docs/PIPELINE-STAGES-2-8.md).
+Безпечний production cutover і recovery: [`docs/PRODUCTION-ROLLOUT.md`](docs/PRODUCTION-ROLLOUT.md).
 
-## Свідомі відхилення від FACTORYFLOW.md
+## Поточні архітектурні рішення
 
 1. **n8n немає**: оркестрація — власний код (state machine + pg-boss). Причина: тестованість, версіонування, один стек.
 2. **Redis немає**: pg-boss живе в Postgres. Queue mode «вмикається» кількістю процесів workers.

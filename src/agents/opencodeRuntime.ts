@@ -1,8 +1,8 @@
 /**
  * OpenCode runtime adapter — subscription harness #3.
  *
- * Auth lives in OpenCode's own home (`~/.local/share/opencode/auth.json`,
- * managed by `opencode providers login`), so like Codex this adapter injects
+ * Auth lives in OpenCode's isolated XDG data volume (`$XDG_DATA_HOME/opencode/auth.json`,
+ * managed by `opencode auth login`), so like Codex this adapter injects
  * NO credentials into agent processes (`authEnv()` is empty). Nothing
  * pay-per-token: whatever provider Roman logged in to bills its own
  * subscription; no API key is ever read or passed by the factory.
@@ -20,9 +20,11 @@
  *   - an "ask" WITHOUT --auto is AUTO-REJECTED (fail-closed, never hangs) and a
  *     human-readable line lands in stdout between the JSON events;
  *   - with --auto, asks are approved but explicit "deny" rules still hold.
- * So codeAgent() runs --auto under a generated deny-config (the workspace
- * guard below), while structured() runs without --auto behind a config that
- * denies every tool outright — the equivalent of Claude's allowedTools: [].
+ * So codeAgent() runs --auto under a generated deny-config in local development,
+ * while structured() runs without --auto behind a config that denies every
+ * tool outright — the equivalent of Claude's allowedTools: []. Production
+ * rejects OpenCode codeAgent() before launch because those rules are not an OS
+ * sandbox; tool-free structured calls remain enabled.
  */
 import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
@@ -31,18 +33,19 @@ import path from 'node:path';
 import type { ZodType } from 'zod';
 import { config } from '../config.js';
 import { log } from '../lib/logger.js';
-import { zodToJsonSchema, extractJson, jsonOnlyInstruction } from './schema.js';
+import { outputJsonSchema, extractJson, jsonOnlyInstruction } from './schema.js';
 import { withAgentSlot } from './semaphore.js';
 import { codeAgentEnv } from './sandbox.js';
 import { withStructuredRetries } from './retry.js';
 import { looksRateLimited, rateLimitedFromText } from './ratelimit.js';
 import { effectiveModel } from './modelPolicy.js';
-import { readAndValidateResult, resultPathIn } from './result.js';
+import { readAndValidateResult } from './result.js';
 import { appendBuildLog, clip, type BuildLogEvent } from '../build/buildLog.js';
 import {
   RateLimitedError,
   RUNTIME_LABELS,
   type AgentRuntime,
+  type CodeAgentInvocationContext,
   type AgentUsage,
   type CodeAgentOptions,
   type StructuredOptions,
@@ -211,13 +214,16 @@ function shortPath(p: string): string {
 export function openCodeGuardConfig(): Record<string, unknown> {
   const sensitiveReads = [
     '**/.ssh/**', '**/.aws/**', '**/.gnupg/**', '**/.kube/**', '**/.docker/**',
-    '**/.claude/**', '**/.codex/**', '**/.config/opencode/**',
+    '**/.claude/**', '**/.codex/**', '**/.config/opencode/**', '**/provider-auth/opencode/**',
     '**/.netrc', '**/.npmrc', '**/.pgpass',
   ];
   return {
     $schema: 'https://opencode.ai/config.json',
     permission: {
       webfetch: 'deny',
+      websearch: 'deny',
+      external_directory: 'deny',
+      task: 'deny',
       read: {
         '*': 'allow',
         ...Object.fromEntries(sensitiveReads.map((p) => [p, 'deny'])),
@@ -343,7 +349,7 @@ export const opencodeRuntime: AgentRuntime = {
 
   terminalLaunch(opts: CodeAgentOptions, _context: { settingsPath: string }): TerminalLaunchSpec {
     const args = [];
-    const model = effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
+    const model = opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
     if (model) args.push('--model', model);
     args.unshift('--pure');
     return {
@@ -366,8 +372,8 @@ export const opencodeRuntime: AgentRuntime = {
   ): Promise<T> {
     const retries = opts.retries ?? 2;
     const timeoutMs = opts.timeoutMs ?? DEFAULT_STRUCTURED_TIMEOUT_MS;
-    const prompt = `${systemPrompt}\n\n---\n\n${userContent}${jsonOnlyInstruction(schema)}`;
-    const model = effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
+    const prompt = `${systemPrompt}\n\n---\n\n${userContent}${jsonOnlyInstruction(schema, opts.outputJsonSchema)}`;
+    const model = opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
 
     return withStructuredRetries({
       name, runtime: this.id, retries,
@@ -417,17 +423,20 @@ export const opencodeRuntime: AgentRuntime = {
     });
   },
 
-  async codeAgent<T>(opts: CodeAgentOptions, resultSchema: ZodType<T>): Promise<T> {
+  async codeAgent<T>(
+    opts: CodeAgentOptions,
+    resultSchema: ZodType<T>,
+    invocation: CodeAgentInvocationContext,
+  ): Promise<T> {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_CODE_TIMEOUT_MS;
-    const resultPath = resultPathIn(opts.cwd);
-    const model = effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
+    const model = opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
     const startedAt = Date.now();
 
     return withAgentSlot(`code:${opts.name}`, async () => {
       const prompt =
         `${opts.appendSystemPrompt ? `${opts.appendSystemPrompt}\n\n---\n\n` : ''}${opts.prompt}\n\n` +
         `MANDATORY FINAL STEP: write a file named result.json in the workspace root (${opts.cwd}) ` +
-        `matching this JSON Schema, then stop:\n${JSON.stringify(zodToJsonSchema(resultSchema), null, 2)}`;
+        `matching this JSON Schema, then stop:\n${JSON.stringify(outputJsonSchema(resultSchema, opts.outputJsonSchema), null, 2)}`;
 
       // --pure keeps the operator's personal plugins/MCP servers out of a
       // client build (the workspace agent's analogue of settingSources:
@@ -443,10 +452,12 @@ export const opencodeRuntime: AgentRuntime = {
 
       assertNotRateLimited(outcome, `${outcome.res.stdout}\n${outcome.res.stderr}`.slice(-600), opts.name);
 
-      // The artifact is the contract: salvage it before declaring failure,
-      // exactly like the Claude adapter treats error_max_turns sessions.
+      // The current invocation's artifact is the contract: salvage it before
+      // declaring failure, exactly like Claude treats error_max_turns sessions.
       if (outcome.res.code !== 0 || outcome.events.some((e) => e.type === 'error')) {
-        const salvaged = await readAndValidateResult(resultPath, opts.name, resultSchema).catch(() => undefined);
+        const salvaged = await readAndValidateResult(
+          invocation.resultPath, opts.name, resultSchema, invocation,
+        ).catch(() => undefined);
         if (salvaged !== undefined) {
           log.warn('code agent wrote a valid result.json despite a failed run', {
             name: opts.name, exit: outcome.res.code,
@@ -462,7 +473,9 @@ export const opencodeRuntime: AgentRuntime = {
         );
       }
 
-      const result = await readAndValidateResult(resultPath, opts.name, resultSchema);
+      const result = await readAndValidateResult(
+        invocation.resultPath, opts.name, resultSchema, invocation,
+      );
       reportUsage(opts.onUsage, outcome.events, model, startedAt);
       return result;
     });

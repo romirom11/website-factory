@@ -9,6 +9,7 @@ import { config } from '../config.js';
 import type { AgentRuntimeId } from '../agents/types.js';
 import { runtimeLabel } from '../agents/types.js';
 import { log } from '../lib/logger.js';
+import { jobDisplayTitle } from '../orchestrator/jobDefinitions.js';
 
 /**
  * True when Telegram can attach a URL (inline buttons / clickable links).
@@ -101,17 +102,8 @@ function noButtonHint(): string {
   return linkableBase() ? '' : '\n\n<i>Кнопки з лінками з\'являться, коли в Налаштуваннях → Система буде публічна адреса UI (Tailscale), а не localhost.</i>';
 }
 
-/** Ukrainian names for pipeline stages, for humans — never raw job types. */
-const STAGE_LABELS: Record<string, string> = {
-  'discover': 'Пошук бізнесів', 'normalize': 'Обробка знайденого', 'fast-qualify': 'Швидкий відбір',
-  'enrich': 'Збір даних про бізнес', 'collect-assets': 'Збір фото і лого', 'audit-website': 'Перевірка їхнього сайту',
-  'score-and-qa': 'Оцінка і перевірка фактів', 'readiness-gate': 'Перевірка готовності',
-  'content-and-design': 'Підготовка дизайну', 'build-site': 'Збірка демосайту', 'visual-qa': 'Перевірка демосайту',
-  'deploy-demo': 'Публікація демо', 'request-approval': 'Підготовка до відправки',
-  'send-outreach': 'Відправка повідомлення', 'send-followup': 'Нагадування', 'poll-replies': 'Перевірка відповідей',
-  'daily-summary': 'Підсумок дня', 'enrich-socials': 'Пошук соцмереж', 'refresh-brand': 'Оновлення айдентики',
-};
-export function stageLabel(jobType: string): string { return STAGE_LABELS[jobType] ?? jobType; }
+/** Ukrainian names for pipeline stages, sourced from the shared job contract. */
+export function stageLabel(jobType: string): string { return jobDisplayTitle(jobType); }
 
 function esc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');

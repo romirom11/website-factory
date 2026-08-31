@@ -11,6 +11,10 @@
  */
 import { eq, and, inArray, ne } from 'drizzle-orm';
 import { db, schema } from '../src/db/client.js';
+import {
+  businessTransitions,
+  requireBusinessStatus,
+} from '../src/orchestrator/statuses.js';
 
 const campaignId = process.argv[2];
 if (!campaignId) {
@@ -54,14 +58,20 @@ for (const id of ids) {
   }
 }
 
-const reset = await db.update(schema.businesses)
-  .set({ status: 'prequalified', statusReason: 'phaseB reset', score: null, scoreBreakdown: null, updatedAt: new Date() })
-  .where(inArray(schema.businesses.id, ids)).returning({ id: schema.businesses.id });
-
-for (const id of reset.map((r) => r.id)) {
-  await db.insert(schema.statusHistory).values({
-    businessId: id, toStatus: 'prequalified', actor: 'phaseB-reset', reason: 'clean re-run of stages 4-8',
+const reset: string[] = [];
+for (const row of rows) {
+  const result = await businessTransitions.recover({
+    businessId: row.id,
+    expectedStatus: requireBusinessStatus(row.status, `business ${row.id}`),
+    to: 'prequalified',
+    actor: 'phaseB-reset',
+    reason: 'clean re-run of stages 4-8',
   });
+  if (result.kind === 'conflict') continue;
+  await db.update(schema.businesses)
+    .set({ score: null, scoreBreakdown: null, updatedAt: new Date() })
+    .where(and(eq(schema.businesses.id, row.id), eq(schema.businesses.status, 'prequalified')));
+  reset.push(row.id);
 }
 
 console.log(`reset ${reset.length} businesses to prequalified; re-seeded ${seeded} phone contacts`);

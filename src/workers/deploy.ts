@@ -14,12 +14,14 @@ import { cp, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { customAlphabet } from 'nanoid';
-import { eq } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { config } from '../config.js';
-import { transition } from '../orchestrator/statuses.js';
-import { advance } from '../orchestrator/router.js';
-import type { JobPayload } from '../orchestrator/queue.js';
+import {
+  businessTransitions,
+  requireBusinessStatus,
+} from '../orchestrator/statuses.js';
+import { commitWorkflow, type JobPayload } from '../orchestrator/queue.js';
 import { collectWorkspaceGarbage, outputDir } from '../build/workspace.js';
 import { buildLogPath, logStage } from '../build/buildLog.js';
 import { ensureDemoServer } from '../lib/serveDir.js';
@@ -109,6 +111,24 @@ async function healthCheck(url: string, businessName: string): Promise<{ ok: boo
   }
 }
 
+/** Reserve the public path before copying files so retries reuse one target. */
+async function reserveDeployToken(projectId: number): Promise<string> {
+  return db.transaction(async (tx) => {
+    const [project] = await tx.select({ deployToken: schema.siteProjects.deployToken })
+      .from(schema.siteProjects)
+      .where(eq(schema.siteProjects.id, projectId))
+      .limit(1)
+      .for('update');
+    if (!project) throw new Error(`site project not found: ${projectId}`);
+    if (project.deployToken) return project.deployToken;
+    const reserved = token();
+    await tx.update(schema.siteProjects)
+      .set({ deployToken: reserved })
+      .where(eq(schema.siteProjects.id, projectId));
+    return reserved;
+  });
+}
+
 export async function deployHandler(payload: JobPayload): Promise<void> {
   const businessId = payload.businessId!;
   const project = await resolveProject('deploy', payload);
@@ -119,15 +139,23 @@ export async function deployHandler(payload: JobPayload): Promise<void> {
   }
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   if (!biz) throw new Error(`business not found: ${businessId}`);
+  const expectedStatus = requireBusinessStatus(biz.status, `business ${businessId}`);
+  if (!['site_in_progress', 'site_ready'].includes(expectedStatus)) {
+    log.info('deploy skipped: business no longer belongs to the build flow', {
+      businessId,
+      status: expectedStatus,
+    });
+    return;
+  }
 
   const source = outputDir(project.dir);
   if (!existsSync(path.join(source, 'index.html'))) {
     throw new Error(`no exported site to deploy at ${source}`);
   }
 
-  // Idempotent: a redeploy of the same project reuses its token, so an approval
-  // card that already carries the URL keeps working.
-  const slug = project.deployToken ?? token();
+  // The token is durably reserved before the external filesystem effect. A
+  // crash after copying cannot make the retry publish a second orphan URL.
+  const slug = await reserveDeployToken(projectId);
   const target = path.join(DEPLOYS_ROOT, slug);
   await mkdir(DEPLOYS_ROOT, { recursive: true });
   await cp(source, target, {
@@ -152,19 +180,69 @@ export async function deployHandler(payload: JobPayload): Promise<void> {
     throw new Error(`deploy health check failed for ${deployUrl}: ${health.detail}`);
   }
 
-  await db.update(schema.siteProjects).set({
-    deployUrl, deployToken: slug, deployedAt: new Date(), state: 'deployed',
-  }).where(eq(schema.siteProjects.id, projectId));
+  let completed = false;
+  await commitWorkflow(async (tx) => {
+    const [lockedProject] = await tx.select({ state: schema.siteProjects.state })
+      .from(schema.siteProjects)
+      .where(eq(schema.siteProjects.id, projectId))
+      .limit(1)
+      .for('update');
+    if (!lockedProject || !['ready', 'deployed'].includes(lockedProject.state)) return [];
+
+    const [lockedBusiness] = await tx.select({
+      status: schema.businesses.status,
+      campaignId: schema.businesses.campaignId,
+    }).from(schema.businesses)
+      .where(eq(schema.businesses.id, businessId))
+      .limit(1)
+      .for('update');
+    if (!lockedBusiness) throw new Error(`business not found: ${businessId}`);
+    const currentStatus = requireBusinessStatus(lockedBusiness.status, `business ${businessId}`);
+    if (!['site_in_progress', 'site_ready'].includes(currentStatus)) return [];
+
+    const transitioned = await businessTransitions.normalInTransaction(tx, {
+      businessId,
+      expectedStatus: currentStatus,
+      to: 'site_ready',
+      actor: 'deploy-worker',
+      reason: deployUrl,
+    });
+    if (transitioned.kind === 'conflict') {
+      throw new Error(`deploy lost its locked transition for ${businessId}`);
+    }
+    const [updated] = await tx.update(schema.siteProjects).set({
+      deployUrl,
+      deployToken: slug,
+      deployedAt: new Date(),
+      state: 'deployed',
+    }).where(and(
+      eq(schema.siteProjects.id, projectId),
+      inArray(schema.siteProjects.state, ['ready', 'deployed']),
+    )).returning({ id: schema.siteProjects.id });
+    if (!updated) throw new Error(`deploy lost its locked project ${projectId}`);
+    completed = true;
+    return [{
+      name: 'request-approval',
+      payload: {
+        businessId,
+        campaignId: lockedBusiness.campaignId,
+        idempotencyKey: `request-approval:${businessId}`,
+      },
+    }];
+  });
+  if (!completed) {
+    log.info('deploy result discarded: project or business already advanced', { businessId, projectId });
+    return;
+  }
 
   log.info('demo deployed', { businessId, projectId, deployUrl, health: health.detail, filesRewritten: rewritten });
-  // Last line of this project's build log: the panel that showed the run turns
-  // into a record of it, ending where the demo starts existing.
-  await logStage(buildLogPath(businessId), `Демо опубліковано: ${deployUrl}`, 'deploy');
-
-  // The demo now lives in deploys/<token>/ and the reports live in storage, so the
-  // build artefacts in the workspace are dead weight. Never fails the deploy.
+  await logStage(buildLogPath(businessId), `Демо опубліковано: ${deployUrl}`, 'deploy')
+    .catch((error) => log.warn('build log write failed after deploy commit', {
+      businessId,
+      projectId,
+      error: String(error),
+    }));
+  // Only reclaim source artifacts after the durable project/status/approval
+  // handoff commits. A queue failure must leave a retryable workspace behind.
   await collectWorkspaceGarbage(project.dir, 'deployed').catch(() => {});
-
-  await transition(businessId, 'site_ready', 'deploy-worker', deployUrl);
-  await advance(businessId); // -> request-approval (phase D)
 }

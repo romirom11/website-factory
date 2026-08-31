@@ -1,17 +1,36 @@
 import PgBoss from 'pg-boss';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { config } from '../config.js';
-import { db, schema } from '../db/client.js';
+import { db, pool, schema } from '../db/client.js';
 import { log } from '../lib/logger.js';
 import { notifyJobProblem, notifySubscriptionPause } from '../telegram/notify.js';
 import { isRateLimitedError } from '../agents/types.js';
+import { withAgentWorkerGroup } from '../agents/semaphore.js';
+import {
+  LOGICAL_JOB_FIELD,
+  getJobDefinition,
+  isJobName,
+  type JobName,
+  type WorkerGroup,
+} from './jobDefinitions.js';
+import {
+  ensureRequiredQueues,
+  type QueueCreator,
+} from './queueReadiness.js';
+import {
+  WorkflowRunStore,
+  type EnqueueResult,
+  type EnqueueMutation,
+  type EnqueueTransactionPlanner,
+} from './workflowRunStore.js';
+import {
+  failEnrichmentBranchInTransaction,
+  type EnrichmentBranch,
+} from './enrichmentBarrier.js';
+import { businessTransitions } from './statuses.js';
 
-export type JobName =
-  | 'discover' | 'normalize' | 'fast-qualify' | 'enrich' | 'enrich-socials'
-  | 'collect-assets' | 'refresh-brand'
-  | 'audit-website' | 'score-and-qa' | 'readiness-gate' | 'content-and-design'
-  | 'build-site' | 'visual-qa' | 'deploy-demo' | 'request-approval'
-  | 'send-outreach' | 'send-followup' | 'poll-replies' | 'daily-summary';
+export type { JobName } from './jobDefinitions.js';
+export type { EnqueueResult } from './workflowRunStore.js';
 
 export interface JobPayload {
   campaignId?: string;
@@ -21,8 +40,15 @@ export interface JobPayload {
 }
 
 export type Handler = (payload: JobPayload) => Promise<void>;
+export type HandlerRegistry = Readonly<Record<JobName, Handler>>;
 
 let boss: PgBoss | null = null;
+
+function enrichmentBranchFor(name: JobName): EnrichmentBranch | null {
+  if (name === 'collect-assets') return 'assets';
+  if (name === 'audit-website') return 'audit';
+  return null;
+}
 
 export async function getBoss(): Promise<PgBoss> {
   if (boss) return boss;
@@ -32,149 +58,329 @@ export async function getBoss(): Promise<PgBoss> {
   return boss;
 }
 
-/**
- * Job types that consume the AI subscription. They run one-at-a-time
- * (teamSize/batchSize 1) so the 5-hour window is never burned in parallel;
- * `src/agents/semaphore.ts` enforces the same cap inside the process.
- */
-const AGENT_JOBS: ReadonlySet<JobName> = new Set<JobName>([
-  'enrich', 'score-and-qa', 'content-and-design', 'build-site', 'visual-qa', 'request-approval',
-  // Since the agent-led social finder (SOCIAL_FINDER), this job can spend the
-  // subscription window too: the engines are blocked on the server, so the
-  // fallback fires routinely rather than rarely. Running it wide would park the
-  // extra workers on the agent semaphore while their 30-minute expiry ran down.
-  'enrich-socials',
-]);
+export type { QueueCreator } from './queueReadiness.js';
 
-const RETRY: Partial<Record<JobName, { limit: number; delay: number }>> = {
-  'discover': { limit: 2, delay: 60 },
-  'enrich': { limit: 3, delay: 120 },
-  // Browser + public SERPs: a second full pass costs minutes and hardens the
-  // rate limits that caused the first failure. One retry, then it stays failed
-  // and Roman re-runs it from the card when he wants to.
-  'enrich-socials': { limit: 1, delay: 120 },
-  // Mines stored evidence only — no page captures, no agent call. A retry is
-  // cheap and the usual failure is a transient MinIO or CDN hiccup.
-  'refresh-brand': { limit: 2, delay: 30 },
-  'audit-website': { limit: 3, delay: 60 },
-  'build-site': { limit: 1, delay: 0 },
-  'send-outreach': { limit: 0, delay: 0 }, // NEVER auto-retry sends
-};
+/** Create every current and target queue before any HTTP readiness is exposed. */
+export async function ensureQueues(queueCreator?: QueueCreator): Promise<void> {
+  const target = queueCreator ?? await getBoss();
+  await ensureRequiredQueues(target);
+}
 
 export async function enqueue(
   name: JobName,
   payload: JobPayload,
   opts: { startAfterSeconds?: number; priority?: number } = {},
-): Promise<string | null> {
+): Promise<EnqueueResult> {
   const b = await getBoss();
-  const retry = RETRY[name] ?? { limit: 3, delay: 60 };
-  const singletonKey = payload.idempotencyKey
-    ?? (payload.businessId ? `${name}:${payload.businessId}` : `${name}:${payload.campaignId ?? 'global'}`);
-  const jobId = await b.send(name, payload, {
-    retryLimit: retry.limit,
-    retryDelay: retry.delay,
-    retryBackoff: true,
-    // Agent jobs can legitimately run for an hour (site build + pnpm build).
-    expireInSeconds: AGENT_JOBS.has(name) ? 60 * 90 : 60 * 30,
-    singletonKey, // idempotency: same key won't double-queue while active
-    // Higher runs first (pg-boss default 0). The build policy uses it so leads
-    // with no site at all are built before ones that already have some presence.
-    ...(opts.priority !== undefined ? { priority: opts.priority } : {}),
-    ...(opts.startAfterSeconds ? { startAfter: opts.startAfterSeconds } : {}),
+  const result = await new WorkflowRunStore(pool, b).enqueue({ name, payload, options: opts });
+  log.info(result.kind === 'accepted' ? 'job enqueued' : 'duplicate job suppressed', {
+    name,
+    runId: result.runId,
+    bossJobId: result.bossJobId,
+    ...payload,
   });
-  await db.insert(schema.workflowJobs).values({
-    bossJobId: jobId, jobType: name,
-    businessId: payload.businessId ?? null, campaignId: payload.campaignId ?? null,
-    payload: payload as Record<string, unknown>,
-    idempotencyKey: singletonKey, status: 'queued',
-  });
-  log.info('job enqueued', { name, jobId, ...payload });
-  return jobId;
+  return result;
 }
 
-/** Wrap a handler with job-journal + error routing. One business failing never stops the campaign. */
-export async function register(name: JobName, handler: Handler): Promise<void> {
+/** Enqueue a job and a related domain mutation on the same Postgres client. */
+export async function enqueueWithMutation(
+  name: JobName,
+  payload: JobPayload,
+  opts: { startAfterSeconds?: number; priority?: number },
+  mutation: EnqueueMutation,
+): Promise<EnqueueResult> {
   const b = await getBoss();
-  await b.createQueue(name).catch(() => { /* exists */ });
-  // Agent jobs share one finite subscription window (SPEC §2.3а), so they are
-  // capped rather than run wide. The cap follows AGENT_CONCURRENCY instead of
-  // being pinned to 1: `src/agents/semaphore.ts` enforces the same number
-  // in-process, so pulling more jobs than that would only park them on the
-  // semaphore, while pulling fewer leaves configured capacity unused.
-  const agentTeam = Math.max(1, config.agents.concurrency);
-  const workOpts = AGENT_JOBS.has(name)
-    ? { batchSize: 1, teamSize: agentTeam, teamConcurrency: agentTeam }
-    : { batchSize: 1 };
-  await b.work(name, workOpts, async (jobs) => {
-    for (const job of jobs) {
-      const payload = job.data as JobPayload;
-      const [jobRow] = await db.select().from(schema.workflowJobs)
-        .where(eq(schema.workflowJobs.bossJobId, job.id));
-      const attempt = (jobRow?.attempts ?? 0) + 1;
-      await db.update(schema.workflowJobs)
-        .set({ status: 'running', attempts: attempt, startedAt: new Date() })
-        .where(eq(schema.workflowJobs.bossJobId, job.id));
-      try {
-        await handler(payload);
-        await db.update(schema.workflowJobs)
-          .set({ status: 'succeeded', finishedAt: new Date() })
-          .where(eq(schema.workflowJobs.bossJobId, job.id));
-      } catch (err: any) {
-        const detail = String(err?.stack ?? err).slice(0, 4000);
+  const result = await new WorkflowRunStore(pool, b).enqueue(
+    { name, payload, options: opts },
+    mutation,
+  );
+  log.info(result.kind === 'accepted' ? 'job and domain mutation committed' : 'domain mutation committed with existing job', {
+    name,
+    runId: result.runId,
+    bossJobId: result.bossJobId,
+    ...payload,
+  });
+  return result;
+}
 
-        // SPEC §2.3(б): an exhausted subscription window is NOT a failure.
-        // The job parks in `retry_wait`, is re-enqueued under the SAME
-        // idempotency key once the window resets, and burns no attempt.
-        if (isRateLimitedError(err)) {
-          const waitMs = err.retryAfterMs;
-          const nextAttemptAt = new Date(Date.now() + waitMs);
-          await db.update(schema.workflowJobs)
-            .set({
-              status: 'retry_wait',
-              // do not count this against the failure limit
-              attempts: Math.max(0, attempt - 1),
-              nextAttemptAt,
-              errorCode: 'RATE_LIMITED',
-              errorDetail: `subscription limit (${err.rateLimitType ?? 'unknown'}); resumes ${nextAttemptAt.toISOString()}`,
-              finishedAt: new Date(),
-            })
-            .where(eq(schema.workflowJobs.bossJobId, job.id));
-          await enqueue(name, { ...payload, idempotencyKey: jobRow?.idempotencyKey ?? payload.idempotencyKey },
-            { startAfterSeconds: Math.ceil(waitMs / 1000) });
-          log.warn('job parked on subscription limit', {
-            name, jobId: job.id, waitMinutes: Math.round(waitMs / 60_000),
-            resumesAt: nextAttemptAt.toISOString(),
-          });
-          await notifySubscriptionPause({
-            jobType: name, businessId: payload.businessId, resumesAt: nextAttemptAt,
-            runtime: err.runtime,
-          }).catch(() => {});
-          continue; // resolved for pg-boss: no failure, no auto-retry storm
-        }
-        const isFinalAttempt = attempt > (RETRY[name]?.limit ?? 3);
-        const needsHuman = err?.code === 'NEEDS_HUMAN';
-        await db.update(schema.workflowJobs)
+/**
+ * Commit a multi-write stage decision and all continuation jobs together.
+ *
+ * Workers use this boundary when the next payload depends on a row created in
+ * the same transaction (for example a new site-project id), or when a stage
+ * can legitimately finish without enqueueing a continuation.
+ */
+export async function commitWorkflow(
+  plan: EnqueueTransactionPlanner,
+): Promise<EnqueueResult[]> {
+  const b = await getBoss();
+  return new WorkflowRunStore(pool, b).enqueueTransaction(plan);
+}
+
+export async function processJob(
+  name: JobName,
+  job: PgBoss.Job<JobPayload>,
+  handler: Handler,
+  b: PgBoss,
+): Promise<void> {
+  const definition = getJobDefinition(name);
+  const payload = job.data;
+  const claim = await db.transaction(async (tx) => {
+    const [jobRow] = await tx.select().from(schema.workflowJobs)
+      .where(eq(schema.workflowJobs.bossJobId, job.id))
+      .limit(1)
+      .for('update');
+    if (!jobRow) return null;
+    if (jobRow.runId) {
+      const [run] = await tx.select().from(schema.workflowJobRuns)
+        .where(eq(schema.workflowJobRuns.id, jobRow.runId))
+        .limit(1)
+        .for('update');
+      if (
+        !run
+        || run.currentAttemptSequence !== jobRow.attemptSequence
+        || !['queued', 'retry_wait'].includes(run.status)
+      ) return null;
+    }
+    const attempt = jobRow.attempts + 1;
+    const claimed = await tx.update(schema.workflowJobs)
           .set({
-            status: needsHuman ? 'needs_human' : (isFinalAttempt ? 'failed' : 'queued'),
-            errorCode: err?.code ?? 'ERR',
-            errorDetail: detail,
+            status: 'running', attempts: attempt, startedAt: new Date(),
+            finishedAt: null, nextAttemptAt: null,
+          })
+      .where(and(
+        eq(schema.workflowJobs.id, jobRow.id),
+        eq(schema.workflowJobs.status, 'queued'),
+      ))
+      .returning({ id: schema.workflowJobs.id });
+    if (!claimed.length) return null;
+    if (jobRow.runId) {
+      await tx.update(schema.workflowJobRuns)
+        .set({ status: 'running', updatedAt: new Date(), finishedAt: null })
+        .where(eq(schema.workflowJobRuns.id, jobRow.runId));
+    }
+    return { jobRow, attempt };
+  });
+
+  if (!claim) {
+    log.warn('stale job delivery ignored', { name, bossJobId: job.id });
+    return;
+  }
+  const { jobRow, attempt } = claim;
+
+  try {
+    await withAgentWorkerGroup(definition.workerGroup, () => handler(payload));
+    const committed = await db.transaction(async (tx) => {
+      const [currentAttempt] = await tx.select({
+        status: schema.workflowJobs.status,
+        runId: schema.workflowJobs.runId,
+        attemptSequence: schema.workflowJobs.attemptSequence,
+      })
+        .from(schema.workflowJobs)
+        .where(eq(schema.workflowJobs.id, jobRow.id))
+        .limit(1)
+        .for('update');
+      if (currentAttempt?.status !== 'running') return false;
+      if (currentAttempt.runId) {
+        const [run] = await tx.select().from(schema.workflowJobRuns)
+          .where(eq(schema.workflowJobRuns.id, currentAttempt.runId))
+          .limit(1)
+          .for('update');
+        if (
+          !run
+          || run.status !== 'running'
+          || run.currentAttemptSequence !== currentAttempt.attemptSequence
+        ) return false;
+      }
+      const finishedAt = new Date();
+      await tx.update(schema.workflowJobs)
+        .set({ status: 'succeeded', finishedAt })
+        .where(eq(schema.workflowJobs.id, jobRow.id));
+      if (currentAttempt.runId) {
+        await tx.update(schema.workflowJobRuns)
+          .set({ status: 'succeeded', updatedAt: finishedAt, finishedAt })
+          .where(eq(schema.workflowJobRuns.id, currentAttempt.runId));
+      }
+      return true;
+    });
+    if (!committed) log.warn('stale job success ignored', { name, bossJobId: job.id });
+  } catch (err: any) {
+    const detail = String(err?.stack ?? err).slice(0, 4000);
+
+    if (isRateLimitedError(err)) {
+      const waitMs = err.retryAfterMs;
+      const nextAttemptAt = new Date(Date.now() + waitMs);
+      const errorDetail = `subscription limit (${err.rateLimitType ?? 'unknown'}); resumes ${nextAttemptAt.toISOString()}`;
+      const continuation = await new WorkflowRunStore(pool, b).continueAfterRateLimit({
+        bossJobId: job.id,
+        retryAfterMs: waitMs,
+        errorDetail,
+        nextAttemptAt,
+      });
+      if (continuation.kind === 'stale') {
+        log.warn('stale rate-limit result ignored', {
+          name, bossJobId: job.id, runId: continuation.runId,
+        });
+        return;
+      }
+      if (continuation.kind === 'legacy') {
+        const parked = await db.update(schema.workflowJobs)
+          .set({
+            status: 'retry_wait', attempts: Math.max(0, attempt - 1),
+            nextAttemptAt, errorCode: 'RATE_LIMITED', errorDetail,
             finishedAt: new Date(),
           })
-          .where(eq(schema.workflowJobs.bossJobId, job.id));
-        log.error('job failed', { name, jobId: job.id, attempt, err: detail.slice(0, 500) });
-        if (needsHuman || isFinalAttempt) {
-          await notifyJobProblem({
-            jobType: name,
-            businessId: payload.businessId,
-            campaignId: payload.campaignId,
-            needsHuman,
-            error: String(err?.message ?? err),
-          }).catch(() => {});
+          .where(and(
+            eq(schema.workflowJobs.id, jobRow.id),
+            eq(schema.workflowJobs.status, 'running'),
+          ))
+          .returning({ id: schema.workflowJobs.id });
+        if (parked.length) {
+          await enqueue(
+            name,
+            { ...payload, idempotencyKey: jobRow.idempotencyKey ?? payload.idempotencyKey },
+            { startAfterSeconds: Math.ceil(waitMs / 1000) },
+          );
         }
-        if (!needsHuman) throw err; // let pg-boss retry
       }
+      log.warn('job parked on subscription limit', {
+        name, jobId: job.id,
+        runId: continuation.kind === 'legacy' ? null : continuation.runId,
+        successorJobId: continuation.kind === 'legacy' ? null : continuation.bossJobId,
+        waitMinutes: Math.round(waitMs / 60_000),
+        resumesAt: nextAttemptAt.toISOString(),
+      });
+      await notifySubscriptionPause({
+        jobType: name, businessId: payload.businessId, resumesAt: nextAttemptAt,
+        runtime: err.runtime,
+      }).catch(() => {});
+      return;
     }
-  });
+    const isFinalAttempt = attempt > definition.retry.limit;
+    const needsHuman = err?.code === 'NEEDS_HUMAN';
+    const failedCommitted = await db.transaction(async (tx) => {
+      const attemptStatus = needsHuman ? 'needs_human' : (isFinalAttempt ? 'failed' : 'queued');
+      const terminal = needsHuman || isFinalAttempt;
+      const [currentAttempt] = await tx.select({
+        status: schema.workflowJobs.status,
+        runId: schema.workflowJobs.runId,
+        attemptSequence: schema.workflowJobs.attemptSequence,
+      })
+        .from(schema.workflowJobs)
+        .where(eq(schema.workflowJobs.id, jobRow.id))
+        .limit(1)
+        .for('update');
+      if (currentAttempt?.status !== 'running') return false;
+      if (currentAttempt.runId) {
+        const [run] = await tx.select().from(schema.workflowJobRuns)
+          .where(eq(schema.workflowJobRuns.id, currentAttempt.runId))
+          .limit(1)
+          .for('update');
+        if (
+          !run
+          || run.status !== 'running'
+          || run.currentAttemptSequence !== currentAttempt.attemptSequence
+        ) return false;
+      }
+      const finishedAt = new Date();
+      await tx.update(schema.workflowJobs)
+        .set({
+          status: attemptStatus,
+          errorCode: err?.code ?? 'ERR',
+          errorDetail: detail,
+          finishedAt,
+        })
+        .where(eq(schema.workflowJobs.id, jobRow.id));
+      if (currentAttempt.runId) {
+        await tx.update(schema.workflowJobRuns)
+          .set({
+            status: attemptStatus,
+            updatedAt: finishedAt,
+            finishedAt: terminal ? finishedAt : null,
+          })
+          .where(eq(schema.workflowJobRuns.id, currentAttempt.runId));
+      }
+      const enrichmentBranch = enrichmentBranchFor(name);
+      if (
+        terminal
+        && enrichmentBranch
+        && typeof payload.enrichmentRunId === 'string'
+        && typeof payload.businessId === 'string'
+      ) {
+        const [business] = await tx.select({ status: schema.businesses.status })
+          .from(schema.businesses)
+          .where(eq(schema.businesses.id, payload.businessId))
+          .limit(1)
+          .for('update');
+        const branchFailure = await failEnrichmentBranchInTransaction(tx, {
+          runId: payload.enrichmentRunId,
+          businessId: payload.businessId,
+          branch: enrichmentBranch,
+          reason: `${name} ${needsHuman ? 'needs human' : 'retries exhausted'}: ${String(err?.message ?? err)}`
+            .slice(0, 500),
+        });
+        if (branchFailure.kind === 'blocked' && branchFailure.changed && business?.status === 'enriching') {
+          await businessTransitions.normalInTransaction(tx, {
+            businessId: payload.businessId,
+            expectedStatus: 'enriching',
+            to: 'needs_review',
+            actor: `${name}-lifecycle`,
+            reason: `${name} could not complete its enrichment evidence branch`,
+          });
+        }
+      }
+      return true;
+    });
+    if (!failedCommitted) {
+      log.warn('stale job failure ignored', { name, bossJobId: job.id });
+      return;
+    }
+    log.error('job failed', { name, jobId: job.id, attempt, err: detail.slice(0, 500) });
+    if (needsHuman || isFinalAttempt) {
+      await notifyJobProblem({
+        jobType: name,
+        businessId: payload.businessId,
+        campaignId: payload.campaignId,
+        needsHuman,
+        error: String(err?.message ?? err),
+      }).catch(() => {});
+    }
+    if (!needsHuman) throw err;
+  }
+}
+
+function logicalQueueHandler(name: JobName, handler: Handler, b: PgBoss): PgBoss.WorkHandler<JobPayload> {
+  return async (jobs) => {
+    for (const job of jobs) await processJob(name, job, handler, b);
+  };
+}
+
+/** Register a logical queue (non-agent jobs and bounded legacy drainers). */
+export async function register(name: JobName, handler: Handler): Promise<string> {
+  const b = await getBoss();
+  await b.createQueue(name);
+  return b.work(name, { batchSize: 1, priority: true }, logicalQueueHandler(name, handler, b));
+}
+
+/** Dispatch a shared physical agent queue back to its typed logical handler. */
+export function createAgentQueueHandler(
+  group: WorkerGroup,
+  handlers: HandlerRegistry,
+  b: PgBoss,
+): PgBoss.WorkHandler<JobPayload> {
+  return async (jobs) => {
+    for (const job of jobs) {
+      const raw = job.data as JobPayload;
+      const logicalName = raw[LOGICAL_JOB_FIELD];
+      if (!isJobName(logicalName)) throw new Error(`agent queue job ${job.id} has no valid logical name`);
+      const definition = getJobDefinition(logicalName);
+      if (definition.workerGroup !== group || definition.agentCapability !== 'subscription') {
+        throw new Error(`job ${logicalName} does not belong to agent-${group}`);
+      }
+      const { [LOGICAL_JOB_FIELD]: _logicalName, ...payload } = raw;
+      await processJob(logicalName, { ...job, data: payload }, handlers[logicalName], b);
+    }
+  };
 }
 
 export class NeedsHumanError extends Error {

@@ -3,40 +3,35 @@
 /**
  * Server actions = every mutation Roman can make from the UI.
  *
- * These carry the same hard rules as the workers, because the UI is the thing
- * that triggers a send:
- *  - Approve writes an `approvals` row and enqueues exactly one `send-outreach`
- *    whose idempotency key is derived from the approval id. A second Approve on
- *    an already-decided approval is refused HERE, and the outreach worker's
- *    unique index refuses it again. Two independent locks, on purpose.
+ * State-changing workflow commands go through the authenticated factory API:
+ * approval/campaign domain writes and their jobs share one Postgres transaction.
+ * Direct DB access in this module is reserved for simple operator-owned records
+ * that do not have a queue side effect.
  *  - Manual status changes are recorded with actor 'roman' and a reason, so
  *    status_history stays a real audit trail (SPEC §5).
  */
 
-import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { revalidatePath } from 'next/cache';
 import { db, schema } from './db';
-import { enqueueJob, type JobName } from './queue';
-import { sendIdempotencyKey, followupIdempotencyKey, isManualChannel, deepLinkFor } from './keys';
+import { enqueueJob, type JobName } from './jobs';
+import { isManualChannel, deepLinkFor } from './keys';
 import {
-  BUILDABLE_STATUSES, BUILD_POLICY_LABELS, buildJobPriority, isActiveJobStatus,
-  isActiveProjectState, normalizeBuildPolicy,
+  BUILD_POLICY_LABELS, isActiveJobStatus, normalizeBuildPolicy,
 } from './buildPolicy';
 import { CLOSED_STATUSES, isSocialChannel, socialsButtonState } from './socials';
 import { humanStatus, reviewAsk } from './humanStatus';
 import { stageName } from './stageNames';
 import type { ActionResult } from './types';
 import { retryFailedJob, stopFailedBuild } from './buildFailureDecision';
+import { isJobName } from '@factory/jobDefinitions';
+import { isBusinessStatus } from '@factory/businessStatus';
+import { operatorTransition } from './businessTransitions';
+import { factoryFetch } from './factoryApi';
 
 // ─── Approvals ───────────────────────────────────────────────────────────────
 
-/**
- * Approve outreach for a business.
- *
- * Exactly-once is enforced by decision state: the UPDATE only matches an
- * approval whose decision IS NULL, so two concurrent clicks mean one UPDATE
- * matches a row and the other matches nothing — and only the winner enqueues.
- */
+/** Approve and enqueue as one factory-owned Postgres + pg-boss transaction. */
 export async function approveOutreach(input: {
   approvalId: number;
   channel: string;
@@ -44,12 +39,6 @@ export async function approveOutreach(input: {
   subject: string | null;
   body: string;
 }): Promise<ActionResult> {
-  const [approval] = await db.select().from(schema.approvals)
-    .where(eq(schema.approvals.id, input.approvalId));
-  if (!approval) return { ok: false, message: 'Approval не знайдено' };
-  if (approval.decision) {
-    return { ok: false, message: `Вже вирішено раніше: ${approval.decision}. Другий send неможливий.` };
-  }
   if (!input.channel || !input.toAddress) {
     return { ok: false, message: 'Не обрано канал або адресу — відправляти нікуди' };
   }
@@ -57,39 +46,28 @@ export async function approveOutreach(input: {
     return { ok: false, message: 'Порожній текст повідомлення' };
   }
 
-  const payload = {
-    ...(approval.payload as Record<string, unknown> ?? {}),
-    draft: {
-      channel: input.channel,
-      toAddress: input.toAddress,
-      subject: input.subject,
-      body: input.body,
+  const response = await factoryFetch(
+    `/internal/outreach-approvals/${input.approvalId}/decisions`,
+    {
+      method: 'POST',
+      body: {
+        decision: 'approve',
+        channel: input.channel,
+        toAddress: input.toAddress,
+        subject: input.subject,
+        body: input.body,
+      },
     },
-    // Record what Roman actually approved, distinct from what was proposed.
-    approvedAt: new Date().toISOString(),
-  };
-
-  // Conditional update = the lock. Losing click updates zero rows.
-  const updated = await db.update(schema.approvals)
-    .set({ decision: 'approved', decidedBy: 'roman', decidedAt: new Date(), payload })
-    .where(and(eq(schema.approvals.id, input.approvalId), isNull(schema.approvals.decision)))
-    .returning();
-
-  if (!updated.length) {
-    return { ok: false, message: 'Це approval вже вирішене іншим кліком — другий send не створено.' };
+  );
+  if (!response.ok) {
+    return { ok: false, message: response.message || 'Фабрика не підтвердила approval.' };
   }
-
-  await transitionBusiness(approval.businessId, 'outreach_approved', `approval #${approval.id}`);
-
-  await enqueueJob({
-    name: 'send-outreach',
-    businessId: approval.businessId,
-    idempotencyKey: sendIdempotencyKey(approval.id),
-    data: { approvalId: approval.id },
-  });
+  const result = response.body?.result as Record<string, unknown> | undefined;
+  const businessId = typeof result?.businessId === 'string' ? result.businessId : null;
+  if (!businessId) return { ok: false, message: 'Фабрика повернула некоректний результат approval.' };
 
   revalidatePath('/inbox');
-  revalidatePath(`/businesses/${approval.businessId}`);
+  revalidatePath(`/businesses/${businessId}`);
 
   if (isManualChannel(input.channel)) {
     return {
@@ -99,7 +77,7 @@ export async function approveOutreach(input: {
         channel: input.channel,
         deepLink: deepLinkFor(input.channel, input.toAddress, input.body),
         text: input.body,
-        approvalId: approval.id,
+        approvalId: input.approvalId,
       },
     };
   }
@@ -107,63 +85,42 @@ export async function approveOutreach(input: {
 }
 
 export async function rejectOutreach(input: { approvalId: number; reason: string }): Promise<ActionResult> {
-  const [approval] = await db.select().from(schema.approvals)
-    .where(eq(schema.approvals.id, input.approvalId));
-  if (!approval) return { ok: false, message: 'Approval не знайдено' };
-  if (approval.decision) return { ok: false, message: `Вже вирішено: ${approval.decision}` };
-
-  const updated = await db.update(schema.approvals)
-    .set({ decision: 'rejected', decidedBy: 'roman', decidedAt: new Date() })
-    .where(and(eq(schema.approvals.id, input.approvalId), isNull(schema.approvals.decision)))
-    .returning();
-  if (!updated.length) return { ok: false, message: 'Вже вирішене іншим кліком' };
-
-  await transitionBusiness(approval.businessId, 'rejected', input.reason || `approval #${approval.id} rejected`);
+  const response = await factoryFetch(
+    `/internal/outreach-approvals/${input.approvalId}/decisions`,
+    {
+      method: 'POST',
+      body: { decision: 'reject', reason: input.reason.trim() || 'відхилено Романом' },
+    },
+  );
+  if (!response.ok) {
+    return { ok: false, message: response.message || 'Фабрика не підтвердила відхилення.' };
+  }
+  const result = response.body?.result as Record<string, unknown> | undefined;
+  const businessId = typeof result?.businessId === 'string' ? result.businessId : null;
   revalidatePath('/inbox');
+  if (businessId) revalidatePath(`/businesses/${businessId}`);
   return { ok: true, message: 'Відхилено.' };
 }
 
-/**
- * Roman sent a manual-channel message by hand and confirms it.
- * Flips the pending outreach row to sent, moves the business to contacted and
- * schedules follow-ups. Idempotent: a second confirmation changes nothing.
- */
+/** Confirm the human send and schedule follow-ups in one factory transaction. */
 export async function confirmManualSent(input: { approvalId: number }): Promise<ActionResult> {
-  const key = sendIdempotencyKey(input.approvalId);
-  const [msg] = await db.select().from(schema.outreachMessages)
-    .where(eq(schema.outreachMessages.idempotencyKey, key));
-  if (!msg) {
-    return { ok: false, message: 'Повідомлення ще не створене воркером — зачекай секунду і онови.' };
+  const response = await factoryFetch(
+    `/internal/outreach-approvals/${input.approvalId}/manual-sent`,
+    { method: 'POST' },
+  );
+  if (!response.ok) {
+    return { ok: false, message: response.message || 'Фабрика не підтвердила ручне надсилання.' };
   }
-  if (msg.state !== 'manual_pending') {
-    return { ok: true, message: `Вже позначено як ${msg.state} — повторно нічого не робимо.` };
-  }
-
-  await db.update(schema.outreachMessages)
-    .set({ state: 'sent', sentAt: new Date() })
-    .where(and(eq(schema.outreachMessages.id, msg.id), eq(schema.outreachMessages.state, 'manual_pending')));
-  await db.insert(schema.outreachEvents).values({
-    businessId: msg.businessId, messageId: msg.id, event: 'sent',
-    detail: { channel: msg.channel, manualConfirmation: true, actor: 'roman' },
-  });
-  await transitionBusiness(msg.businessId, 'contacted', `${msg.channel} відправлено вручну`);
-  await db.insert(schema.deals).values({ businessId: msg.businessId, state: 'contacted' }).onConflictDoNothing();
-
-  // Follow-ups, same keying as the worker.
-  const followupDays = (process.env.FOLLOWUP_SCHEDULE_DAYS ?? '3,7').split(',').map(Number);
-  for (let i = 0; i < followupDays.length; i++) {
-    await enqueueJob({
-      name: 'send-followup',
-      businessId: msg.businessId,
-      idempotencyKey: followupIdempotencyKey(input.approvalId, i + 1),
-      data: { followupIndex: i + 1, approvalId: input.approvalId, channel: msg.channel },
-      startAfterSeconds: followupDays[i] * 24 * 3600,
-    });
-  }
-
+  const result = response.body?.result as Record<string, unknown> | undefined;
+  const businessId = typeof result?.businessId === 'string' ? result.businessId : null;
   revalidatePath('/inbox');
-  revalidatePath(`/businesses/${msg.businessId}`);
-  return { ok: true, message: 'Записано як відправлене вручну, follow-up заплановані.' };
+  if (businessId) revalidatePath(`/businesses/${businessId}`);
+  return {
+    ok: true,
+    message: result?.kind === 'already_confirmed'
+      ? `Вже позначено як ${String(result.state ?? 'sent')} — повторно нічого не робимо.`
+      : 'Записано як відправлене вручну, follow-up заплановані.',
+  };
 }
 
 // ─── Business-level manual actions ───────────────────────────────────────────
@@ -175,22 +132,35 @@ export async function confirmManualSent(input: { approvalId: number }): Promise<
 export async function transitionBusiness(
   businessId: string, to: string, reason: string,
 ): Promise<ActionResult> {
+  if (!isBusinessStatus(to)) return { ok: false, message: `Невідомий статус: ${to}` };
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   if (!biz) return { ok: false, message: 'Бізнес не знайдено' };
-  if (biz.status === to) return { ok: true, message: `Вже в статусі ${to}` };
+  if (!isBusinessStatus(biz.status)) {
+    return { ok: false, message: `У бізнесу некоректний поточний статус: ${biz.status}` };
+  }
 
-  await db.transaction(async (tx) => {
-    await tx.update(schema.businesses)
-      .set({ status: to, statusReason: reason, updatedAt: new Date() })
-      .where(eq(schema.businesses.id, businessId));
-    await tx.insert(schema.statusHistory).values({
-      businessId, fromStatus: biz.status, toStatus: to, reason, actor: 'roman',
-    });
+  const response = await operatorTransition({
+    businessId,
+    expectedStatus: biz.status,
+    to,
+    reason: reason.trim() || 'ручна зміна статусу Романом',
   });
 
   revalidatePath(`/businesses/${businessId}`);
   revalidatePath('/businesses');
-  return { ok: true, message: `${biz.status} → ${to}` };
+  if (response.result?.kind === 'moved') {
+    return { ok: true, message: `${response.result.from} → ${response.result.to}` };
+  }
+  if (response.result?.kind === 'already_at_target') {
+    return { ok: true, message: `Вже в статусі ${response.result.status}` };
+  }
+  if (response.result?.kind === 'conflict') {
+    return {
+      ok: false,
+      message: `Стан уже змінився: очікували ${response.result.expectedStatus}, зараз ${response.result.currentStatus}.`,
+    };
+  }
+  return { ok: false, message: response.message || 'Фабрика не підтвердила зміну статусу.' };
 }
 
 /**
@@ -206,26 +176,28 @@ async function transitionBusinessFrom(
   to: string,
   reason: string,
 ): Promise<ActionResult> {
-  const moved = await db.transaction(async (tx) => {
-    const changed = await tx.update(schema.businesses)
-      .set({ status: to, statusReason: reason, updatedAt: new Date() })
-      .where(and(
-        eq(schema.businesses.id, businessId),
-        eq(schema.businesses.status, from),
-      ))
-      .returning({ id: schema.businesses.id });
-    if (!changed.length) return false;
-    await tx.insert(schema.statusHistory).values({
-      businessId, fromStatus: from, toStatus: to, reason, actor: 'roman',
-    });
-    return true;
+  if (!isBusinessStatus(from) || !isBusinessStatus(to)) {
+    return { ok: false, message: 'Некоректний статус у рішенні оператора.' };
+  }
+  const response = await operatorTransition({
+    businessId,
+    expectedStatus: from,
+    to,
+    reason,
   });
 
   revalidatePath(`/businesses/${businessId}`);
   revalidatePath('/businesses');
-  return moved
-    ? { ok: true, message: `${from} → ${to}` }
-    : { ok: false, message: 'Це рішення щойно вже прийняли в іншій вкладці.' };
+  if (response.result?.kind === 'moved') {
+    return { ok: true, message: `${response.result.from} → ${response.result.to}` };
+  }
+  if (response.result?.kind === 'already_at_target') {
+    return { ok: true, message: `Вже в статусі ${response.result.status}` };
+  }
+  if (response.result?.kind === 'conflict') {
+    return { ok: false, message: 'Це рішення щойно вже прийняли в іншій вкладці.' };
+  }
+  return { ok: false, message: response.message || 'Фабрика не підтвердила рішення.' };
 }
 
 /**
@@ -254,30 +226,22 @@ export async function markDoNotContact(formData: FormData): Promise<ActionResult
   const reason = String(formData.get('reason') ?? '').trim() || 'позначено вручну в UI';
   if (!businessId) return { ok: false, message: 'Не вибрано бізнес' };
 
-  await db.insert(schema.doNotContact)
-    .values({ matchType: 'business_id', value: businessId, reason })
-    .onConflictDoNothing();
-
-  // Also block the concrete addresses, so a re-discovered duplicate stays blocked.
-  const contacts = await db.select().from(schema.businessContacts)
-    .where(eq(schema.businessContacts.businessId, businessId));
-  for (const c of contacts) {
-    const matchType = c.channel === 'email' ? 'email'
-      : ['phone', 'whatsapp', 'viber'].includes(c.channel) ? 'phone' : null;
-    if (!matchType) continue;
-    await db.insert(schema.doNotContact)
-      .values({ matchType, value: c.value, reason: `do_not_contact ${businessId}` })
-      .onConflictDoNothing();
+  const response = await factoryFetch(`/internal/businesses/${businessId}/do-not-contact`, {
+    method: 'POST',
+    body: { reason },
+  });
+  if (!response.ok) {
+    return { ok: false, message: response.message || 'Фабрика не зафіксувала заборону контакту.' };
   }
+  const result = response.body?.result as Record<string, unknown> | undefined;
+  const blockedAddresses = Number(result?.blockedAddresses ?? 0);
+  revalidatePath('/inbox');
+  revalidatePath(`/businesses/${businessId}`);
 
-  await transitionBusiness(businessId, 'do_not_contact', reason);
-
-  // Named by its consequence, and it says how many addresses went with the
-  // business — that is the part a person cannot see from the card afterwards.
   return {
     ok: true,
-    message: contacts.length
-      ? `Заблоковано назавжди — бізнес і ${contacts.length} його адрес`
+    message: blockedAddresses
+      ? `Заблоковано назавжди — бізнес і ${blockedAddresses} його адрес`
       : 'Заблоковано назавжди',
   };
 }
@@ -285,20 +249,21 @@ export async function markDoNotContact(formData: FormData): Promise<ActionResult
 /** Re-run a pipeline stage for one business. */
 export async function reenqueueStage(formData: FormData): Promise<ActionResult> {
   const businessId = String(formData.get('businessId') ?? '');
-  const job = String(formData.get('job') ?? '') as JobName;
-  if (!businessId || !job) return { ok: false, message: 'Не вибрано крок' };
+  const requestedJob = String(formData.get('job') ?? '');
+  if (!businessId || !isJobName(requestedJob)) return { ok: false, message: 'Не вибрано коректний крок' };
+  const job: JobName = requestedJob;
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   if (!biz) return { ok: false, message: 'Бізнес не знайдено' };
   // A fresh key every time on purpose: this button means "run it again NOW",
   // and a stable key would make the second press a silent no-op.
-  const jobId = await enqueueJob({
+  const result = await enqueueJob({
     name: job, businessId, campaignId: biz.campaignId,
     idempotencyKey: `${job}:${businessId}:${Date.now()}`,
   });
   revalidatePath(`/businesses/${businessId}`);
   revalidatePath('/settings', 'layout');
 
-  if (!jobId) return { ok: false, message: `Крок «${stageName(job)}» уже стоїть у черзі` };
+  if (result.kind === 'duplicate') return { ok: false, message: `Крок «${stageName(job)}» уже стоїть у черзі` };
   return { ok: true, message: `Крок «${stageName(job)}» поставлено в чергу` };
 }
 
@@ -364,7 +329,7 @@ export async function retryJobAction(jobId: number): Promise<ActionResult> {
 /**
  * Stop a dead build without rejecting its business.
  *
- * The failed attempt is history, the half-built project becomes `failed`, and
+ * The failed attempt is history, the half-built project becomes `cancelled`, and
  * the business returns to `production_ready` so Roman may build it again later.
  * This is the second honest ending of a failed-build card; dismissing only the
  * job row would leave the business stuck in `site_in_progress` forever.
@@ -397,25 +362,24 @@ export async function createCampaign(formData: FormData): Promise<ActionResult> 
     return { ok: false, message: 'Потрібні місто, ніша і хоча б один пошуковий запит' };
   }
 
-  const slug = `${country}-${city}-${niche}`.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-  const id = `${slug}-${new Date().toISOString().slice(0, 7)}`;
-
-  // `onConflictDoNothing` means a repeat of this month's city+niche is a no-op,
-  // and the operator has to be told that rather than shown a success.
-  const created = await db.insert(schema.campaigns).values({
-    id, country, city, niche, language, queries,
-    geofence: { lat, lng, radiusKm },
-    targetCount,
-    autoBuild,
-    mode: process.env.FACTORY_MODE === 'live' ? 'live' : 'dry_run',
-    status: 'running',
-  }).onConflictDoNothing().returning({ id: schema.campaigns.id });
-
-  if (!created.length) {
-    return { ok: false, message: `Кампанія «${id}» уже існує — нову не створено` };
+  const response = await factoryFetch('/internal/campaigns', {
+    method: 'POST',
+    body: {
+      country,
+      city,
+      niche,
+      language,
+      queries,
+      targetCount,
+      lat,
+      lng,
+      radiusKm,
+      autoBuild,
+    },
+  });
+  if (!response.ok) {
+    return { ok: false, message: response.message || 'Фабрика не створила кампанію.' };
   }
-
-  await enqueueJob({ name: 'discover', campaignId: id, idempotencyKey: `discover:${id}` });
   revalidatePath('/campaigns');
   return { ok: true, message: `Кампанію «${city} · ${niche}» створено, пошук бізнесів поставлено в чергу` };
 }
@@ -427,15 +391,12 @@ export async function updateDealStage(formData: FormData): Promise<ActionResult>
   const state = String(formData.get('state') ?? '');
   if (!businessId || !state) return { ok: false, message: 'Не вибрано етап' };
 
-  await db.insert(schema.deals).values({ businessId, state })
-    .onConflictDoUpdate({
-      target: schema.deals.businessId,
-      set: { state, updatedAt: new Date() },
-    });
-
-  // Keep the business status in step with the deal for the stages that mirror.
-  if (['replied', 'meeting', 'proposal', 'won', 'lost'].includes(state)) {
-    await transitionBusiness(businessId, state, `deal stage → ${state} (вручну)`);
+  const response = await factoryFetch(`/internal/businesses/${businessId}/deal-stage`, {
+    method: 'POST',
+    body: { state },
+  });
+  if (!response.ok) {
+    return { ok: false, message: response.message || 'Фабрика не оновила етап розмови.' };
   }
   revalidatePath('/inbox');
   revalidatePath(`/businesses/${businessId}`);
@@ -472,74 +433,23 @@ export async function funnelCounts(): Promise<Array<{ campaignId: string; status
  * still done by the content-and-design worker, never here.
  */
 export async function startDemoBuild(businessId: string): Promise<ActionResult> {
-  const [biz] = await db.select().from(schema.businesses)
-    .where(eq(schema.businesses.id, businessId));
-  if (!biz) return { ok: false, message: 'Бізнес не знайдено' };
-
-  if (!BUILDABLE_STATUSES.has(biz.status)) {
-    return { ok: false, message: `${biz.name}: статус ${biz.status} — збірка не запускається звідси` };
-  }
-
-  // Already building? Refuse. Two builders in one workspace is the failure mode
-  // this check exists for.
-  const [project] = await db.select().from(schema.siteProjects)
-    .where(eq(schema.siteProjects.businessId, businessId))
-    .orderBy(desc(schema.siteProjects.createdAt)).limit(1);
-  if (isActiveProjectState(project?.state)) {
-    return { ok: false, message: `${biz.name}: збірка вже йде (${project!.state})` };
-  }
-
-  const [job] = await db.select().from(schema.workflowJobs)
-    .where(and(
-      eq(schema.workflowJobs.businessId, businessId),
-      inArray(schema.workflowJobs.jobType, ['content-and-design', 'build-site']),
-    ))
-    .orderBy(desc(schema.workflowJobs.createdAt)).limit(1);
-  if (isActiveJobStatus(job?.status)) {
-    return { ok: false, message: `${biz.name}: job уже в черзі (${job!.status})` };
-  }
-
-  const [gaps] = await db.select({ n: sql<number>`count(*)` }).from(schema.productionGaps)
-    .where(and(
-      eq(schema.productionGaps.businessId, businessId),
-      eq(schema.productionGaps.resolved, false),
-      eq(schema.productionGaps.blockerLevel, 'hard'),
-    ));
-  const openGaps = Number(gaps?.n ?? 0);
-
-  if (biz.status === 'needs_review') {
-    // A demo built over an unresolved hard gap would have to invent the missing
-    // material, which the factory does not do (SPEC §5). Refuse, don't paper over.
-    if (openGaps > 0) {
-      return { ok: false, message: `${biz.name}: ${openGaps} незакритих gaps — спершу закрий їх` };
-    }
-    const moved = await transitionBusinessFrom(
-      businessId, 'needs_review', 'production_ready',
-      'ручний запуск збірки з UI: gaps закриті',
-    );
-    if (!moved.ok) return moved;
-  }
-
-  const verdict = await latestVerdict(businessId);
-
-  // Stable idempotency key: a second click while the job is active is a no-op
-  // in pg-boss (singletonKey), and the checks above already refused it earlier.
-  const jobId = await enqueueJob({
-    name: 'content-and-design',
-    businessId,
-    campaignId: biz.campaignId,
-    idempotencyKey: `content-and-design:${businessId}`,
-    priority: buildJobPriority({ latestVerdict: verdict, score: biz.score }),
+  const response = await factoryFetch(`/internal/businesses/${businessId}/builds`, {
+    method: 'POST',
   });
+  if (!response.ok) {
+    return { ok: false, message: response.message || 'Фабрика не запустила збірку.' };
+  }
+  const result = response.body?.result as Record<string, unknown> | undefined;
+  const job = result?.job as Record<string, unknown> | undefined;
 
   revalidatePath('/businesses');
   revalidatePath(`/businesses/${businessId}`);
   revalidatePath('/settings', 'layout');
 
-  if (!jobId) {
-    return { ok: false, message: `${biz.name}: такий job уже активний у черзі` };
+  if (job?.kind === 'duplicate') {
+    return { ok: false, message: 'Такий build job уже активний у черзі' };
   }
-  return { ok: true, message: `${biz.name}: збірка демо поставлена в чергу` };
+  return { ok: true, message: 'Збірка демо поставлена в чергу' };
 }
 
 /** Latest audit verdict, or null when the business was never audited. */
@@ -613,49 +523,17 @@ export async function resolveBusinessReviewAction(input: {
     return { ok: true, message: `${biz.name}: закрито без статусу «Відхилено» і без контакту` };
   }
 
-  const [latest] = await db.select({ status: schema.workflowJobs.status })
-    .from(schema.workflowJobs)
-    .where(and(
-      eq(schema.workflowJobs.businessId, biz.id),
-      eq(schema.workflowJobs.jobType, 'enrich'),
-    ))
-    .orderBy(desc(schema.workflowJobs.createdAt))
-    .limit(1);
-  if (isActiveJobStatus(latest?.status)) {
-    const moved = await transitionBusinessFrom(
-      biz.id, 'needs_review', 'enriching', 'повторний збір фактів уже запущено Романом',
-    );
-    revalidatePath('/inbox');
-    if (!moved.ok) return moved;
-    return { ok: true, message: `${biz.name}: факти вже перезбираються` };
+  const response = await factoryFetch(`/internal/businesses/${biz.id}/recollect-facts`, {
+    method: 'POST',
+  });
+  if (!response.ok) {
+    return { ok: false, message: response.message || 'Не вдалося запустити повторний збір фактів.' };
   }
-
-  const claimReason = 'Роман попросив заново зібрати й перевірити факти';
-  const moved = await transitionBusinessFrom(
-    biz.id, 'needs_review', 'enriching', claimReason,
-  );
-  if (!moved.ok) return moved;
-
-  let jobId: string | null;
-  try {
-    jobId = await enqueueJob({
-      name: 'enrich',
-      businessId: biz.id,
-      campaignId: biz.campaignId,
-      idempotencyKey: `enrich:${biz.id}:roman`,
-    });
-  } catch (error) {
-    await transitionBusinessFrom(
-      biz.id,
-      'enriching',
-      'needs_review',
-      biz.statusReason ?? 'повторний збір фактів не вдалося запустити',
-    );
-    throw error;
-  }
-
+  const result = response.body?.result as Record<string, unknown> | undefined;
   revalidatePath('/inbox');
-  if (!jobId) return { ok: true, message: `${biz.name}: повторний збір уже стоїть у черзі` };
+  if (result?.kind === 'already_active') {
+    return { ok: true, message: `${biz.name}: повторний збір уже стоїть у черзі` };
+  }
   return { ok: true, message: `${biz.name}: заново збираю факти й джерела` };
 }
 
@@ -681,10 +559,9 @@ export async function setCampaignBuildPolicy(formData: FormData): Promise<Action
  * fact of a business whose demo may be building right now. This job only adds
  * sources and contacts, and never touches the status.
  *
- * The idempotency key is stable per business, so a second click while the job
- * is in flight is a no-op in pg-boss — the same lock the build button relies
- * on, and the reason `enqueueJob` returning null is reported rather than
- * silently treated as success.
+ * The idempotency key is stable per business, so a second click resolves to the
+ * canonical active run — the same durable lock the build button relies on —
+ * and is reported rather than silently treated as a new run.
  */
 export async function startSocialsDiscovery(businessId: string): Promise<ActionResult> {
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
@@ -709,7 +586,7 @@ export async function startSocialsDiscovery(businessId: string): Promise<ActionR
   });
   if (!state.enabled) return { ok: false, message: `${biz.name}: ${state.hint}` };
 
-  const jobId = await enqueueJob({
+  const result = await enqueueJob({
     name: 'enrich-socials',
     businessId,
     campaignId: biz.campaignId,
@@ -720,7 +597,7 @@ export async function startSocialsDiscovery(businessId: string): Promise<ActionR
   revalidatePath('/businesses');
   revalidatePath('/settings', 'layout');
 
-  if (!jobId) return { ok: false, message: `${biz.name}: такий job уже активний у черзі` };
+  if (result.kind === 'duplicate') return { ok: false, message: `${biz.name}: такий job уже активний у черзі` };
   return { ok: true, message: `${biz.name}: пошук соцмереж поставлено в чергу` };
 }
 
@@ -750,7 +627,7 @@ export async function refreshBrandIdentity(businessId: string): Promise<ActionRe
     return { ok: false, message: `${biz.name}: бізнес закритий (${biz.status})` };
   }
 
-  const jobId = await enqueueJob({
+  const result = await enqueueJob({
     name: 'refresh-brand',
     businessId,
     campaignId: biz.campaignId,
@@ -760,7 +637,7 @@ export async function refreshBrandIdentity(businessId: string): Promise<ActionRe
   revalidatePath(`/businesses/${businessId}`);
   revalidatePath('/businesses');
 
-  if (!jobId) return { ok: false, message: `${biz.name}: оновлення айдентики вже в черзі` };
+  if (result.kind === 'duplicate') return { ok: false, message: `${biz.name}: оновлення айдентики вже в черзі` };
   return { ok: true, message: `${biz.name}: оновлення айдентики поставлено в чергу` };
 }
 
@@ -804,27 +681,33 @@ export async function startSocialsDiscoveryBulk(businessIds: string[]): Promise<
 export async function verifySocialContact(formData: FormData): Promise<ActionResult> {
   const contactId = Number(formData.get('contactId'));
   if (!contactId) return { ok: false, message: 'Не вибрано контакт' };
-  const [contact] = await db.select().from(schema.businessContacts)
-    .where(eq(schema.businessContacts.id, contactId));
+  const contact = await db.transaction(async (tx) => {
+    const [current] = await tx.select().from(schema.businessContacts)
+      .where(eq(schema.businessContacts.id, contactId))
+      .limit(1)
+      .for('update');
+    if (!current) return null;
+
+    await tx.update(schema.businessContacts)
+      .set({
+        verified: true,
+        verifiedBy: 'roman',
+        verifiedNote: String(formData.get('note') ?? '').trim() || null,
+      })
+      .where(eq(schema.businessContacts.id, contactId));
+
+    // Once a social profile is confirmed, the "we could not confirm one" gap
+    // is no longer true. The endorsement and gap resolution are one decision.
+    if (isSocialChannel(current.channel)) {
+      await tx.update(schema.productionGaps).set({ resolved: true }).where(and(
+        eq(schema.productionGaps.businessId, current.businessId),
+        eq(schema.productionGaps.gap, 'socials_unresolved'),
+        eq(schema.productionGaps.resolved, false),
+      ));
+    }
+    return current;
+  });
   if (!contact) return { ok: false, message: 'Контакт не знайдено' };
-
-  await db.update(schema.businessContacts)
-    .set({
-      verified: true,
-      verifiedBy: 'roman',
-      verifiedNote: String(formData.get('note') ?? '').trim() || null,
-    })
-    .where(eq(schema.businessContacts.id, contactId));
-
-  // Once a social profile is confirmed, the "we could not confirm one" gap is
-  // no longer true.
-  if (isSocialChannel(contact.channel)) {
-    await db.update(schema.productionGaps).set({ resolved: true }).where(and(
-      eq(schema.productionGaps.businessId, contact.businessId),
-      eq(schema.productionGaps.gap, 'socials_unresolved'),
-      eq(schema.productionGaps.resolved, false),
-    ));
-  }
 
   revalidatePath(`/businesses/${contact.businessId}`);
   revalidatePath('/businesses');

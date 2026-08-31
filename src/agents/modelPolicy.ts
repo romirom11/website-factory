@@ -26,7 +26,7 @@ export type AgentRuntimeId = 'claude-code' | 'codex' | 'opencode';
 /** The registry defaults belong to this runtime. */
 export const DEFAULT_RUNTIME_ID: 'claude-code' = 'claude-code';
 
-export type SettingSource = 'db' | 'env' | 'default';
+export type SettingSource = 'process' | 'db' | 'env' | 'default';
 
 export interface ModelInputs {
   /** Effective AGENT_MODEL, resolved db → env → ''. */

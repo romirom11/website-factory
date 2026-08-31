@@ -19,19 +19,20 @@
  */
 import { chromium, type Browser } from 'playwright';
 import path from 'node:path';
-import { copyFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { copyFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { getObject, putRaw } from '../lib/storage.js';
 import { serveDir } from '../lib/serveDir.js';
 import { config } from '../config.js';
 import { runAgent } from '../agents/agent.js';
-import { transition } from '../orchestrator/statuses.js';
-import { enqueue, NeedsHumanError, type JobPayload } from '../orchestrator/queue.js';
-import { buildSnapshot, type BuildSnapshot } from '../build/snapshot.js';
+import { createAgentInputWorkspace } from '../agents/transport.js';
+import { parkBuildForHumanReview } from '../orchestrator/buildReviewDecision.js';
+import { commitWorkflow, NeedsHumanError, type JobPayload } from '../orchestrator/queue.js';
+import { buildSnapshot, realPhotos, type BuildSnapshot } from '../build/snapshot.js';
 import { VisualCritiqueSchema, type QaIssue } from '../build/schemas.js';
+import { evaluateLayoutQuality } from '../build/layoutQuality.js';
 import {
   WOW_MAX, motionRefDir, renderWowGate, renderWowRubric, wowVerdict,
 } from '../build/motionRefs.js';
@@ -426,6 +427,13 @@ export async function deterministicChecks(
   const issues: QaIssue[] = [];
   const screenshots: Array<{ name: string; buf: Buffer }> = [];
   const metrics: Record<string, unknown> = {};
+  const evidencePhotos = realPhotos(snapshot);
+  const evidencePhotoFiles = [...new Set(evidencePhotos.flatMap((asset) => [
+    asset.file,
+    path.basename(asset.file),
+    asset.objectKey,
+    path.basename(asset.objectKey),
+  ]))];
 
   for (const vp of VIEWPORTS) {
     const ctx = await browser.newContext({ viewport: { width: vp.width, height: vp.height } });
@@ -504,7 +512,7 @@ export async function deterministicChecks(
     // content and the largest true gap was 85px, so "empty bands" was the wrong
     // metric. What was actually wrong is DENSITY — 52 content elements spread
     // over 4691px. Ink coverage per 1000px of page is the honest proxy.
-    const slop = await page.evaluate(() => {
+    const slop = await page.evaluate((realPhotoFiles) => {
       const vw = document.documentElement.clientWidth;
       const pageHeight = document.body.scrollHeight;
 
@@ -530,6 +538,7 @@ export async function deterministicChecks(
       let inkElements = 0;
       let textChars = 0;
       let mediaArea = 0;
+      let evidenceMediaArea = 0;
       for (const el of Array.from(document.querySelectorAll('body *')).slice(0, 8000)) {
         const r = el.getBoundingClientRect();
         if (r.width < 8 || r.height < 8) continue;
@@ -539,7 +548,16 @@ export async function deterministicChecks(
         const isMedia = ['IMG', 'VIDEO', 'CANVAS', 'SVG'].includes(el.tagName)
           || st.backgroundImage.includes('url(');
         if (isLeafText) { inkElements++; textChars += (el.textContent ?? '').trim().length; }
-        if (isMedia) { inkElements++; mediaArea += r.width * r.height; }
+        if (isMedia) {
+          inkElements++;
+          mediaArea += r.width * r.height;
+          let source = st.backgroundImage;
+          if (el instanceof HTMLImageElement) source += ` ${el.currentSrc} ${el.src}`;
+          if (el instanceof HTMLVideoElement) source += ` ${el.currentSrc} ${el.src} ${el.poster}`;
+          if (realPhotoFiles.some((file) => file.length > 0 && source.includes(file))) {
+            evidenceMediaArea += r.width * r.height;
+          }
+        }
       }
       const per1000 = pageHeight > 0 ? (inkElements / pageHeight) * 1000 : 0;
 
@@ -556,10 +574,11 @@ export async function deterministicChecks(
         inkElements,
         textChars,
         mediaAreaRatio: Number((mediaArea / Math.max(1, vw * pageHeight)).toFixed(3)),
+        evidenceMediaAreaRatio: Number((evidenceMediaArea / Math.max(1, vw * pageHeight)).toFixed(3)),
         inkPer1000px: Number(per1000.toFixed(1)),
         placeholders,
       };
-    });
+    }, evidencePhotoFiles);
 
     for (const c of slop.clipped) {
       issues.push({
@@ -572,17 +591,17 @@ export async function deterministicChecks(
       });
     }
 
-    // Calibration: the demo Roman rejected scored 11.1 ink elements and 0.06
-    // media-area per 1000px on desktop. Below 14 is measurably thinner than a
-    // page that has something to say; it is a prompt to add content or cut height,
-    // not an automatic failure, hence medium.
-    if (vp.name === 'desktop' && slop.inkPer1000px < 14) {
-      issues.push({
-        severity: 'medium', category: 'spacing-rhythm', viewport: vp.name,
-        issue: `Content density is thin: ${slop.inkElements} text/media elements over a ${slop.pageHeight}px page (${slop.inkPer1000px} per 1000px, ${slop.textChars} characters total). The page is mostly padding, which reads as unfinished rather than as confident whitespace.`,
-        fix: 'Either cut the page height (tighten section padding to a 3-step scale) or give the sparse sections real content from the snapshot. Whitespace should frame something.',
-      });
-    }
+    issues.push(...evaluateLayoutQuality({
+      viewport: vp.name,
+      hasRealPhotos: evidencePhotos.length > 0,
+      metrics: {
+        pageHeight: slop.pageHeight,
+        inkElements: slop.inkElements,
+        inkPer1000px: slop.inkPer1000px,
+        textChars: slop.textChars,
+        evidenceMediaAreaRatio: slop.evidenceMediaAreaRatio,
+      },
+    }));
     if (slop.placeholders.length) {
       issues.push({
         severity: 'high', category: 'content', viewport: vp.name,
@@ -593,6 +612,12 @@ export async function deterministicChecks(
     metrics[`${vp.name}.pageHeight`] = slop.pageHeight;
     metrics[`${vp.name}.inkPer1000px`] = slop.inkPer1000px;
     metrics[`${vp.name}.inkElements`] = slop.inkElements;
+    metrics[`${vp.name}.textChars`] = slop.textChars;
+    metrics[`${vp.name}.pageHeightPerTextChar`] = Number(
+      (slop.pageHeight / Math.max(1, slop.textChars)).toFixed(2),
+    );
+    metrics[`${vp.name}.mediaAreaRatio`] = slop.mediaAreaRatio;
+    metrics[`${vp.name}.evidenceMediaAreaRatio`] = slop.evidenceMediaAreaRatio;
     metrics[`${vp.name}.clippedText`] = slop.clipped.length;
 
     const brokenImages = await page.evaluate(() =>
@@ -758,7 +783,7 @@ export async function runVisualCritique(opts: {
   /** Project's live build log; the critic's own turns are traced into it too. */
   buildLogPath?: string;
 }): Promise<import('../build/schemas.js').VisualCritique> {
-  const shotDir = await mkdtemp(path.join(tmpdir(), 'factory-qa-'));
+  const shotDir = await createAgentInputWorkspace('factory-qa-');
   try {
     const imagePaths: string[] = [];
     const inventory: Array<{ image: string; what: string }> = [];
@@ -1166,7 +1191,7 @@ export async function visualQaHandler(payload: JobPayload): Promise<void> {
   );
 
   const reportKeys = [...(project.qaReportKeys ?? []), qaReportKey];
-  await db.update(schema.siteProjects).set({
+  const qaProjectPatch = {
     qaIterations: iteration + 1,
     qaReportKey,
     qaReportKeys: reportKeys,
@@ -1196,7 +1221,7 @@ export async function visualQaHandler(payload: JobPayload): Promise<void> {
           }
         : {}),
     },
-  }).where(eq(schema.siteProjects.id, projectId));
+  };
 
   log.info('QA pass complete', {
     businessId, iteration, total: issues.length, blocking: blocking.length,
@@ -1206,12 +1231,31 @@ export async function visualQaHandler(payload: JobPayload): Promise<void> {
   // ── verdict ───────────────────────────────────────────────────────────────
   if (blocking.length === 0) {
     await logStage(logPath, 'Перевірка пройдена — публікую демо', 'visual-qa');
-    await db.update(schema.siteProjects).set({ state: 'ready' })
-      .where(eq(schema.siteProjects.id, projectId));
-    await enqueue('deploy-demo', {
-      businessId, projectId, campaignId: payload.campaignId,
-      idempotencyKey: `deploy-demo:${businessId}:${projectId}`,
+    let handedOff = false;
+    await commitWorkflow(async (tx) => {
+      const [updated] = await tx.update(schema.siteProjects)
+        .set({ ...qaProjectPatch, state: 'ready' })
+        .where(and(
+          eq(schema.siteProjects.id, projectId),
+          eq(schema.siteProjects.state, 'qa'),
+          eq(schema.siteProjects.qaIterations, iteration),
+        ))
+        .returning({ id: schema.siteProjects.id });
+      if (!updated) return [];
+      handedOff = true;
+      return [{
+        name: 'deploy-demo',
+        payload: {
+          businessId,
+          projectId,
+          campaignId: payload.campaignId,
+          idempotencyKey: `deploy-demo:${businessId}:${projectId}`,
+        },
+      }];
     });
+    if (!handedOff) {
+      log.info('stale visual QA pass ignored: project already advanced', { businessId, projectId });
+    }
     return;
   }
 
@@ -1226,10 +1270,19 @@ export async function visualQaHandler(payload: JobPayload): Promise<void> {
       `Ліміт ${iterationCap} ітерацій вичерпано, ${blocking.length} проблем лишилось — чекає на Романа`,
       'visual-qa',
     );
-    await db.update(schema.siteProjects).set({ state: 'needs_human_review' })
-      .where(eq(schema.siteProjects.id, projectId));
-    await transition(businessId, 'needs_review', 'visual-qa',
-      `QA limit (${iterationCap}) reached with ${blocking.length} open issues`);
+    const parked = await parkBuildForHumanReview({
+      projectId,
+      businessId,
+      reason: `QA limit (${iterationCap}) reached with ${blocking.length} open issues`,
+      projectPatch: qaProjectPatch,
+    });
+    if (!parked) {
+      log.info('stale visual QA verdict ignored: project or business already advanced', {
+        businessId,
+        projectId,
+      });
+      return;
+    }
     // Decision #9: every Telegram push links into the control UI; Telegram has
     // no controls of its own.
     await notifyTelegram(
@@ -1253,13 +1306,34 @@ export async function visualQaHandler(payload: JobPayload): Promise<void> {
     'visual-qa',
   );
   await writeQaIssues(dir, renderQaIssues(issues, iteration + 1, snapshot));
-  await enqueue('build-site', {
-    businessId, projectId, campaignId: payload.campaignId,
-    iteration: iteration + 1,
-    issues: issues.map((i) => `[${i.severity}/${i.category}] ${i.issue} → ${i.fix}`),
-    idempotencyKey: `build-site:${businessId}:${projectId}:${iteration + 1}`,
+  let handedOff = false;
+  await commitWorkflow(async (tx) => {
+    const [updated] = await tx.update(schema.siteProjects)
+      .set(qaProjectPatch)
+      .where(and(
+        eq(schema.siteProjects.id, projectId),
+        eq(schema.siteProjects.state, 'qa'),
+        eq(schema.siteProjects.qaIterations, iteration),
+      ))
+      .returning({ id: schema.siteProjects.id });
+    if (!updated) return [];
+    handedOff = true;
+    return [{
+      name: 'build-site',
+      payload: {
+        businessId,
+        projectId,
+        campaignId: payload.campaignId,
+        iteration: iteration + 1,
+        issues: issues.map((issue) => `[${issue.severity}/${issue.category}] ${issue.issue} → ${issue.fix}`),
+        idempotencyKey: `build-site:${businessId}:${projectId}:${iteration + 1}`,
+      },
+    }];
   });
-  log.info('QA issues fed back to builder', { businessId, iteration: iteration + 1, issues: blocking.length });
+  log.info(
+    handedOff ? 'QA issues fed back to builder' : 'stale visual QA result ignored',
+    { businessId, iteration: iteration + 1, issues: blocking.length },
+  );
 }
 
 /** Public alias for tooling; the loop above uses the local name. */

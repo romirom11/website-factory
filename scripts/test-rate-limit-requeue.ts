@@ -1,73 +1,124 @@
 /**
- * Integration test for the subscription-limit path (spec §2.3б) against the
- * REAL Postgres + pg-boss: a handler throwing RateLimitedError must park the
- * job in `retry_wait` with next_attempt_at, keep the same idempotency key,
- * NOT count an attempt, and never reach `failed`.
- *
- *   pnpm tsx scripts/test-rate-limit-requeue.ts
+ * Real PostgreSQL + pg-boss proof for subscription-limit continuation.
+ * A continuation is a new physical attempt inside the same logical run and is
+ * created exactly once even when two recovery paths race.
  */
-import { and, eq, desc } from 'drizzle-orm';
-import { db, schema } from '../src/db/client.js';
-import { enqueue, register, getBoss, type JobName } from '../src/orchestrator/queue.js';
-import { RateLimitedError } from '../src/agents/types.js';
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { asc, eq } from 'drizzle-orm';
+import * as schema from '../src/db/schema.js';
+import { WorkflowRunStore } from '../src/orchestrator/workflowRunStore.js';
+import { withDisposableFactoryDatabase } from './lib/disposableFactoryDatabase.js';
 
-const KEY = `ratelimit-test:${Date.now()}`;
-// A dedicated queue name: registering a REAL job type here would race with the
-// production worker (and with jobs left over from earlier runs), which silently
-// invalidates the test. Cast is safe — pg-boss treats the name as a plain string.
-const JOB = `ratelimit-probe-${Date.now()}` as JobName;
-let failures = 0;
-const check = (label: string, cond: boolean, detail?: unknown) => {
-  if (cond) console.log(`✅ ${label}`);
-  else { failures++; console.error(`❌ ${label}`, detail ?? ''); }
-};
+let passed = 0;
 
-async function main(): Promise<void> {
-  let calls = 0;
-  // Throw a rate limit on the first call only.
-  await register(JOB, async () => {
-    calls++;
-    if (calls === 1) {
-      throw new RateLimitedError('5-hour window exhausted', {
-        retryAfterMs: 60_000, rateLimitType: 'five_hour',
-        resetsAt: new Date(Date.now() + 60_000),
-        runtime: 'codex',
-      });
-    }
-  });
-
-  await enqueue(JOB, { businessId: 'ratelimit-probe', idempotencyKey: KEY });
-
-  // wait for the handler to run and the row to be updated
-  const deadline = Date.now() + 60_000;
-  let parked: typeof schema.workflowJobs.$inferSelect | undefined;
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 1000));
-    const rows = await db.select().from(schema.workflowJobs)
-      .where(and(eq(schema.workflowJobs.idempotencyKey, KEY), eq(schema.workflowJobs.status, 'retry_wait')));
-    if (rows.length) { parked = rows[0]; break; }
-  }
-
-  check('handler was invoked', calls >= 1, { calls });
-  check('job parked in retry_wait', Boolean(parked), parked?.status);
-  check('errorCode = RATE_LIMITED', parked?.errorCode === 'RATE_LIMITED', parked?.errorCode);
-  check('next_attempt_at set in the future', Boolean(parked?.nextAttemptAt && parked.nextAttemptAt > new Date()), parked?.nextAttemptAt);
-  check('attempts NOT counted against the limit', parked?.attempts === 0, parked?.attempts);
-
-  const all = await db.select().from(schema.workflowJobs)
-    .where(eq(schema.workflowJobs.idempotencyKey, KEY)).orderBy(desc(schema.workflowJobs.id));
-  check('re-enqueued under the SAME idempotency key', all.length === 2, all.map((r) => r.status));
-  check('both rows share one idempotency key', new Set(all.map((r) => r.idempotencyKey)).size === 1);
-  check('never marked failed', !all.some((r) => r.status === 'failed'), all.map((r) => r.status));
-  check('re-enqueued row is queued', all[0]?.status === 'queued', all[0]?.status);
-
-  // cleanup
-  await db.delete(schema.workflowJobs).where(eq(schema.workflowJobs.idempotencyKey, KEY));
-  const boss = await getBoss();
-  await boss.stop({ graceful: false });
-
-  console.log(failures === 0 ? '\n🧪 RATE-LIMIT REQUEUE TEST PASSED' : `\n${failures} FAILURE(S)`);
-  process.exit(failures === 0 ? 0 : 1);
+async function check(label: string, fn: () => void | Promise<void>): Promise<void> {
+  await fn();
+  passed++;
+  console.log(`✅ ${label}`);
 }
 
-main().catch((err) => { console.error('TEST ERROR:', err); process.exit(1); });
+await withDisposableFactoryDatabase(async ({ pool, db, boss }) => {
+  const store = new WorkflowRunStore(pool, boss);
+  const key = `rate-limit:${randomUUID()}`;
+  const first = await store.enqueue({
+    name: 'build-site',
+    payload: {
+      businessId: `e2e-${randomUUID()}`,
+      projectId: 1,
+      idempotencyKey: key,
+    },
+  });
+  assert.equal(first.kind, 'accepted');
+
+  await db.update(schema.workflowJobs)
+    .set({ status: 'running', attempts: 1, startedAt: new Date() })
+    .where(eq(schema.workflowJobs.id, first.attemptId));
+  await db.update(schema.workflowJobRuns)
+    .set({ status: 'running', updatedAt: new Date() })
+    .where(eq(schema.workflowJobRuns.id, first.runId));
+
+  const nextAttemptAt = new Date(Date.now() + 60_000);
+  const continuationInput = {
+    bossJobId: first.bossJobId,
+    retryAfterMs: 60_000,
+    nextAttemptAt,
+    errorDetail: `subscription limit (five_hour); resumes ${nextAttemptAt.toISOString()}`,
+  };
+
+  const results = await Promise.all([
+    store.continueAfterRateLimit(continuationInput),
+    store.continueAfterRateLimit(continuationInput),
+  ]);
+
+  await check('racing continuations schedule one successor', () => {
+    assert.equal(results.filter((result) => result.kind === 'scheduled').length, 1);
+    assert.equal(results.filter((result) => result.kind === 'existing').length, 1);
+    assert.equal(new Set(results.map((result) => result.kind === 'legacy' ? null : result.bossJobId)).size, 1);
+  });
+
+  const [run] = await db.select().from(schema.workflowJobRuns)
+    .where(eq(schema.workflowJobRuns.id, first.runId));
+  const attempts = await db.select().from(schema.workflowJobs)
+    .where(eq(schema.workflowJobs.runId, first.runId))
+    .orderBy(asc(schema.workflowJobs.attemptSequence));
+
+  await check('continuation stays on the same logical run', () => {
+    assert.equal(run?.id, first.runId);
+    assert.equal(run?.status, 'retry_wait');
+    assert.equal(run?.currentAttemptSequence, 2);
+    assert.equal(attempts.length, 2);
+    assert.deepEqual(attempts.map((attempt) => attempt.attemptSequence), [1, 2]);
+    assert.equal(new Set(attempts.map((attempt) => attempt.idempotencyKey)).size, 1);
+  });
+
+  await check('rate limit does not consume a failure attempt', () => {
+    assert.equal(attempts[0]?.status, 'retry_wait');
+    assert.equal(attempts[0]?.attempts, 0);
+    assert.equal(attempts[0]?.errorCode, 'RATE_LIMITED');
+    assert.equal(attempts[1]?.status, 'queued');
+    assert.equal(attempts[1]?.attempts, 0);
+    assert.equal(attempts[1]?.nextAttemptAt?.getTime(), nextAttemptAt.getTime());
+    assert.equal(attempts.some((attempt) => attempt.status === 'failed'), false);
+  });
+
+  await check('application and pg-boss ledgers contain the same two attempts', async () => {
+    const ids = attempts.map((attempt) => attempt.bossJobId);
+    const result = await pool.query<{ id: string }>(
+      `select id::text from pgboss.job where id = any($1::uuid[]) order by id`,
+      [ids],
+    );
+    assert.equal(result.rows.length, 2);
+  });
+
+  await check('a late rate-limit result cannot create work for a cancelled run', async () => {
+    const staleKey = `stale-rate-limit:${randomUUID()}`;
+    const stale = await store.enqueue({
+      name: 'build-site',
+      payload: {
+        businessId: `e2e-${randomUUID()}`,
+        projectId: 2,
+        idempotencyKey: staleKey,
+      },
+    });
+    assert.equal(stale.kind, 'accepted');
+    await db.update(schema.workflowJobs)
+      .set({ status: 'cancelled', finishedAt: new Date() })
+      .where(eq(schema.workflowJobs.id, stale.attemptId));
+    await db.update(schema.workflowJobRuns)
+      .set({ status: 'cancelled', finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(schema.workflowJobRuns.id, stale.runId));
+    const before = await db.select().from(schema.workflowJobs)
+      .where(eq(schema.workflowJobs.runId, stale.runId));
+    const result = await store.continueAfterRateLimit({
+      ...continuationInput,
+      bossJobId: stale.bossJobId,
+    });
+    const after = await db.select().from(schema.workflowJobs)
+      .where(eq(schema.workflowJobs.runId, stale.runId));
+    assert.equal(result.kind, 'stale');
+    assert.equal(after.length, before.length);
+  });
+
+  console.log(`\n🧪 RATE-LIMIT REQUEUE TEST PASSED (${passed})`);
+});

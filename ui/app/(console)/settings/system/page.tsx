@@ -1,15 +1,10 @@
 import Link from 'next/link';
-import { desc, eq, inArray, sql, type SQL, and } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, sql, type SQL } from 'drizzle-orm';
 import { db, schema } from '@/lib/db';
-import { Status } from '@/components/Status';
 import { SystemStatusPanel } from '@/components/SystemStatusPanel';
 import { EffectiveConfigPanel } from '@/components/EffectiveConfigPanel';
 import { loadSystemStatus } from '@/lib/systemStatus';
-import { fmtDate, fmtTime, truncate } from '@/lib/format';
-import { humanJobLine, humanJobStatus } from '@/lib/humanStatus';
-import { stageName } from '@/lib/stageNames';
-import { ActionForm } from '@/components/ActionForm';
-import { retryJob } from '@/lib/actions';
+import { JobRunList, type JobRunView } from '@/components/JobRunList';
 
 export const dynamic = 'force-dynamic';
 
@@ -52,32 +47,69 @@ export default async function SystemPage({
 }: { searchParams: Promise<{ status?: string; type?: string }> }) {
   const { status, type } = await searchParams;
 
-  const [status_, counts] = await Promise.all([
+  const runWhere: SQL[] = [];
+  const legacyWhere: SQL[] = [isNull(schema.workflowJobs.runId)];
+  if (status) {
+    runWhere.push(eq(schema.workflowJobRuns.status, status));
+    legacyWhere.push(eq(schema.workflowJobs.status, status));
+  }
+  if (type) {
+    runWhere.push(eq(schema.workflowJobRuns.jobType, type));
+    legacyWhere.push(eq(schema.workflowJobs.jobType, type));
+  }
+
+  // Read a little more from both ledgers, merge by time, then enforce one page
+  // cap. During the additive rollout old terminal rows have no run_id and stay
+  // visible beside native logical runs until retention removes them.
+  const PAGE = 40;
+  const [status_, counts, runRows, legacyRows] = await Promise.all([
     loadSystemStatus(),
-    db.execute(sql`select status, count(*)::int as n from workflow_jobs group by status`),
+    db.execute(sql`
+      select coalesce(r.status, w.status) as status, count(*)::int as n
+      from workflow_jobs w
+      left join workflow_job_runs r on r.id = w.run_id
+      where w.run_id is null or w.attempt_sequence = r.current_attempt_sequence
+      group by coalesce(r.status, w.status)
+    `),
+    db.select().from(schema.workflowJobRuns)
+      .where(runWhere.length ? and(...runWhere) : undefined)
+      .orderBy(desc(schema.workflowJobRuns.createdAt))
+      .limit(PAGE),
+    db.select().from(schema.workflowJobs)
+      .where(and(...legacyWhere))
+      .orderBy(desc(schema.workflowJobs.createdAt))
+      .limit(PAGE),
   ]);
   const byStatus = new Map(
     (counts.rows as Array<{ status: string; n: number }>).map((r) => [r.status, r.n]),
   );
 
-  const where: SQL[] = [];
-  if (status) where.push(eq(schema.workflowJobs.status, status));
-  if (type) where.push(eq(schema.workflowJobs.jobType, type));
+  const runIds = runRows.map((run) => run.id);
+  const attempts = runIds.length
+    ? await db.select().from(schema.workflowJobs)
+      .where(inArray(schema.workflowJobs.runId, runIds))
+      .orderBy(asc(schema.workflowJobs.attemptSequence))
+    : [];
+  const attemptsByRun = new Map<string, typeof attempts>();
+  for (const attempt of attempts) {
+    if (!attempt.runId) continue;
+    const rows = attemptsByRun.get(attempt.runId) ?? [];
+    rows.push(attempt);
+    attemptsByRun.set(attempt.runId, rows);
+  }
 
-  // 40, not 200: at 200 this page is a 40,000px scroll of mostly-succeeded rows
-  // that nobody reads to the end. The filters above are how you find an older
-  // one; the list itself is "what happened lately".
-  const PAGE = 40;
-  const jobs = await db.select().from(schema.workflowJobs)
-    .where(where.length ? and(...where) : undefined)
-    .orderBy(desc(schema.workflowJobs.createdAt))
-    .limit(PAGE);
+  const selected = [
+    ...runRows.map((run) => ({ kind: 'run' as const, createdAt: run.createdAt, run })),
+    ...legacyRows.map((attempt) => ({ kind: 'legacy' as const, createdAt: attempt.createdAt, attempt })),
+  ].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).slice(0, PAGE);
 
   // The job list identified businesses by raw id (`gr-patras-abige-hair-nail`),
   // which is the one page-level place the console still asked Roman to read a
   // slug instead of a name (sweep P2-3). One lookup over the ids actually on
   // this page — not a join, because the page is capped at 40 rows anyway.
-  const jobBusinessIds = [...new Set(jobs.map((j) => j.businessId).filter((x): x is string => Boolean(x)))];
+  const jobBusinessIds = [...new Set(selected
+    .map((item) => item.kind === 'run' ? item.run.businessId : item.attempt.businessId)
+    .filter((id): id is string => Boolean(id)))];
   const jobBusinessNames = new Map<string, string>(
     jobBusinessIds.length
       ? (await db.select({ id: schema.businesses.id, name: schema.businesses.name })
@@ -86,6 +118,64 @@ export default async function SystemPage({
         .map((b) => [b.id, b.name])
       : [],
   );
+
+  const jobs: JobRunView[] = selected.map((item) => {
+    if (item.kind === 'legacy') {
+      const attempt = item.attempt;
+      return {
+        key: `legacy-${attempt.id}`,
+        runId: null,
+        jobType: attempt.jobType,
+        businessId: attempt.businessId,
+        businessName: attempt.businessId ? jobBusinessNames.get(attempt.businessId) ?? null : null,
+        campaignId: attempt.campaignId,
+        status: attempt.status,
+        currentAttemptSequence: null,
+        duplicateSuppressions: 0,
+        lastDuplicateAt: null,
+        createdAt: attempt.createdAt,
+        attempts: [{
+          id: attempt.id,
+          sequence: null,
+          status: attempt.status,
+          attempts: attempt.attempts,
+          nextAttemptAt: attempt.nextAttemptAt,
+          errorCode: attempt.errorCode,
+          errorDetail: attempt.errorDetail,
+          startedAt: attempt.startedAt,
+          finishedAt: attempt.finishedAt,
+          createdAt: attempt.createdAt,
+        }],
+      };
+    }
+
+    const run = item.run;
+    return {
+      key: run.id,
+      runId: run.id,
+      jobType: run.jobType,
+      businessId: run.businessId,
+      businessName: run.businessId ? jobBusinessNames.get(run.businessId) ?? null : null,
+      campaignId: run.campaignId,
+      status: run.status,
+      currentAttemptSequence: run.currentAttemptSequence,
+      duplicateSuppressions: run.duplicateSuppressions,
+      lastDuplicateAt: run.lastDuplicateAt,
+      createdAt: run.createdAt,
+      attempts: (attemptsByRun.get(run.id) ?? []).map((attempt) => ({
+        id: attempt.id,
+        sequence: attempt.attemptSequence,
+        status: attempt.status,
+        attempts: attempt.attempts,
+        nextAttemptAt: attempt.nextAttemptAt,
+        errorCode: attempt.errorCode,
+        errorDetail: attempt.errorDetail,
+        startedAt: attempt.startedAt,
+        finishedAt: attempt.finishedAt,
+        createdAt: attempt.createdAt,
+      })),
+    };
+  });
 
   return (
     <div>
@@ -122,53 +212,7 @@ export default async function SystemPage({
             })}
           </div>
 
-          <ul>
-            {jobs.map((j) => {
-              const human = humanJobStatus(j.status);
-              return (
-                <li key={j.id} className="row grid-cols-[minmax(0,1fr)_auto]">
-                  <div className="min-w-0">
-                    <span className="text-sm font-medium first-letter:uppercase">{stageName(j.jobType)}</span>
-                    <div className="mt-0.5">
-                      <Status tone={human.tone} title={j.status}>
-                        {humanJobLine(j.status, fmtTime(j.nextAttemptAt))}
-                      </Status>
-                    </div>
-                    <div className="text-sm text-ink-mute mt-0.5 truncate">
-                      {j.businessId ? (
-                        <Link href={`/businesses/${j.businessId}`} title={j.businessId} className="link">
-                          {jobBusinessNames.get(j.businessId) ?? j.businessId}
-                        </Link>
-                      ) : (
-                        <span className="font-mono">{j.campaignId ?? '—'}</span>
-                      )}
-                      {' · '}{fmtDate(j.createdAt)}
-                      {j.attempts > 1 && <> · спроб {j.attempts}</>}
-                    </div>
-                    {j.errorCode && (
-                      <details className="mt-1">
-                        <summary className="disclosure text-dot-stop hover:text-dot-stop">
-                          {j.errorCode}
-                        </summary>
-                        <pre className="text-sm text-ink-mute mt-1 whitespace-pre-wrap font-mono">
-                          {truncate(j.errorDetail, 600)}
-                        </pre>
-                      </details>
-                    )}
-                  </div>
-                  {['failed', 'needs_human'].includes(j.status) && (
-                    <ActionForm action={retryJob}>
-                      <input type="hidden" name="jobId" value={j.id} />
-                      <button type="submit" className="btn-outline btn-sm">Повторити</button>
-                    </ActionForm>
-                  )}
-                </li>
-              );
-            })}
-            {jobs.length === 0 && (
-              <li className="px-5 py-10 text-center text-ink-mute">Немає кроків за цим фільтром.</li>
-            )}
-          </ul>
+          <JobRunList runs={jobs} />
 
           {jobs.length === PAGE && (
             <p className="px-5 py-3 text-sm text-ink-mute border-t border-line">

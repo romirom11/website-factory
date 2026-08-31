@@ -87,7 +87,7 @@ async function main(): Promise<void> {
     }
   }
 
-  // ── 3. Hero clip in mock mode ──────────────────────────────────────────────
+  // Hero clip through the local deterministic renderer.
   heading('2. generateHeroClip — ffmpeg Ken Burns');
   const samplePhoto = await makeSampleImage();
   console.log(`  input photo: ${samplePhoto}`);
@@ -98,7 +98,7 @@ async function main(): Promise<void> {
       prompt: 'slow cinematic push-in, warm natural light',
       durationSec: 4,
       outDir: OUT_DIR,
-      fileName: 'verify-hero-mock',
+      fileName: 'verify-hero-ken-burns',
     });
     if (clip) {
       console.log(`  ok         : ${clip.filePath}`);

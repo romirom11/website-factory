@@ -5,13 +5,14 @@
  *
  * Every one of these is a thin proxy to the factory's `/internal/accounts/*`
  * endpoints, for the same reason the checks are (see `settingsActions.ts`): the
- * factory container is the one holding the `claude` and `codex` CLIs and the
- * credentials that will actually be used. Brokering a login from the UI
- * container would authenticate the wrong process.
+ * factory API routes the flow to the runtime owner: the isolated runner
+ * executor in production, or the factory process in explicit local-development
+ * mode. Brokering a login from the UI container would authenticate the wrong
+ * filesystem.
  *
  * No secret ever comes back through here. A finished Claude flow returns
- * "connected", never the token — that went straight into the encrypted settings
- * store on the factory side.
+ * "connected", never the token — that went straight into the runtime-owned
+ * credential volume.
  */
 import { revalidatePath } from 'next/cache';
 import { effectiveValue, saveSetting } from './settings';

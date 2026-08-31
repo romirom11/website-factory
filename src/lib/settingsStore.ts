@@ -88,12 +88,27 @@ export async function writeSetting(
 let cache = new Map<string, string>();
 let timer: NodeJS.Timeout | null = null;
 let inFlight: Promise<void> | null = null;
+const snapshotListeners = new Set<() => void>();
+
+/** Subscribe to successful live snapshot refreshes without exposing secret values. */
+export function subscribeSettingsChanges(listener: () => void): () => void {
+  snapshotListeners.add(listener);
+  return () => snapshotListeners.delete(listener);
+}
 
 /** Kick a background re-read; failures keep the previous snapshot. */
 function refresh(): Promise<void> {
   if (inFlight) return inFlight;
   inFlight = loadSettingsFromDb()
-    .then((values) => { cache = values; primeSettings(values); })
+    .then((values) => {
+      cache = values;
+      primeSettings(values);
+      for (const listener of snapshotListeners) {
+        try { listener(); } catch (err) {
+          log.warn('settings listener failed', { err: String(err).slice(0, 200) });
+        }
+      }
+    })
     .catch((err) => {
       log.warn('settings refresh failed, keeping last snapshot', { err: String(err).slice(0, 200) });
       // Re-prime the old snapshot so its timestamp advances and we do not
@@ -147,6 +162,12 @@ export async function writeHeartbeat(group: string, detail?: Record<string, unkn
     .values({ key, value, encrypted: false, updatedAt: new Date(), updatedBy: 'worker' })
     .onConflictDoUpdate({ target: schema.settings.key, set: { value, updatedAt: new Date(), updatedBy: 'worker' } })
     .catch(() => { /* a heartbeat must never break a worker */ });
+}
+
+/** Remove a heartbeat that belonged to a retired worker topology. */
+export async function retireHeartbeat(group: string): Promise<void> {
+  if (!/^[a-z0-9,-]+$/i.test(group)) throw new Error(`invalid heartbeat group: ${group}`);
+  await db.delete(schema.settings).where(eq(schema.settings.key, `${HEARTBEAT_PREFIX}${group}`));
 }
 
 /** Start stamping a heartbeat for this process's worker group. */

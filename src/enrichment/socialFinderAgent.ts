@@ -33,9 +33,9 @@
  * profile capture, it cannot invent a contact.
  */
 import path from 'node:path';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { rm, writeFile } from 'node:fs/promises';
 import { runCodeAgent, z } from '../agents/codeAgent.js';
+import { createAgentInputWorkspace } from '../agents/transport.js';
 import { isRateLimitedError } from '../agents/types.js';
 import { log } from '../lib/logger.js';
 import { config } from '../config.js';
@@ -227,7 +227,7 @@ export async function findSocialCandidates(
     return { candidates, notes: [...opts.resultOverride.notes, ...notes], raw: opts.resultOverride };
   }
 
-  const dir = await mkdtemp(path.join(tmpdir(), 'factory-social-'));
+  const dir = await createAgentInputWorkspace('factory-social-');
   try {
     await writeFile(path.join(dir, 'BRIEF.md'), renderFinderBrief(biz, opts.knownProfiles ?? []));
 
@@ -256,9 +256,8 @@ export async function findSocialCandidates(
         // agent silently has no way to search at all (verified empirically).
         allowedTools: ['ToolSearch', 'WebSearch', 'Read', 'Write'],
         // Headless even when builds run in tmux: a few minutes of searching in a
-        // scratch dir is nothing anyone would attach to, and this runs in the
-        // `factory` process, which does not own the terminal port that
-        // `factory-build` serves.
+        // scratch dir is nothing anyone would attach to. The runner reserves
+        // its single web-terminal slot for attachable build sessions.
         terminal: false,
         onUsage: (u) => log.info('agent usage', { businessId: biz.id, call: 'social-finder', ...u }),
       }, SocialFinderResultSchema);

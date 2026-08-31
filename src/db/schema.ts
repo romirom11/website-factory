@@ -1,6 +1,6 @@
-import { desc } from 'drizzle-orm';
+import { desc, sql } from 'drizzle-orm';
 import {
-  pgTable, text, integer, real, boolean, timestamp, jsonb, serial, uniqueIndex, index,
+  pgTable, text, integer, real, boolean, timestamp, jsonb, serial, uuid, uniqueIndex, index,
 } from 'drizzle-orm/pg-core';
 
 // ─── Campaigns ────────────────────────────────────────────────────────────────
@@ -255,7 +255,7 @@ export const siteProjects = pgTable('site_projects', {
   /** Unguessable path segment under deploys/; kept so a redeploy reuses the URL. */
   deployToken: text('deploy_token'),
   deployedAt: timestamp('deployed_at'),
-  state: text('state').notNull().default('pending'), // pending | brief | building | qa | needs_human_review | ready | deployed
+  state: text('state').notNull().default('pending'), // pending | brief | building | qa | needs_human_review | ready | deployed | failed | cancelled
   createdAt: timestamp('created_at').notNull().defaultNow(),
 }, (t) => [index('site_project_biz_idx').on(t.businessId)]);
 
@@ -283,18 +283,27 @@ export const outreachMessages = pgTable('outreach_messages', {
   idempotencyKey: text('idempotency_key').notNull(),
   providerMessageId: text('provider_message_id'),
   kind: text('kind').notNull().default('initial'), // initial | followup_1 | followup_2
-  state: text('state').notNull().default('queued'), // queued | sent | delivered | failed | simulated | manual_pending
+  state: text('state').notNull().default('queued'), // queued | sent | delivered | failed | delivery_unknown | simulated | manual_pending
   sentAt: timestamp('sent_at'),
-}, (t) => [uniqueIndex('outreach_idem_idx').on(t.idempotencyKey), index('outreach_biz_idx').on(t.businessId)]);
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex('outreach_idem_idx').on(t.idempotencyKey),
+  index('outreach_biz_idx').on(t.businessId),
+  index('outreach_budget_sent_idx').on(t.sentAt)
+    .where(sql`${t.channel} in ('email', 'whatsapp') and ${t.state} in ('sent', 'delivered', 'simulated', 'delivery_unknown')`),
+  index('outreach_budget_queued_idx').on(t.createdAt)
+    .where(sql`${t.channel} in ('email', 'whatsapp') and ${t.state} = 'queued'`),
+]);
 
 export const outreachEvents = pgTable('outreach_events', {
   id: serial('id').primaryKey(),
   businessId: text('business_id').notNull().references(() => businesses.id),
   messageId: integer('message_id').references(() => outreachMessages.id),
-  event: text('event').notNull(), // sent | delivered | bounced | replied | opted_out
+  idempotencyKey: text('idempotency_key'),
+  event: text('event').notNull(), // sent | delivered | bounced | replied | opted_out | failed | delivery_unknown
   detail: jsonb('detail'),
   at: timestamp('at').notNull().defaultNow(),
-});
+}, (t) => [uniqueIndex('outreach_event_idem_idx').on(t.idempotencyKey)]);
 
 export const deals = pgTable('deals', {
   id: serial('id').primaryKey(),
@@ -313,9 +322,39 @@ export const doNotContact = pgTable('do_not_contact', {
   value: text('value').notNull(),
   reason: text('reason'),
   at: timestamp('at').notNull().defaultNow(),
-}, (t) => [uniqueIndex('dnc_idx').on(t.matchType, t.value)]);
+}, (t) => [
+  uniqueIndex('dnc_idx').on(t.matchType, t.value),
+  index('dnc_email_normalized_idx').on(sql`lower(trim(${t.value}))`)
+    .where(sql`${t.matchType} = 'email'`),
+  index('dnc_phone_normalized_idx').on(sql`regexp_replace(${t.value}, '[^0-9]', '', 'g')`)
+    .where(sql`${t.matchType} = 'phone'`),
+]);
 
-// ─── Jobs (mirror of pg-boss for reporting; pg-boss keeps its own schema) ────
+// ─── Jobs: logical commands + physical pg-boss attempts ─────────────────────
+
+export const workflowJobRuns = pgTable('workflow_job_runs', {
+  id: uuid('id').primaryKey(),
+  jobType: text('job_type').notNull(),
+  idempotencyKey: text('idempotency_key').notNull(),
+  businessId: text('business_id'),
+  campaignId: text('campaign_id'),
+  // queued | running | retry_wait | succeeded | failed | needs_human | cancelled
+  status: text('status').notNull().default('queued'),
+  currentAttemptSequence: integer('current_attempt_sequence').notNull().default(1),
+  /** Number of enqueue commands intentionally collapsed into this active run. */
+  duplicateSuppressions: integer('duplicate_suppressions').notNull().default(0),
+  /** Lets the operator distinguish an old run from current duplicate traffic. */
+  lastDuplicateAt: timestamp('last_duplicate_at'),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+  updatedAt: timestamp('updated_at').notNull().defaultNow(),
+  finishedAt: timestamp('finished_at'),
+}, (t) => [
+  uniqueIndex('workflow_runs_active_idem_idx')
+    .on(t.jobType, t.idempotencyKey)
+    .where(sql`${t.status} in ('queued', 'running', 'retry_wait')`),
+  index('workflow_runs_status_idx').on(t.status),
+  index('workflow_runs_business_idx').on(t.businessId),
+]);
 
 export const workflowJobs = pgTable('workflow_jobs', {
   id: serial('id').primaryKey(),
@@ -324,6 +363,10 @@ export const workflowJobs = pgTable('workflow_jobs', {
   businessId: text('business_id'),
   campaignId: text('campaign_id'),
   idempotencyKey: text('idempotency_key'),
+  /** Nullable for rows created before workflow_job_runs was introduced. */
+  runId: uuid('run_id').references(() => workflowJobRuns.id),
+  /** Physical successor number within one logical run; nullable for legacy rows. */
+  attemptSequence: integer('attempt_sequence'),
   /** Full job payload as enqueued — so a UI retry re-runs the job VERBATIM
    * (projectId/iteration/issues survive), instead of a lossy reconstruction. */
   payload: jsonb('payload'),
@@ -337,7 +380,60 @@ export const workflowJobs = pgTable('workflow_jobs', {
   startedAt: timestamp('started_at'),
   finishedAt: timestamp('finished_at'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
-}, (t) => [index('job_biz_idx').on(t.businessId), index('job_status_idx').on(t.status)]);
+}, (t) => [
+  index('job_biz_idx').on(t.businessId),
+  index('job_status_idx').on(t.status),
+  index('job_run_idx').on(t.runId),
+  uniqueIndex('job_run_sequence_idx').on(t.runId, t.attemptSequence)
+    .where(sql`${t.runId} is not null`),
+]);
+
+/** Durable audit trail for one-time startup repairs of pre-run job rows. */
+export const workflowReconciliationEvents = pgTable('workflow_reconciliation_events', {
+  id: serial('id').primaryKey(),
+  eventType: text('event_type').notNull(),
+  jobType: text('job_type').notNull(),
+  idempotencyKey: text('idempotency_key'),
+  runId: uuid('run_id').references(() => workflowJobRuns.id),
+  attemptId: integer('attempt_id').references(() => workflowJobs.id),
+  bossJobId: text('boss_job_id'),
+  detail: jsonb('detail').$type<Record<string, unknown>>(),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+}, (t) => [
+  index('workflow_reconciliation_run_idx').on(t.runId),
+  index('workflow_reconciliation_created_idx').on(t.createdAt),
+]);
+
+// ─── Enrichment fan-out barrier ─────────────────────────────────────────────
+
+/**
+ * One evidence generation fans out into assets + website audit. Scoring may
+ * start only after both branches have durably succeeded for the current run.
+ */
+export const enrichmentRuns = pgTable('enrichment_runs', {
+  id: uuid('id').primaryKey(),
+  businessId: text('business_id').notNull().references(() => businesses.id),
+  campaignId: text('campaign_id').notNull().references(() => campaigns.id),
+  generation: integer('generation').notNull(),
+  // native | legacy (bounded compatibility for pre-0017 live branch jobs)
+  source: text('source').notNull().default('native'),
+  // running | score_enqueued | completed | blocked | superseded
+  status: text('status').notNull().default('running'),
+  // pending | succeeded | failed | blocked
+  assetsStatus: text('assets_status').notNull().default('pending'),
+  auditStatus: text('audit_status').notNull().default('pending'),
+  blockingReason: text('blocking_reason'),
+  scoreEnqueuedAt: timestamp('score_enqueued_at'),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+  updatedAt: timestamp('updated_at').notNull().defaultNow(),
+  completedAt: timestamp('completed_at'),
+}, (t) => [
+  uniqueIndex('enrichment_runs_business_generation_idx').on(t.businessId, t.generation),
+  uniqueIndex('enrichment_runs_current_business_idx')
+    .on(t.businessId)
+    .where(sql`${t.status} in ('running', 'score_enqueued')`),
+  index('enrichment_runs_status_idx').on(t.status),
+]);
 
 // ─── Settings (phase E) ──────────────────────────────────────────────────────
 

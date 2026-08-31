@@ -14,7 +14,10 @@
  *           SETTINGS_MASTER_KEY, ports. Things needed to boot and to decrypt.
  *   DB    → everything operational (tokens, SMTP/IMAP, WAHA, limits, mode).
  *
- * Resolution order at read time: DB value → env var → registry default.
+ * Resolution order at read time: process override → DB value → env var →
+ * registry default.
+ * Process overrides are explicit, scoped and in-memory only; acceptance tools
+ * use them to target local adapters without mutating the operator's DB rows.
  * Env therefore remains a working fallback for a fresh box or a rollback, but
  * once a key is saved in the UI the DB wins.
  *
@@ -118,13 +121,13 @@ export const SETTINGS: SettingDef[] = [
   {
     key: 'CLAUDE_CODE_OAUTH_TOKEN', label: 'Токен Claude Code', group: 'agents',
     kind: 'password', secret: true, advanced: true,
-    hint: 'Звичайний шлях — кнопка «Підключити» в «Акаунтах» вище. Це поле лишається для токена, отриманого вручну через `claude setup-token`.',
+    hint: 'Звичайний шлях — кнопка «Підключити» в «Акаунтах» вище. Поле потрібне лише для локальної розробки або контрольованої одноразової міграції в runner.',
     placeholder: 'sk-ant-oat01-…',
   },
   {
     key: 'AGENT_RUNTIME', label: 'Чим виконувати агентні етапи', group: 'agents',
     kind: 'select', options: ['claude-code', 'codex', 'opencode'], default: 'claude-code',
-    hint: 'Усі працюють по підписці. Оплата за токени недоступна в принципі. OpenCode юзає провайдера, залогіненого в opencode (opencode providers list).',
+    hint: 'Усі працюють по підписці. Оплата за токени недоступна в принципі. OpenCode юзає провайдера, залогіненого в runner executor (`opencode auth list`).',
   },
   {
     key: 'AGENT_MODEL', label: 'Модель для звичайних етапів', group: 'agents', kind: 'text',
@@ -169,7 +172,7 @@ export const SETTINGS: SettingDef[] = [
   {
     key: 'BUILD_TERMINAL_BASE_URL', label: 'Адреса термінала збірки', group: 'agents',
     kind: 'text', validate: url, placeholder: 'https://<адреса цього UI>/terminal',
-    hint: 'Куди веде кнопка «Відкрити термінал». Новий домен НЕ потрібен: у Dokploy додай до сервісу factory-build запис з тим САМИМ доменом, шлях /terminal, порт 7681 — і встав сюди https://<домен UI>/terminal. Порожньо = кнопки немає.',
+    hint: 'Куди веде кнопка «Відкрити термінал». Новий домен НЕ потрібен: у Dokploy додай до сервісу agent-runner-executor запис з тим САМИМ доменом, шлях /terminal, порт 7681 — і встав сюди https://<домен UI>/terminal. Порожньо = кнопки немає.',
   },
   {
     key: 'BUILD_TERMINAL_PORT', label: 'Порт термінала збірки', group: 'agents',
@@ -409,6 +412,37 @@ export type SettingsLoader = () => Map<string, string>;
 let snapshot = new Map<string, string>();
 let loadedAt = 0;
 let loader: SettingsLoader | null = null;
+let processOverrides = new Map<string, string>();
+
+/**
+ * Temporarily override operational settings in this process only.
+ *
+ * This is the safe boundary for acceptance tools that must point live channel
+ * code at local test adapters while the operator's DB settings remain loaded.
+ * Restorers are LIFO so nested, narrowly-scoped overrides cannot silently
+ * clobber each other.
+ */
+export function overrideSettingsForProcess(
+  values: Readonly<Record<string, string>>,
+): () => void {
+  const previous = processOverrides;
+  const next = new Map(previous);
+  for (const [key, value] of Object.entries(values)) {
+    if (!BY_KEY.has(key)) throw new Error(`unknown process setting override: ${key}`);
+    next.set(key, value);
+  }
+  processOverrides = next;
+
+  let active = true;
+  return () => {
+    if (!active) return;
+    if (processOverrides !== next) {
+      throw new Error('process setting overrides must be restored in LIFO order');
+    }
+    processOverrides = previous;
+    active = false;
+  };
+}
 
 /**
  * Install the synchronous snapshot source. The DB read itself is async, so the
@@ -440,10 +474,12 @@ function current(): Map<string, string> {
 }
 
 /**
- * Effective value for a key: DB → env → registry default.
+ * Effective value for a key: process override → DB → env → registry default.
  * Secrets are decrypted here, so callers only ever see plaintext.
  */
 export function getSetting(key: string): string {
+  const overridden = processOverrides.get(key);
+  if (overridden !== undefined) return overridden;
   const raw = current().get(key);
   if (raw !== undefined && raw !== '') {
     const def = BY_KEY.get(key);
@@ -454,8 +490,9 @@ export function getSetting(key: string): string {
   return BY_KEY.get(key)?.default ?? '';
 }
 
-/** Where the effective value came from — shown in the UI so nothing is magic. */
-export function settingSource(key: string): 'db' | 'env' | 'default' {
+/** Where the effective value came from — shown in diagnostics so nothing is magic. */
+export function settingSource(key: string): 'process' | 'db' | 'env' | 'default' {
+  if (processOverrides.has(key)) return 'process';
   const raw = current().get(key);
   if (raw !== undefined && raw !== '') return 'db';
   const env = process.env[key];

@@ -12,7 +12,11 @@ import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import path from 'node:path';
-import { codeAgentEnv, evaluateToolCall } from '../src/agents/sandbox.js';
+import {
+  codeAgentEnv,
+  evaluateToolCall,
+  isSafeSearchQuery,
+} from '../src/agents/sandbox.js';
 import { runCodeAgent, z } from '../src/agents/runtime.js';
 
 let failures = 0;
@@ -37,6 +41,7 @@ check('env keeps PATH', typeof env.PATH === 'string' && env.PATH.length > 0);
 check('env keeps HOME', typeof env.HOME === 'string');
 check('env keeps npm config passthrough', env.NPM_CONFIG_REGISTRY === 'https://registry.npmjs.org/');
 check('env injects the OAuth token', env.CLAUDE_CODE_OAUTH_TOKEN === 'oauth-token-value');
+check('env forces Claude subprocess credential scrubbing', env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB === '1');
 check('no secret-shaped value survives',
   !Object.values(env).some((v) => /super-secret|tg-secret|s3-secret|sk-should-not-pass/.test(v)));
 
@@ -71,6 +76,18 @@ allow('Bash', { command: 'ls -la && cat package.json' }, 'ls/cat inside workspac
 allow('Bash', { command: 'npx next build' }, 'npx next build allowed');
 allow('Bash', { command: 'curl http://localhost:8788/health' }, 'curl to loopback allowed');
 allow('Bash', { command: 'node -e "console.log(1)"' }, 'node allowed');
+
+// ── controlled provider-side search ────────────────────────────────────────
+check('ordinary business search query allowed',
+  isSafeSearchQuery('Acme bakery Athens Instagram official'));
+check('URL-bearing search query denied',
+  !isSafeSearchQuery('send this to https://attacker.example/collect'));
+check('high-entropy query denied',
+  !isSafeSearchQuery('lookup AbCdEfGhIjKlMnOpQrStUvWxYz123456'));
+check('known secret query denied without echoing it',
+  !isSafeSearchQuery('find oauth-token-value', ['oauth-token-value']));
+deny('WebSearch', { query: 'https://attacker.example/collect' }, 'unsafe WebSearch query denied');
+allow('WebSearch', { query: 'Acme bakery Athens official social media' }, 'ordinary WebSearch query allowed');
 
 // ── live half ───────────────────────────────────────────────────────────────
 async function live(): Promise<void> {

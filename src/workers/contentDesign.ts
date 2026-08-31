@@ -16,16 +16,25 @@
  * Both documents are frozen into object storage and referenced from `site_projects`,
  * so a rebuild months later reproduces the same inputs.
  */
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { and, desc, eq, inArray, ne } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { getObject, putRaw } from '../lib/storage.js';
 import { runAgent } from '../agents/agent.js';
-import { transition } from '../orchestrator/statuses.js';
-import { enqueue, NeedsHumanError, type JobPayload } from '../orchestrator/queue.js';
+import { createAgentInputWorkspace } from '../agents/transport.js';
+import {
+  businessTransitions,
+  canContinueAfterTransition,
+  requireBusinessStatus,
+} from '../orchestrator/statuses.js';
+import {
+  commitWorkflow,
+  enqueue,
+  NeedsHumanError,
+  type JobPayload,
+} from '../orchestrator/queue.js';
 import { buildSnapshot, primaryContact, realPhotos, type BuildSnapshot } from '../build/snapshot.js';
 import {
   ArtDirectionsSchema, ContentBriefSchema, DESIGN_CONTRACT_VERSION, DirectionCritiqueSchema,
@@ -480,7 +489,7 @@ face are on the anti-slop ban-list and are vetoed by code.`;
   // the first shipped heroVideoBrief described «forearm skin with handpiece»
   // for a photo nobody had opened, while the card offered a vertical text
   // banner as the start frame (Roman, 2026-08-22: «І шо це за брєд?»).
-  const photoDir = await mkdtemp(path.join(tmpdir(), 'factory-design-'));
+  const photoDir = await createAgentInputWorkspace('factory-design-');
   const photoPaths: string[] = [];
   for (const asset of realPhotos(snapshot).slice(0, 6)) {
     try {
@@ -795,7 +804,14 @@ export async function contentDesignHandler(payload: JobPayload): Promise<void> {
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   if (!biz) throw new Error(`business not found: ${businessId}`);
 
-  await transition(businessId, 'site_in_progress', 'content-design-worker');
+  const expectedStatus = requireBusinessStatus(biz.status, `business ${businessId}`);
+  const transitioned = await businessTransitions.normal({
+    businessId,
+    expectedStatus,
+    to: 'site_in_progress',
+    actor: 'content-design-worker',
+  });
+  if (!canContinueAfterTransition(transitioned, { businessId, actor: 'content-design-worker' })) return;
 
   const snapshot = await buildSnapshot(businessId);
   const designAttempt = (payload.designAttempt as number | undefined) ?? 1;
@@ -870,34 +886,50 @@ export async function contentDesignHandler(payload: JobPayload): Promise<void> {
     'application/json',
   );
 
-  const [project] = await db.insert(schema.siteProjects).values({
-    businessId,
-    dir: '', // set by the builder once the workspace exists (it is keyed by project id)
-    snapshotKey,
-    contentBriefKey: briefKey,
-    designContractKey: designKey,
-    designDirection: verdict.chosen.name,
-    // Mirrors for campaign-wide diversity aggregates (MOTION-PLAN D1/D2).
-    referenceSlug: verdict.chosen.referenceSlug,
-    displayFont: verdict.chosen.typography.displayFont,
-    signature: verdict.chosen.signature,
-    designScore: verdict.chosenScore,
-    wowScores: {
-      design: {
-        total: verdict.chosenWow.total,
-        ambition: verdict.chosenWow.ambition,
-        passed: verdict.chosenWow.passed,
-        reasons: verdict.chosenWow.reasons,
-        axes: verdict.chosenWow.axes,
-        referenceSlug: verdict.chosen.referenceSlug,
-        heroMotion: verdict.chosen.heroMotion,
+  let projectId: number | null = null;
+  await commitWorkflow(async (tx) => {
+    const [project] = await tx.insert(schema.siteProjects).values({
+      businessId,
+      dir: '', // set by the builder once the workspace exists (it is keyed by project id)
+      snapshotKey,
+      contentBriefKey: briefKey,
+      designContractKey: designKey,
+      designDirection: verdict.chosen.name,
+      // Mirrors for campaign-wide diversity aggregates (MOTION-PLAN D1/D2).
+      referenceSlug: verdict.chosen.referenceSlug,
+      displayFont: verdict.chosen.typography.displayFont,
+      signature: verdict.chosen.signature,
+      designScore: verdict.chosenScore,
+      wowScores: {
+        design: {
+          total: verdict.chosenWow.total,
+          ambition: verdict.chosenWow.ambition,
+          passed: verdict.chosenWow.passed,
+          reasons: verdict.chosenWow.reasons,
+          axes: verdict.chosenWow.axes,
+          referenceSlug: verdict.chosen.referenceSlug,
+          heroMotion: verdict.chosen.heroMotion,
+        },
       },
-    },
-    state: 'brief',
-  }).returning();
+      state: 'brief',
+    }).returning({ id: schema.siteProjects.id });
+    if (!project) throw new Error(`failed to create site project for ${businessId}`);
+    projectId = project.id;
+    return [{
+      name: 'build-site',
+      payload: {
+        businessId,
+        campaignId: biz.campaignId,
+        projectId: project.id,
+        iteration: 0,
+        idempotencyKey: `build-site:${businessId}:${project.id}:0`,
+      },
+    }];
+  });
+  if (projectId === null) throw new Error(`site project transaction returned no id for ${businessId}`);
 
   log.info('stage 9 complete', {
-    businessId, projectId: project!.id, seconds: Math.round((Date.now() - startedAt) / 1000),
+    businessId, projectId, seconds: Math.round((Date.now() - startedAt) / 1000),
   });
 
   // First line of this project's live build log. It can only be written here,
@@ -907,12 +939,11 @@ export async function contentDesignHandler(payload: JobPayload): Promise<void> {
   await logStage(
     buildLogPath(businessId),
     `Текст і дизайн готові за ${Math.round((Date.now() - startedAt) / 60_000)} хв · `
-    + `обрано напрямок «${verdict.chosen.name}» — стартує збірка сайту (проєкт ${project!.id})`,
+    + `обрано напрямок «${verdict.chosen.name}» — стартує збірка сайту (проєкт ${projectId})`,
     'content-design',
-  );
-
-  await enqueue('build-site', {
-    businessId, campaignId: biz.campaignId, projectId: project!.id, iteration: 0,
-    idempotencyKey: `build-site:${businessId}:${project!.id}:0`,
-  });
+  ).catch((error) => log.warn('build log write failed after stage 9 commit', {
+    businessId,
+    projectId,
+    error: String(error),
+  }));
 }

@@ -13,20 +13,21 @@
  * by that prefix in foreign-key order. The census in `harness.ts` proves after
  * the fact that nothing else moved.
  */
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { assertFixtureId, sql, sqlOne, FIXTURE_PREFIX } from './harness.js';
+import {
+  PROJECT_ROOT, factoryBusinessWorkspaceRoot, factoryDeployDir, factoryWorkspaceDir,
+  removeFactoryFixturePath, writeFactoryFixtureFile,
+} from './runtimeFs.js';
 
 export const FIXTURE_CAMPAIGN = 'e2e-fixture-campaign';
-export const ROOT = path.resolve(new URL('../..', import.meta.url).pathname);
+export const ROOT = PROJECT_ROOT;
 
 export interface FixtureBusiness {
   id: string;
   name: string;
   projectId?: number;
-  deployToken?: string;
-  deployDir?: string;
-  workspaceDir?: string;
 }
 
 export async function createCampaign(): Promise<string> {
@@ -101,10 +102,9 @@ export async function createBusiness(input: {
 /**
  * A deployed demo on disk, so the approval card has something real to link to.
  *
- * The deploy directory is written under `deploys/e2e-<token>` — inside the
- * directory the live demo server already serves, because the privacy checks in
- * group 7 walk every directory there and a fixture that lived somewhere else
- * would be exempt from exactly the rules it should be proving.
+ * The deploy directory is written to the factory container's real named volume
+ * under `deploys/e2e<token>`. The privacy checks inspect that same volume, so a
+ * fixture cannot pass from a host-only directory the demo server never sees.
  */
 export async function createSiteProject(biz: FixtureBusiness, state: string, opts: {
   deployed?: boolean;
@@ -128,16 +128,15 @@ export async function createSiteProject(biz: FixtureBusiness, state: string, opt
   // the Referer re-rooting path it is supposed to be exercising. `e2e` stays as
   // an alphanumeric leading marker so teardown can still recognise it.
   const token = `e2e${Math.random().toString(36).slice(2, 12)}${Date.now().toString(36)}`.replace(/[^a-z0-9]/g, '');
-  const dir = path.join(ROOT, 'deploys', token);
+  const dir = factoryDeployDir(token);
   let deployUrl: string | null = null;
 
   if (opts.deployed) {
-    await mkdir(dir, { recursive: true });
-    await writeFile(path.join(dir, 'index.html'),
+    await writeFactoryFixtureFile(path.posix.join(dir, 'index.html'),
       '<!doctype html><html lang="el"><head><meta charset="utf-8">'
       + '<meta name="robots" content="noindex, nofollow">'
       + `<title>${biz.name}</title></head><body><h1>${biz.name}</h1>`
-      + '<p>e2e fixture demo</p></body></html>', 'utf8');
+      + '<p>e2e fixture demo</p></body></html>');
     deployUrl = `${process.env.DEMO_BASE_URL ?? 'http://localhost:8788'}/${token}/`;
   }
 
@@ -150,36 +149,20 @@ export async function createSiteProject(biz: FixtureBusiness, state: string, opt
       JSON.stringify(state === 'needs_human_review' ? ['[high] e2e fixture open issue'] : [])],
   );
 
-  /**
-   * `dir` is resolved INSIDE THE FACTORY CONTAINER, not on the host.
-   *
-   * `existsSync(path.join(project.dir, 'package.json'))` runs in the factory
-   * process, where `./sites` is mounted at `/app/sites` (docker-compose.yml).
-   * Storing the host path here makes every workspace look missing to the very
-   * check «Ще спроба» performs first — which is exactly how this fixture failed
-   * before: the action correctly refused with «Воркспейс цієї збірки більше не
-   * на диску», and the gate read a real refusal as a broken button.
-   *
-   * The directory is created on the HOST path (same bind mount, other side) and
-   * recorded under the CONTAINER path.
-   */
-  const relDir = path.join('sites', biz.id, String(project!.id));
-  const hostDir = path.join(ROOT, relDir);
-  const containerDir = path.posix.join(process.env.E2E_FACTORY_ROOT ?? '/app', relDir);
+  // `dir` and the file are both resolved inside the factory runtime. Compose
+  // uses a named volume here, so a same-named host directory is unrelated.
+  const containerDir = factoryWorkspaceDir(biz.id, project!.id);
   if (opts.withWorkspace) {
-    await mkdir(hostDir, { recursive: true });
-    await writeFile(path.join(hostDir, 'package.json'),
-      JSON.stringify({ name: 'e2e-fixture-site', private: true, version: '0.0.0' }, null, 2), 'utf8');
+    await writeFactoryFixtureFile(
+      path.posix.join(containerDir, 'package.json'),
+      JSON.stringify({ name: 'e2e-fixture-site', private: true, version: '0.0.0' }, null, 2),
+    );
   }
   await sql(`update site_projects set dir = $1 where id = $2`, [containerDir, project!.id]);
-  const workspace = opts.withWorkspace ? hostDir : undefined;
 
   return {
     ...biz,
     projectId: project!.id,
-    deployToken: opts.deployed ? token : undefined,
-    deployDir: opts.deployed ? dir : undefined,
-    workspaceDir: workspace,
   };
 }
 
@@ -214,6 +197,67 @@ export async function createFailedJob(biz: FixtureBusiness, jobType = 'enrich'):
     [jobType, biz.id, FIXTURE_CAMPAIGN, `${FIXTURE_PREFIX}job:${biz.id}:${Date.now()}`],
   );
   return row!.id;
+}
+
+/** A native logical run plus its append-only physical attempt history. */
+export async function createLogicalJobRun(input: {
+  biz: FixtureBusiness;
+  status: string;
+  attemptStatuses: string[];
+  jobType?: string;
+  duplicateSuppressions?: number;
+}): Promise<string> {
+  assertFixtureId(input.biz.id);
+  if (input.attemptStatuses.length === 0) throw new Error('logical fixture run needs at least one attempt');
+  const runId = randomUUID();
+  const jobType = input.jobType ?? 'enrich';
+  const currentAttemptSequence = input.attemptStatuses.length;
+  const idempotencyKey = `${FIXTURE_PREFIX}run:${input.biz.id}:${input.status}:${runId}`;
+  await sql(
+    `insert into workflow_job_runs
+       (id, job_type, idempotency_key, business_id, campaign_id, status,
+        current_attempt_sequence, duplicate_suppressions, last_duplicate_at,
+        created_at, updated_at, finished_at)
+     values ($1, $2, $3, $4, $5, $6, $7, $8,
+       case when $8::int > 0 then now() else null end,
+       now(), now(), case when $6 in ('queued','running','retry_wait') then null else now() end)`,
+    [runId, jobType, idempotencyKey, input.biz.id, FIXTURE_CAMPAIGN, input.status,
+      currentAttemptSequence, input.duplicateSuppressions ?? 0],
+  );
+  for (const [index, status] of input.attemptStatuses.entries()) {
+    const terminal = !['queued', 'running', 'retry_wait'].includes(status);
+    await sql(
+      `insert into workflow_jobs
+         (job_type, business_id, campaign_id, idempotency_key, run_id,
+          attempt_sequence, status, attempts, error_code, error_detail,
+          next_attempt_at, started_at, finished_at, created_at)
+       values ($1, $2, $3, $4, $5, $6, $7, $8,
+         case when $7 in ('failed','needs_human') then 'E2E_STATE' else null end,
+         case when $7 in ('failed','needs_human') then 'e2e fixture state detail' else null end,
+         case when $7 = 'retry_wait' then now() + interval '20 minutes' else null end,
+         case when $7 <> 'queued' then now() else null end,
+         case when $9::boolean then now() else null end,
+         now() - (($6::int - 1) * interval '1 minute'))`,
+      [jobType, input.biz.id, FIXTURE_CAMPAIGN, idempotencyKey, runId,
+        index + 1, status, index + 1, terminal],
+    );
+  }
+  return runId;
+}
+
+/** A durable fan-in failure for the operator's blocked-enrichment state. */
+export async function createBlockedEnrichment(biz: FixtureBusiness): Promise<string> {
+  assertFixtureId(biz.id);
+  const runId = randomUUID();
+  await sql(
+    `insert into enrichment_runs
+       (id, business_id, campaign_id, generation, source, status,
+        assets_status, audit_status, blocking_reason, created_at, updated_at, completed_at)
+     values ($1, $2, $3, 1, 'native', 'blocked', 'failed', 'succeeded',
+       'collect-assets failed after durable evidence capture', now(), now(), now())`,
+    [runId, biz.id, FIXTURE_CAMPAIGN],
+  );
+  return runId;
 }
 
 /** The workflow-journal half of a build waiting for Roman's QA decision. */
@@ -254,21 +298,25 @@ export async function destroyFixtures(): Promise<void> {
     // Tokens are alphanumeric (see `createSiteProject`), so the marker is the
     // bare `e2e` prefix rather than the hyphenated row-id prefix.
     if (!/^e2e[a-z0-9]+$/i.test(t.deploy_token ?? '')) continue;
-    await rm(path.join(ROOT, 'deploys', t.deploy_token), { recursive: true, force: true });
+    await removeFactoryFixturePath(factoryDeployDir(t.deploy_token));
   }
   // Build workspaces (`sites/e2e-…/`) — same reasoning: a directory the DB no
   // longer points at is invisible to the leftover query but still on disk.
   const workspaces = await sql<{ id: string }>(
     `select id from businesses where id like $1`, [like]);
   for (const w of workspaces) {
-    await rm(path.join(ROOT, 'sites', assertFixtureId(w.id)), { recursive: true, force: true });
+    await removeFactoryFixturePath(factoryBusinessWorkspaceRoot(w.id));
   }
+
+  await sql(`delete from workflow_reconciliation_events
+    where attempt_id in (select id from workflow_jobs where business_id like $1)
+       or run_id in (select id from workflow_job_runs where business_id like $1)`, [like]).catch(() => {});
 
   const byBusiness = [
     'outreach_events', 'outreach_messages', 'approvals', 'deals', 'do_not_contact',
     'site_projects', 'production_gaps', 'qualifications', 'website_audits',
     'business_facts', 'business_contacts', 'business_sources',
-    'status_history', 'workflow_jobs',
+    'status_history', 'workflow_jobs', 'enrichment_runs',
   ];
   for (const table of byBusiness) {
     const col = table === 'do_not_contact' ? 'value' : 'business_id';
@@ -277,6 +325,7 @@ export async function destroyFixtures(): Promise<void> {
   // do_not_contact also keys on match_type='business_id'
   await sql(`delete from do_not_contact where value like $1`, [like]).catch(() => {});
   await sql(`delete from workflow_jobs where idempotency_key like $1`, [like]).catch(() => {});
+  await sql(`delete from workflow_job_runs where business_id like $1 or idempotency_key like $1`, [like]).catch(() => {});
   await sql(`delete from businesses where id like $1`, [like]);
   await sql(`delete from campaigns where id like $1`, [like]);
 
@@ -296,6 +345,8 @@ export async function leftoverFixtures(): Promise<string[]> {
     ['businesses', 'id', like],
     ['campaigns', 'id', like],
     ['workflow_jobs', 'business_id', like],
+    ['workflow_job_runs', 'business_id', like],
+    ['enrichment_runs', 'business_id', like],
     ['production_gaps', 'business_id', like],
     ['approvals', 'business_id', like],
     ['outreach_messages', 'business_id', like],

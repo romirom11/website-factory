@@ -237,14 +237,22 @@ async function claimBuildReviewDecisionInTransaction(
 
 /** Atomically park the worker's QA verdict with its business state. */
 export async function parkBuildForHumanReview(
-  input: { projectId: number; businessId: string; reason: string },
+  input: {
+    projectId: number;
+    businessId: string;
+    reason: string;
+    projectPatch?: Partial<Pick<
+      typeof schema.siteProjects.$inferInsert,
+      'qaIterations' | 'qaReportKey' | 'qaReportKeys' | 'screenshotKeys' | 'openIssues' | 'wowScores'
+    >>;
+  },
   database: BuildReviewDatabase = db,
 ): Promise<boolean> {
   const transitions = new BusinessTransitionService(database);
   try {
     return await database.transaction(async (tx) => {
       const [project] = await tx.update(schema.siteProjects)
-        .set({ state: 'needs_human_review' })
+        .set({ ...input.projectPatch, state: 'needs_human_review' })
         .where(and(
           eq(schema.siteProjects.id, input.projectId),
           eq(schema.siteProjects.businessId, input.businessId),

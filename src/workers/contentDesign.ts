@@ -29,7 +29,12 @@ import {
   canContinueAfterTransition,
   requireBusinessStatus,
 } from '../orchestrator/statuses.js';
-import { enqueue, NeedsHumanError, type JobPayload } from '../orchestrator/queue.js';
+import {
+  commitWorkflow,
+  enqueue,
+  NeedsHumanError,
+  type JobPayload,
+} from '../orchestrator/queue.js';
 import { buildSnapshot, primaryContact, realPhotos, type BuildSnapshot } from '../build/snapshot.js';
 import {
   ArtDirectionsSchema, ContentBriefSchema, DESIGN_CONTRACT_VERSION, DirectionCritiqueSchema,
@@ -881,34 +886,50 @@ export async function contentDesignHandler(payload: JobPayload): Promise<void> {
     'application/json',
   );
 
-  const [project] = await db.insert(schema.siteProjects).values({
-    businessId,
-    dir: '', // set by the builder once the workspace exists (it is keyed by project id)
-    snapshotKey,
-    contentBriefKey: briefKey,
-    designContractKey: designKey,
-    designDirection: verdict.chosen.name,
-    // Mirrors for campaign-wide diversity aggregates (MOTION-PLAN D1/D2).
-    referenceSlug: verdict.chosen.referenceSlug,
-    displayFont: verdict.chosen.typography.displayFont,
-    signature: verdict.chosen.signature,
-    designScore: verdict.chosenScore,
-    wowScores: {
-      design: {
-        total: verdict.chosenWow.total,
-        ambition: verdict.chosenWow.ambition,
-        passed: verdict.chosenWow.passed,
-        reasons: verdict.chosenWow.reasons,
-        axes: verdict.chosenWow.axes,
-        referenceSlug: verdict.chosen.referenceSlug,
-        heroMotion: verdict.chosen.heroMotion,
+  let projectId: number | null = null;
+  await commitWorkflow(async (tx) => {
+    const [project] = await tx.insert(schema.siteProjects).values({
+      businessId,
+      dir: '', // set by the builder once the workspace exists (it is keyed by project id)
+      snapshotKey,
+      contentBriefKey: briefKey,
+      designContractKey: designKey,
+      designDirection: verdict.chosen.name,
+      // Mirrors for campaign-wide diversity aggregates (MOTION-PLAN D1/D2).
+      referenceSlug: verdict.chosen.referenceSlug,
+      displayFont: verdict.chosen.typography.displayFont,
+      signature: verdict.chosen.signature,
+      designScore: verdict.chosenScore,
+      wowScores: {
+        design: {
+          total: verdict.chosenWow.total,
+          ambition: verdict.chosenWow.ambition,
+          passed: verdict.chosenWow.passed,
+          reasons: verdict.chosenWow.reasons,
+          axes: verdict.chosenWow.axes,
+          referenceSlug: verdict.chosen.referenceSlug,
+          heroMotion: verdict.chosen.heroMotion,
+        },
       },
-    },
-    state: 'brief',
-  }).returning();
+      state: 'brief',
+    }).returning({ id: schema.siteProjects.id });
+    if (!project) throw new Error(`failed to create site project for ${businessId}`);
+    projectId = project.id;
+    return [{
+      name: 'build-site',
+      payload: {
+        businessId,
+        campaignId: biz.campaignId,
+        projectId: project.id,
+        iteration: 0,
+        idempotencyKey: `build-site:${businessId}:${project.id}:0`,
+      },
+    }];
+  });
+  if (projectId === null) throw new Error(`site project transaction returned no id for ${businessId}`);
 
   log.info('stage 9 complete', {
-    businessId, projectId: project!.id, seconds: Math.round((Date.now() - startedAt) / 1000),
+    businessId, projectId, seconds: Math.round((Date.now() - startedAt) / 1000),
   });
 
   // First line of this project's live build log. It can only be written here,
@@ -918,12 +939,11 @@ export async function contentDesignHandler(payload: JobPayload): Promise<void> {
   await logStage(
     buildLogPath(businessId),
     `Текст і дизайн готові за ${Math.round((Date.now() - startedAt) / 60_000)} хв · `
-    + `обрано напрямок «${verdict.chosen.name}» — стартує збірка сайту (проєкт ${project!.id})`,
+    + `обрано напрямок «${verdict.chosen.name}» — стартує збірка сайту (проєкт ${projectId})`,
     'content-design',
-  );
-
-  await enqueue('build-site', {
-    businessId, campaignId: biz.campaignId, projectId: project!.id, iteration: 0,
-    idempotencyKey: `build-site:${businessId}:${project!.id}:0`,
-  });
+  ).catch((error) => log.warn('build log write failed after stage 9 commit', {
+    businessId,
+    projectId,
+    error: String(error),
+  }));
 }

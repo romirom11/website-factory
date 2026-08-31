@@ -15,10 +15,8 @@ import { db, schema } from '../db/client.js';
 import { runAgent, z } from '../agents/agent.js';
 import {
   businessTransitions,
-  canContinueAfterTransition,
   requireBusinessStatus,
 } from '../orchestrator/statuses.js';
-import { advance } from '../orchestrator/router.js';
 import { NeedsHumanError, type JobPayload } from '../orchestrator/queue.js';
 import { getEnrichmentBarrier } from '../orchestrator/enrichmentBarrierRuntime.js';
 import { log } from '../lib/logger.js';
@@ -205,13 +203,6 @@ export async function scoreAndQaHandler(payload: JobPayload): Promise<void> {
   const committed = await barrier.commitScore(
     { runId: payload.enrichmentRunId, businessId },
     async (tx) => {
-      await tx.insert(schema.qualifications).values({
-        businessId, stage: 'full', qualified, reasons, score, scoreBreakdown: breakdown,
-        qaPassed, qaNotes, qaNotesUk,
-      });
-      await tx.update(schema.businesses)
-        .set({ score, scoreBreakdown: breakdown, updatedAt: new Date() })
-        .where(eq(schema.businesses.id, businessId));
       transitioned = await businessTransitions.normalInTransaction(tx, {
         businessId,
         expectedStatus,
@@ -219,6 +210,24 @@ export async function scoreAndQaHandler(payload: JobPayload): Promise<void> {
         actor: 'score-worker',
         reason: transitionReason,
       });
+      if (transitioned.kind === 'conflict') return [];
+      await tx.insert(schema.qualifications).values({
+        businessId, stage: 'full', qualified, reasons, score, scoreBreakdown: breakdown,
+        qaPassed, qaNotes, qaNotesUk,
+      });
+      await tx.update(schema.businesses)
+        .set({ score, scoreBreakdown: breakdown, updatedAt: new Date() })
+        .where(eq(schema.businesses.id, businessId));
+      return target === 'qualified'
+        ? [{
+            name: 'readiness-gate',
+            payload: {
+              businessId,
+              campaignId: biz.campaignId,
+              idempotencyKey: `readiness-gate:${businessId}`,
+            },
+          }]
+        : [];
     },
   );
   if (!committed) {
@@ -230,6 +239,4 @@ export async function scoreAndQaHandler(payload: JobPayload): Promise<void> {
   }
   if (!transitioned) throw new Error(`score transition result missing for ${businessId}`);
   log.info('scored', { businessId, score, breakdown, qualified, qaPassed });
-  if (!canContinueAfterTransition(transitioned, { businessId, actor: 'score-worker' })) return;
-  if (target === 'qualified') await advance(businessId); // -> readiness-gate
 }

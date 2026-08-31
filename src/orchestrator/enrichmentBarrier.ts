@@ -3,6 +3,7 @@ import { and, desc, eq, inArray } from 'drizzle-orm';
 import * as schema from '../db/schema.js';
 import {
   WorkflowRunStore,
+  type EnqueueCommand,
   type EnqueueResult,
   type WorkflowRunTransaction,
 } from './workflowRunStore.js';
@@ -36,7 +37,9 @@ export type EnrichmentBranchResult =
   | { kind: 'blocked'; runId: string; branch: EnrichmentBranch; reason: string }
   | { kind: 'stale'; runId: string; branch: EnrichmentBranch };
 
-export type ScoreCommitMutation = (tx: WorkflowRunTransaction) => Promise<void>;
+export type ScoreCommitMutation = (
+  tx: WorkflowRunTransaction,
+) => Promise<void | readonly EnqueueCommand[]>;
 export type BranchCommitMutation = (tx: WorkflowRunTransaction) => Promise<void>;
 
 interface SettleBranchInput {
@@ -376,13 +379,13 @@ export class EnrichmentBarrier {
         || run.scoreEnqueuedAt === null
       ) return [];
 
-      await mutation(tx);
+      const commands = await mutation(tx);
       const now = new Date();
       await tx.update(schema.enrichmentRuns)
         .set({ status: 'completed', completedAt: now, updatedAt: now })
         .where(eq(schema.enrichmentRuns.id, input.runId));
       committed = true;
-      return [];
+      return commands ?? [];
     });
     return committed;
   }

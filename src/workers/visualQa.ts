@@ -21,7 +21,7 @@ import { chromium, type Browser } from 'playwright';
 import path from 'node:path';
 import { copyFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { getObject, putRaw } from '../lib/storage.js';
 import { serveDir } from '../lib/serveDir.js';
@@ -29,7 +29,7 @@ import { config } from '../config.js';
 import { runAgent } from '../agents/agent.js';
 import { createAgentInputWorkspace } from '../agents/transport.js';
 import { parkBuildForHumanReview } from '../orchestrator/buildReviewDecision.js';
-import { enqueue, NeedsHumanError, type JobPayload } from '../orchestrator/queue.js';
+import { commitWorkflow, NeedsHumanError, type JobPayload } from '../orchestrator/queue.js';
 import { buildSnapshot, realPhotos, type BuildSnapshot } from '../build/snapshot.js';
 import { VisualCritiqueSchema, type QaIssue } from '../build/schemas.js';
 import { evaluateLayoutQuality } from '../build/layoutQuality.js';
@@ -1191,7 +1191,7 @@ export async function visualQaHandler(payload: JobPayload): Promise<void> {
   );
 
   const reportKeys = [...(project.qaReportKeys ?? []), qaReportKey];
-  await db.update(schema.siteProjects).set({
+  const qaProjectPatch = {
     qaIterations: iteration + 1,
     qaReportKey,
     qaReportKeys: reportKeys,
@@ -1221,7 +1221,7 @@ export async function visualQaHandler(payload: JobPayload): Promise<void> {
           }
         : {}),
     },
-  }).where(eq(schema.siteProjects.id, projectId));
+  };
 
   log.info('QA pass complete', {
     businessId, iteration, total: issues.length, blocking: blocking.length,
@@ -1231,12 +1231,31 @@ export async function visualQaHandler(payload: JobPayload): Promise<void> {
   // ── verdict ───────────────────────────────────────────────────────────────
   if (blocking.length === 0) {
     await logStage(logPath, 'Перевірка пройдена — публікую демо', 'visual-qa');
-    await db.update(schema.siteProjects).set({ state: 'ready' })
-      .where(eq(schema.siteProjects.id, projectId));
-    await enqueue('deploy-demo', {
-      businessId, projectId, campaignId: payload.campaignId,
-      idempotencyKey: `deploy-demo:${businessId}:${projectId}`,
+    let handedOff = false;
+    await commitWorkflow(async (tx) => {
+      const [updated] = await tx.update(schema.siteProjects)
+        .set({ ...qaProjectPatch, state: 'ready' })
+        .where(and(
+          eq(schema.siteProjects.id, projectId),
+          eq(schema.siteProjects.state, 'qa'),
+          eq(schema.siteProjects.qaIterations, iteration),
+        ))
+        .returning({ id: schema.siteProjects.id });
+      if (!updated) return [];
+      handedOff = true;
+      return [{
+        name: 'deploy-demo',
+        payload: {
+          businessId,
+          projectId,
+          campaignId: payload.campaignId,
+          idempotencyKey: `deploy-demo:${businessId}:${projectId}`,
+        },
+      }];
     });
+    if (!handedOff) {
+      log.info('stale visual QA pass ignored: project already advanced', { businessId, projectId });
+    }
     return;
   }
 
@@ -1255,6 +1274,7 @@ export async function visualQaHandler(payload: JobPayload): Promise<void> {
       projectId,
       businessId,
       reason: `QA limit (${iterationCap}) reached with ${blocking.length} open issues`,
+      projectPatch: qaProjectPatch,
     });
     if (!parked) {
       log.info('stale visual QA verdict ignored: project or business already advanced', {
@@ -1286,13 +1306,34 @@ export async function visualQaHandler(payload: JobPayload): Promise<void> {
     'visual-qa',
   );
   await writeQaIssues(dir, renderQaIssues(issues, iteration + 1, snapshot));
-  await enqueue('build-site', {
-    businessId, projectId, campaignId: payload.campaignId,
-    iteration: iteration + 1,
-    issues: issues.map((i) => `[${i.severity}/${i.category}] ${i.issue} → ${i.fix}`),
-    idempotencyKey: `build-site:${businessId}:${projectId}:${iteration + 1}`,
+  let handedOff = false;
+  await commitWorkflow(async (tx) => {
+    const [updated] = await tx.update(schema.siteProjects)
+      .set(qaProjectPatch)
+      .where(and(
+        eq(schema.siteProjects.id, projectId),
+        eq(schema.siteProjects.state, 'qa'),
+        eq(schema.siteProjects.qaIterations, iteration),
+      ))
+      .returning({ id: schema.siteProjects.id });
+    if (!updated) return [];
+    handedOff = true;
+    return [{
+      name: 'build-site',
+      payload: {
+        businessId,
+        projectId,
+        campaignId: payload.campaignId,
+        iteration: iteration + 1,
+        issues: issues.map((issue) => `[${issue.severity}/${issue.category}] ${issue.issue} → ${issue.fix}`),
+        idempotencyKey: `build-site:${businessId}:${projectId}:${iteration + 1}`,
+      },
+    }];
   });
-  log.info('QA issues fed back to builder', { businessId, iteration: iteration + 1, issues: blocking.length });
+  log.info(
+    handedOff ? 'QA issues fed back to builder' : 'stale visual QA result ignored',
+    { businessId, iteration: iteration + 1, issues: blocking.length },
+  );
 }
 
 /** Public alias for tooling; the loop above uses the local name. */

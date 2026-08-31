@@ -284,8 +284,70 @@ await withDisposableFactoryDatabase(async ({ connectionString, pool, db, boss })
       [businessId],
     ), 0);
     assert.equal(await barrier.isScoreCurrent({ runId: started.runId, businessId }), true);
-    assert.equal(await barrier.completeScore({ runId: started.runId, businessId }), true);
+    assert.equal(await barrier.commitScore(
+      { runId: started.runId, businessId },
+      async (tx) => {
+        await tx.insert(schema.productionGaps).values({
+          businessId,
+          gap: 'score-handoff-proof',
+          blockerLevel: 'soft',
+        });
+        return [{
+          name: 'readiness-gate',
+          payload: {
+            businessId,
+            campaignId,
+            idempotencyKey: `readiness-gate:${businessId}`,
+          },
+        }];
+      },
+    ), true);
+    assert.equal(await count(
+      `select count(*) from production_gaps where business_id = $1 and gap = 'score-handoff-proof'`,
+      [businessId],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from workflow_job_runs where business_id = $1 and job_type = 'readiness-gate'`,
+      [businessId],
+    ), 1);
     assert.equal(await barrier.isScoreCurrent({ runId: started.runId, businessId }), false);
+  });
+
+  await check('score handoff rolls back evidence and barrier when its queue send fails', async () => {
+    const businessId = await createBusiness();
+    const started = await barrier.start({ businessId, campaignId });
+    await barrier.completeBranch({ runId: started.runId, businessId, branch: 'assets' });
+    await barrier.completeBranch({ runId: started.runId, businessId, branch: 'audit' });
+    const failingBarrier = new EnrichmentBarrier(new WorkflowRunStore(pool, {
+      send: async () => { throw new Error('score handoff send injection'); },
+    }));
+    await assert.rejects(
+      failingBarrier.commitScore(
+        { runId: started.runId, businessId },
+        async (tx) => {
+          await tx.insert(schema.productionGaps).values({
+            businessId,
+            gap: 'score-send-rollback-proof',
+            blockerLevel: 'soft',
+          });
+          return [{
+            name: 'readiness-gate',
+            payload: {
+              businessId,
+              campaignId,
+              idempotencyKey: `readiness-gate:${businessId}`,
+            },
+          }];
+        },
+      ),
+      /score handoff send injection/,
+    );
+    assert.equal(await count(
+      `select count(*) from production_gaps where business_id = $1 and gap = 'score-send-rollback-proof'`,
+      [businessId],
+    ), 0);
+    assert.equal(await barrier.isScoreCurrent({ runId: started.runId, businessId }), true);
+    assert.equal(await barrier.completeScore({ runId: started.runId, businessId }), true);
   });
 
   await check('branch evidence and branch completion share one rollback boundary', async () => {

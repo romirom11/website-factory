@@ -154,22 +154,38 @@ Demo URL: ${project?.deployUrl ?? 'MISSING'}.`,
 export async function requestApprovalHandler(job: JobPayload): Promise<void> {
   const businessId = job.businessId!;
 
-  // One pending request at a time: a re-enqueued stage must not spawn a second
-  // card Roman could approve twice.
-  const [pending] = await db.select().from(schema.approvals)
-    .where(and(
-      eq(schema.approvals.businessId, businessId),
-      eq(schema.approvals.kind, 'outreach'),
-      isNull(schema.approvals.decision),
-    ))
-    .orderBy(desc(schema.approvals.createdAt)).limit(1);
-
   const { payload, snapshot } = await prepareApproval(businessId);
-
-  const approvalId = pending
-    ? (await db.update(schema.approvals).set({ payload })
-        .where(eq(schema.approvals.id, pending.id)).returning())[0].id
-    : (await db.insert(schema.approvals).values({ businessId, kind: 'outreach', payload }).returning())[0].id;
+  // Serialize by business so concurrent legacy deliveries cannot both observe
+  // "no pending approval" and create two cards that can be approved.
+  const approval = await db.transaction(async (tx) => {
+    const [business] = await tx.select({ id: schema.businesses.id })
+      .from(schema.businesses)
+      .where(eq(schema.businesses.id, businessId))
+      .limit(1)
+      .for('update');
+    if (!business) throw new Error(`business not found: ${businessId}`);
+    const [pending] = await tx.select().from(schema.approvals)
+      .where(and(
+        eq(schema.approvals.businessId, businessId),
+        eq(schema.approvals.kind, 'outreach'),
+        isNull(schema.approvals.decision),
+      ))
+      .orderBy(desc(schema.approvals.createdAt))
+      .limit(1)
+      .for('update');
+    if (pending) {
+      const [updated] = await tx.update(schema.approvals).set({ payload })
+        .where(eq(schema.approvals.id, pending.id))
+        .returning({ id: schema.approvals.id });
+      if (!updated) throw new Error(`failed to refresh approval ${pending.id}`);
+      return { id: updated.id, reused: true };
+    }
+    const [created] = await tx.insert(schema.approvals)
+      .values({ businessId, kind: 'outreach', payload })
+      .returning({ id: schema.approvals.id });
+    if (!created) throw new Error(`failed to create approval for ${businessId}`);
+    return { id: created.id, reused: false };
+  });
 
   await notifyDemoReady({
     businessId,
@@ -181,6 +197,6 @@ export async function requestApprovalHandler(job: JobPayload): Promise<void> {
   }).catch((err) => log.warn('demo-ready notification failed', { businessId, err: String(err) }));
 
   log.info('approval requested', {
-    businessId, approvalId, channel: payload.draft.channel, reused: Boolean(pending),
+    businessId, approvalId: approval.id, channel: payload.draft.channel, reused: approval.reused,
   });
 }

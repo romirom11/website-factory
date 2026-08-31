@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { assertFixtureId, assertFixtureIds } from './e2e/safety.js';
 import { assertFactoryTaskIsolated } from './e2e/isolation.js';
+import { cleanupAfterFailure } from './e2e/releaseGatePolicy.js';
 
 assert.equal(assertFixtureId('e2e-safe-business'), 'e2e-safe-business');
 assert.deepEqual(assertFixtureIds(['e2e-one', 'e2e-two']), ['e2e-one', 'e2e-two']);
@@ -27,4 +28,13 @@ try {
   else process.env.E2E_FACTORY_ISOLATED = previousIsolation;
 }
 
-console.log('🏭 FIXTURE SAFETY TESTS PASSED (6)');
+const releaseGates = [
+  { name: 'build' },
+  { name: 'F1' },
+  { name: 'F1 cleanup', cleanupAfter: 'F1' },
+  { name: 'publish' },
+];
+assert.equal(cleanupAfterFailure(releaseGates, 0), null);
+assert.equal(cleanupAfterFailure(releaseGates, 1)?.name, 'F1 cleanup');
+
+console.log('🏭 FIXTURE SAFETY TESTS PASSED (8)');

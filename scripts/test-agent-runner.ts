@@ -256,6 +256,8 @@ try {
     await mkdir(oldRoot);
     const old = new Date(Date.now() - 10_000);
     await utimes(oldRoot, old, old);
+    assert.equal(await pruneRunnerWork(undefined, 1_000, new Set([oldId])), 0);
+    assert.equal(existsSync(oldRoot), true);
     assert.equal(await pruneRunnerWork(undefined, 1_000), 1);
     assert.equal(existsSync(oldRoot), false);
   });

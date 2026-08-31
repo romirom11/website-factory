@@ -44,11 +44,10 @@
  * code at all and only ever writes rows, so a `stale` row is silent by
  * construction: it ends a job's life, it does not restart it.
  *
- * The corollary for anyone adding a re-enqueue here later: the payload is NOT
- * persisted (`workflow_jobs` has no payload column), so a re-enqueued job
- * cannot carry forward a suppression flag such as `daily-summary`'s
- * `silent: true`. Any such flag must be derivable from a column that IS stored
- * — `idempotency_key` is the one the summary worker uses.
+ * The corollary for anyone adding a re-enqueue here later: use the persisted
+ * `workflow_jobs.payload` verbatim. Reconstructing a partial payload from the
+ * reporting columns would lose stage-specific fields and suppression flags
+ * such as `daily-summary`'s `silent: true`.
  */
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';

@@ -7,6 +7,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
+import { cleanupAfterFailure } from './e2e/releaseGatePolicy.js';
 
 interface Gate {
   name: string;
@@ -14,6 +15,8 @@ interface Gate {
   args: string[];
   cwd?: string;
   fullOnly?: boolean;
+  /** Run this exact adjacent cleanup even when its owning gate fails. */
+  cleanupAfter?: string;
 }
 
 interface GateResult {
@@ -55,6 +58,8 @@ const gates: Gate[] = [
   { name: 'campaign/global dry-run gate', command: 'pnpm', args: ['test:outreach-mode'] },
   { name: 'deterministic layout quality gates', command: 'pnpm', args: ['test:layout-quality'] },
   { name: 'status transition CAS', command: 'pnpm', args: ['test:status-transitions'] },
+  { name: 'outreach decision command API', command: 'pnpm', args: ['test:outreach-decision-api'] },
+  { name: 'campaign command API', command: 'pnpm', args: ['test:campaign-command-api'] },
   { name: 'discovery transient recovery', command: 'pnpm', args: ['test:discovery-resilience'] },
   { name: 'enrichment fan-in barrier', command: 'pnpm', args: ['test:enrichment-barrier'] },
   { name: 'brand identity', command: 'pnpm', args: ['tsx', 'scripts/test-brand-identity.ts'] },
@@ -74,7 +79,7 @@ const gates: Gate[] = [
   { name: 'GreenMail readiness', command: 'docker', args: ['compose', '--profile', 'dev-mail', 'up', '-d', '--wait', 'greenmail'], fullOnly: true },
   { name: 'live adapter integration against local servers', command: 'pnpm', args: ['tsx', 'scripts/phaseE-e2e.ts'], fullOnly: true },
   { name: 'F1 real multi-agent site generation', command: 'docker', args: ['compose', 'exec', '-T', 'factory', 'pnpm', 'tsx', 'scripts/phaseC-fixture.ts', '--run'], fullOnly: true },
-  { name: 'F1 fixture cleanup', command: 'docker', args: ['compose', 'exec', '-T', 'factory', 'pnpm', 'tsx', 'scripts/phaseC-fixture.ts', '--clean'], fullOnly: true },
+  { name: 'F1 fixture cleanup', command: 'docker', args: ['compose', 'exec', '-T', 'factory', 'pnpm', 'tsx', 'scripts/phaseC-fixture.ts', '--clean'], fullOnly: true, cleanupAfter: 'F1 real multi-agent site generation' },
 ];
 
 async function run(gate: Gate): Promise<GateResult> {
@@ -108,13 +113,21 @@ async function run(gate: Gate): Promise<GateResult> {
 
 const selected = gates.filter((gate) => !gate.fullOnly || !quick);
 const results: GateResult[] = [];
-for (const gate of selected) {
+for (let index = 0; index < selected.length; index++) {
+  const gate = selected[index]!;
   const result = await run(gate);
   results.push(result);
   // Every later full gate assumes the previous artifact/topology is current.
   // Continuing after a failed image build would test stale containers and can
   // even mutate fixture state under code that was not just built.
-  if (!result.ok) break;
+  if (!result.ok) {
+    const cleanup = cleanupAfterFailure(selected, index);
+    if (cleanup) {
+      results.push(await run(cleanup));
+      index++;
+    }
+    break;
+  }
 }
 const skipped = selected.slice(results.length).map((gate) => gate.name);
 

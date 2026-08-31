@@ -3,7 +3,7 @@
  * forwards execution, streams telemetry, then synchronizes allowed outputs.
  */
 import { createHash } from 'node:crypto';
-import { mkdir, stat } from 'node:fs/promises';
+import { mkdir, stat, utimes } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Hono, type Context } from 'hono';
@@ -110,6 +110,11 @@ async function performThroughGateway(
   const roots = runnerRoots();
   const paths = executionPaths(request.requestId, roots);
   await mkdir(paths.root, { recursive: true });
+  // A retry may intentionally reuse scratch retained from an old gateway
+  // process. Refresh its lease before the periodic collector can classify it
+  // as abandoned; in-process cleanup also excludes every in-flight request.
+  const activeAt = new Date();
+  await utimes(paths.root, activeAt, activeAt);
   const manifest = await readManifest(paths.manifest);
   if (manifest && manifest.requestHash !== hash) {
     throw new Error('persisted request id belongs to a different payload');
@@ -396,7 +401,9 @@ export async function startGateway(): Promise<void> {
   const removed = await pruneRunnerWork().catch(() => 0);
   const port = Number(process.env.RUNNER_GATEWAY_PORT ?? 8790);
   serve({ fetch: createGatewayApp().fetch, port, hostname: '0.0.0.0' });
-  const cleanup = setInterval(() => { void pruneRunnerWork(); }, 6 * 60 * 60_000);
+  const cleanup = setInterval(() => {
+    void pruneRunnerWork(undefined, undefined, new Set(inFlight.keys()));
+  }, 6 * 60 * 60_000);
   cleanup.unref?.();
   console.log(JSON.stringify({ level: 'info', msg: 'agent runner gateway ready', port, removed }));
 }

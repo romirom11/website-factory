@@ -214,12 +214,14 @@ export async function readManifest(file: string): Promise<RunnerManifest | null>
 export async function pruneRunnerWork(
   roots = runnerRoots(),
   maxAgeMs = Number(process.env.RUNNER_WORK_RETENTION_HOURS ?? 168) * 60 * 60_000,
+  protectedRequestIds: ReadonlySet<string> = new Set(),
 ): Promise<number> {
   await mkdir(roots.work, { recursive: true });
   const now = Date.now();
   let removed = 0;
   for (const entry of await readdir(roots.work, { withFileTypes: true })) {
     if (!entry.isDirectory() || !/^[0-9a-f-]{36}$/i.test(entry.name)) continue;
+    if (protectedRequestIds.has(entry.name)) continue;
     const target = path.join(roots.work, entry.name);
     const metadata = await stat(target).catch(() => null);
     if (!metadata || now - metadata.mtimeMs <= maxAgeMs) continue;

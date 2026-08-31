@@ -48,8 +48,8 @@ export interface ApprovalItem {
 const AUTOMATED = new Set(['whatsapp', 'email']);
 
 export async function loadApprovalQueue(): Promise<ApprovalItem[]> {
-  // Pending decisions, plus approved-but-not-yet-sent manual channels (Roman
-  // still has work to do on those: tap the deep link, then confirm).
+  // Pending decisions plus approved deliveries that still need operator
+  // attention: manual confirmation, a known failure, or an uncertain result.
   const approvals = await db.select().from(schema.approvals)
     .where(eq(schema.approvals.kind, 'outreach'))
     .orderBy(desc(schema.approvals.createdAt));
@@ -96,9 +96,14 @@ export async function loadApprovalQueue(): Promise<ApprovalItem[]> {
     const sendKey = `send-outreach:approval:${a.id}`;
     const sendRow = messages.find((m) => m.idempotencyKey === sendKey);
 
-    // An approved automated send that already went out is done — off the queue.
-    if (a.decision === 'approved' && sendRow && sendRow.state !== 'manual_pending') continue;
-    // Approved with no manual work pending and no row yet: still in flight, keep it visible.
+    // Only a confirmed delivery/simulation is done. Unknown and failed sends
+    // stay visible because silently hiding them invites an unsafe duplicate.
+    if (
+      a.decision === 'approved'
+      && sendRow
+      && ['sent', 'delivered', 'simulated'].includes(sendRow.state)
+    ) continue;
+    // Approved with no row yet is still in flight, so keep it visible too.
 
     const audit = auditBy.get(a.businessId);
     const project = projectBy.get(a.businessId);

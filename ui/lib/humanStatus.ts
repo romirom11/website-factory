@@ -366,6 +366,7 @@ const MESSAGE_STATES: Record<string, string> = {
   delivered: 'доставлено',
   read: 'прочитано',
   failed: 'не вдалося надіслати',
+  delivery_unknown: 'результат відправки невідомий — не повторювати',
 };
 
 export function humanMessageState(state: string): string {
@@ -380,6 +381,8 @@ const OUTREACH_EVENTS: Record<string, string> = {
   clicked: 'перейшли за посиланням',
   sent: 'надіслано',
   delivered: 'доставлено',
+  failed: 'відправка не вдалася',
+  delivery_unknown: 'результат відправки невідомий',
 };
 
 export function humanOutreachEvent(event: string): string {

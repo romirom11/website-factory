@@ -58,7 +58,12 @@ export async function withDisposableFactoryDatabase<T>(
     await migrate(db, { migrationsFolder: './drizzle' });
 
     boss = new PgBoss({ connectionString: testUrl.toString(), schema: 'pgboss' });
-    boss.on('error', (error) => console.error('pg-boss test error', error));
+    boss.on('error', (error: Error & { code?: string }) => {
+      if (!(tearingDown && error.code === '57P01')) {
+        console.error('pg-boss test error', error);
+        process.exitCode = 1;
+      }
+    });
     await boss.start();
     await ensureRequiredQueues(boss);
 

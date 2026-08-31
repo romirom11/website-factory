@@ -681,27 +681,33 @@ export async function startSocialsDiscoveryBulk(businessIds: string[]): Promise<
 export async function verifySocialContact(formData: FormData): Promise<ActionResult> {
   const contactId = Number(formData.get('contactId'));
   if (!contactId) return { ok: false, message: 'Не вибрано контакт' };
-  const [contact] = await db.select().from(schema.businessContacts)
-    .where(eq(schema.businessContacts.id, contactId));
+  const contact = await db.transaction(async (tx) => {
+    const [current] = await tx.select().from(schema.businessContacts)
+      .where(eq(schema.businessContacts.id, contactId))
+      .limit(1)
+      .for('update');
+    if (!current) return null;
+
+    await tx.update(schema.businessContacts)
+      .set({
+        verified: true,
+        verifiedBy: 'roman',
+        verifiedNote: String(formData.get('note') ?? '').trim() || null,
+      })
+      .where(eq(schema.businessContacts.id, contactId));
+
+    // Once a social profile is confirmed, the "we could not confirm one" gap
+    // is no longer true. The endorsement and gap resolution are one decision.
+    if (isSocialChannel(current.channel)) {
+      await tx.update(schema.productionGaps).set({ resolved: true }).where(and(
+        eq(schema.productionGaps.businessId, current.businessId),
+        eq(schema.productionGaps.gap, 'socials_unresolved'),
+        eq(schema.productionGaps.resolved, false),
+      ));
+    }
+    return current;
+  });
   if (!contact) return { ok: false, message: 'Контакт не знайдено' };
-
-  await db.update(schema.businessContacts)
-    .set({
-      verified: true,
-      verifiedBy: 'roman',
-      verifiedNote: String(formData.get('note') ?? '').trim() || null,
-    })
-    .where(eq(schema.businessContacts.id, contactId));
-
-  // Once a social profile is confirmed, the "we could not confirm one" gap is
-  // no longer true.
-  if (isSocialChannel(contact.channel)) {
-    await db.update(schema.productionGaps).set({ resolved: true }).where(and(
-      eq(schema.productionGaps.businessId, contact.businessId),
-      eq(schema.productionGaps.gap, 'socials_unresolved'),
-      eq(schema.productionGaps.resolved, false),
-    ));
-  }
 
   revalidatePath(`/businesses/${contact.businessId}`);
   revalidatePath('/businesses');

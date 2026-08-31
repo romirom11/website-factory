@@ -11,6 +11,7 @@ import { and, eq, inArray } from 'drizzle-orm';
 import * as schema from '../src/db/schema.js';
 import { getJobDefinition } from '../src/orchestrator/jobDefinitions.js';
 import { OutreachDecisionService } from '../src/orchestrator/outreachDecisionService.js';
+import { OutreachDeliveryService } from '../src/orchestrator/outreachDeliveryService.js';
 import { sendIdempotencyKey } from '../src/outreach/idempotency.js';
 import { CampaignCommandService } from '../src/orchestrator/campaignCommandService.js';
 import { NormalizationService } from '../src/orchestrator/normalizationService.js';
@@ -426,6 +427,282 @@ await withDisposableFactoryDatabase(async ({ pool, db: testDb, boss }) => {
       `select count(*) from status_history where business_id = $1`,
       [businessId],
     ), 0);
+  });
+
+  await check('parallel outreach reservations cannot exceed the daily budget', async () => {
+    const suffix = randomUUID();
+    const campaignId = `campaign-delivery-budget-${suffix}`;
+    const businessId = `e2e-delivery-budget-${suffix}`;
+    await testDb.insert(schema.campaigns).values({
+      id: campaignId,
+      country: 'GR',
+      city: 'Patras',
+      niche: 'test',
+      language: 'el',
+      queries: ['test'],
+      geofence: { lat: 38.2, lng: 21.7, radiusKm: 1 },
+    });
+    await testDb.insert(schema.businesses).values({
+      id: businessId,
+      campaignId,
+      name: 'Delivery Budget Test',
+      normalizedName: 'delivery budget test',
+      status: 'outreach_approved',
+    });
+    const service = new OutreachDeliveryService(
+      (plan) => store.enqueueTransaction(plan),
+      testDb,
+      () => [3, 7],
+    );
+    const reservations = await Promise.all(Array.from({ length: 20 }, (_, index) => (
+      service.reserveMessage({
+        businessId,
+        channel: 'email',
+        toAddress: `budget-${index}@example.test`,
+        subject: 'Demo',
+        body: 'Budget body',
+        idempotencyKey: `delivery-budget:${suffix}:${index}`,
+        messageKind: 'initial',
+        dailyLimit: 3,
+      })
+    )));
+    assert.equal(reservations.filter((result) => result.kind === 'reserved').length, 3);
+    assert.equal(reservations.filter((result) => result.kind === 'daily_limit').length, 17);
+    assert.equal(await count(
+      `select count(*) from outreach_messages where business_id = $1 and state = 'queued'`,
+      [businessId],
+    ), 3);
+
+    const first = reservations.find((result) => result.kind === 'reserved');
+    assert.ok(first);
+    const duplicate = await service.reserveMessage({
+      businessId,
+      channel: 'email',
+      toAddress: 'budget-duplicate@example.test',
+      subject: 'Demo',
+      body: 'Budget body',
+      idempotencyKey: `delivery-budget:${suffix}:${reservations.indexOf(first)}`,
+      messageKind: 'initial',
+      dailyLimit: 3,
+    });
+    assert.equal(duplicate.kind, 'duplicate');
+
+    const manual = await service.reserveMessage({
+      businessId,
+      channel: 'instagram',
+      toAddress: '@budget-test',
+      subject: null,
+      body: 'Manual body',
+      idempotencyKey: `delivery-budget:${suffix}:manual`,
+      messageKind: 'initial',
+      dailyLimit: 0,
+    });
+    assert.equal(manual.kind, 'reserved');
+
+    await testDb.update(schema.outreachMessages).set({ state: 'failed' }).where(and(
+      eq(schema.outreachMessages.businessId, businessId),
+      eq(schema.outreachMessages.channel, 'email'),
+      eq(schema.outreachMessages.state, 'queued'),
+    ));
+    await testDb.insert(schema.outreachMessages).values({
+      businessId,
+      channel: 'email',
+      toAddress: 'old-delivery@example.test',
+      subject: 'Old delivery',
+      body: 'Old delivery body',
+      idempotencyKey: `delivery-budget:${suffix}:old-delivery`,
+      kind: 'initial',
+      state: 'delivered',
+      sentAt: new Date(Date.now() - 48 * 60 * 60 * 1000),
+    });
+    const afterOldDelivery = await service.reserveMessage({
+      businessId,
+      channel: 'email',
+      toAddress: 'after-old@example.test',
+      subject: 'Demo',
+      body: 'After old body',
+      idempotencyKey: `delivery-budget:${suffix}:after-old`,
+      messageKind: 'initial',
+      dailyLimit: 1,
+    });
+    assert.equal(afterOldDelivery.kind, 'reserved');
+    if (afterOldDelivery.kind !== 'reserved') throw new Error('old delivery consumed current budget');
+    await testDb.update(schema.outreachMessages).set({ state: 'failed' })
+      .where(eq(schema.outreachMessages.id, afterOldDelivery.messageId));
+    await testDb.insert(schema.outreachMessages).values({
+      businessId,
+      channel: 'email',
+      toAddress: 'recent-delivery@example.test',
+      subject: 'Recent delivery',
+      body: 'Recent delivery body',
+      idempotencyKey: `delivery-budget:${suffix}:recent-delivery`,
+      kind: 'initial',
+      state: 'delivered',
+      sentAt: new Date(),
+      createdAt: new Date(Date.now() - 48 * 60 * 60 * 1000),
+    });
+    const afterRecentDelivery = await service.reserveMessage({
+      businessId,
+      channel: 'email',
+      toAddress: 'after-recent@example.test',
+      subject: 'Demo',
+      body: 'After recent body',
+      idempotencyKey: `delivery-budget:${suffix}:after-recent`,
+      messageKind: 'initial',
+      dailyLimit: 1,
+    });
+    assert.equal(afterRecentDelivery.kind, 'daily_limit');
+  });
+
+  await check('delivery finalization commits audit, status, deal, and followups together', async () => {
+    const suffix = randomUUID();
+    const campaignId = `campaign-delivery-finalize-${suffix}`;
+    const businessId = `e2e-delivery-finalize-${suffix}`;
+    const rollbackBusinessId = `e2e-delivery-finalize-rollback-${suffix}`;
+    await testDb.insert(schema.campaigns).values({
+      id: campaignId,
+      country: 'GR',
+      city: 'Patras',
+      niche: 'test',
+      language: 'el',
+      queries: ['test'],
+      geofence: { lat: 38.2, lng: 21.7, radiusKm: 1 },
+    });
+    await testDb.insert(schema.businesses).values([
+      {
+        id: businessId,
+        campaignId,
+        name: 'Delivery Finalize Test',
+        normalizedName: 'delivery finalize test',
+        status: 'outreach_approved',
+      },
+      {
+        id: rollbackBusinessId,
+        campaignId,
+        name: 'Delivery Finalize Rollback Test',
+        normalizedName: 'delivery finalize rollback test',
+        status: 'outreach_approved',
+      },
+    ]);
+    const [approval, rollbackApproval] = await testDb.insert(schema.approvals).values([
+      { businessId, kind: 'outreach', decision: 'approved' },
+      { businessId: rollbackBusinessId, kind: 'outreach', decision: 'approved' },
+    ]).returning({ id: schema.approvals.id });
+    const service = new OutreachDeliveryService(
+      (plan) => store.enqueueTransaction(plan),
+      testDb,
+      () => [3, 7],
+    );
+    const reserved = await service.reserveMessage({
+      businessId,
+      channel: 'email',
+      toAddress: 'finalize@example.test',
+      subject: 'Demo',
+      body: 'Finalize body',
+      idempotencyKey: `delivery-finalize:${suffix}`,
+      messageKind: 'initial',
+      dailyLimit: 1000,
+    });
+    assert.equal(reserved.kind, 'reserved');
+    if (reserved.kind !== 'reserved') throw new Error('delivery reservation failed');
+    const finalized = await Promise.all(Array.from({ length: 20 }, () => (
+      service.finalizeInitial({
+        messageId: reserved.messageId,
+        businessId,
+        approvalId: approval!.id,
+        channel: 'email',
+        state: 'simulated',
+        providerMessageId: `simulated-${suffix}`,
+        mode: 'dry_run',
+      })
+    )));
+    assert.equal(finalized.filter((result) => result.kind === 'finalized').length, 1);
+    assert.equal(finalized.filter((result) => result.kind === 'already_finalized').length, 19);
+    assert.equal(await count(
+      `select count(*) from outreach_events where message_id = $1 and event = 'sent'`,
+      [reserved.messageId],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from businesses where id = $1 and status = 'contacted'`,
+      [businessId],
+    ), 1);
+    assert.equal(await count(`select count(*) from deals where business_id = $1`, [businessId]), 1);
+    assert.equal(await count(
+      `select count(*) from workflow_job_runs where business_id = $1 and job_type = 'send-followup'`,
+      [businessId],
+    ), 2);
+
+    const rollbackReserved = await service.reserveMessage({
+      businessId: rollbackBusinessId,
+      channel: 'email',
+      toAddress: 'finalize-rollback@example.test',
+      subject: 'Demo',
+      body: 'Rollback body',
+      idempotencyKey: `delivery-finalize-rollback:${suffix}`,
+      messageKind: 'initial',
+      dailyLimit: 1000,
+    });
+    assert.equal(rollbackReserved.kind, 'reserved');
+    if (rollbackReserved.kind !== 'reserved') throw new Error('rollback reservation failed');
+    const failingStore = new WorkflowRunStore(pool, {
+      send: async () => { throw new Error('followup enqueue injection'); },
+    });
+    const failingService = new OutreachDeliveryService(
+      (plan) => failingStore.enqueueTransaction(plan),
+      testDb,
+      () => [3, 7],
+    );
+    await assert.rejects(failingService.finalizeInitial({
+      messageId: rollbackReserved.messageId,
+      businessId: rollbackBusinessId,
+      approvalId: rollbackApproval!.id,
+      channel: 'email',
+      state: 'sent',
+      providerMessageId: `provider-${suffix}`,
+      mode: 'live',
+    }), /followup enqueue injection/);
+    assert.equal(await count(
+      `select count(*) from outreach_messages where id = $1 and state = 'queued'`,
+      [rollbackReserved.messageId],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from outreach_events where message_id = $1`,
+      [rollbackReserved.messageId],
+    ), 0);
+    assert.equal(await count(
+      `select count(*) from businesses where id = $1 and status = 'outreach_approved'`,
+      [rollbackBusinessId],
+    ), 1);
+    assert.equal(await count(`select count(*) from deals where business_id = $1`, [rollbackBusinessId]), 0);
+    assert.equal(await count(
+      `select count(*) from workflow_job_runs where business_id = $1 and job_type = 'send-followup'`,
+      [rollbackBusinessId],
+    ), 0);
+
+    await service.markDeliveryUnknown(
+      rollbackReserved.messageId,
+      rollbackBusinessId,
+      'provider accepted but local finalization failed',
+    );
+    assert.equal(await count(
+      `select count(*) from outreach_messages where id = $1 and state = 'delivery_unknown' and sent_at is not null`,
+      [rollbackReserved.messageId],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from outreach_events where message_id = $1 and event = 'delivery_unknown'`,
+      [rollbackReserved.messageId],
+    ), 1);
+    const blockedRetry = await service.reserveMessage({
+      businessId: rollbackBusinessId,
+      channel: 'email',
+      toAddress: 'finalize-rollback@example.test',
+      subject: 'Demo',
+      body: 'Rollback body',
+      idempotencyKey: `delivery-finalize-rollback:${suffix}`,
+      messageKind: 'initial',
+      dailyLimit: 1000,
+    });
+    assert.equal(blockedRetry.kind, 'duplicate');
   });
 
   await check('manual build transition and content handoff commit exactly once', async () => {

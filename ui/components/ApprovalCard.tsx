@@ -22,6 +22,21 @@ function channelLabel(value: string | null): string {
   return CHANNELS.find((c) => c.value === value)?.label ?? '—';
 }
 
+function approvalStatus(sendState: string | null) {
+  switch (sendState) {
+    case 'delivery_unknown':
+      return { tone: 'stop' as const, text: 'Результат відправки невідомий — не надсилай повторно' };
+    case 'failed':
+      return { tone: 'stop' as const, text: 'Відправку не завершено — перевір помилку задачі' };
+    case 'manual_pending':
+      return { tone: 'wait' as const, text: 'Затверджено — чекає ручної відправки' };
+    case 'queued':
+      return { tone: 'wait' as const, text: 'Затверджено — повідомлення у черзі' };
+    default:
+      return { tone: 'wait' as const, text: 'Демо готове — чекає на твоє слово' };
+  }
+}
+
 /**
  * The one decision the whole factory is built around: send this message, or not.
  *
@@ -63,6 +78,7 @@ export function ApprovalCard({ item }: { item: ApprovalItem }) {
   const dirty = channel !== (item.channel ?? '') || body !== item.body;
   const deepLink = deepLinkFor(channel, toAddress, body);
   const verdict = humanVerdict(item.websiteVerdict);
+  const deliveryStatus = approvalStatus(item.sendState);
 
   // The in-card result panel STAYS: for a manual channel it is not a message
   // but a workflow — the deep link, the copy button and «Я надіслав». The toast
@@ -103,7 +119,7 @@ export function ApprovalCard({ item }: { item: ApprovalItem }) {
   return (
     <article className="card overflow-hidden">
       <div className="p-5 sm:p-6">
-        <Status tone="wait">Демо готове — чекає на твоє слово</Status>
+        <Status tone={deliveryStatus.tone}>{deliveryStatus.text}</Status>
 
         <h2 className="text-xl font-semibold mt-2">
           <Link href={`/businesses/${item.businessId}`} className="link">

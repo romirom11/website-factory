@@ -3,9 +3,9 @@ import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import * as schema from '../db/schema.js';
 import type { OutreachChannel } from '../channels/types.js';
 import {
-  followupIdempotencyKey,
   sendIdempotencyKey,
 } from '../outreach/idempotency.js';
+import { createFollowupCommands } from '../outreach/followups.js';
 import {
   type EnqueueResult,
   type WorkflowRunStore,
@@ -56,25 +56,6 @@ function record(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
-}
-
-function followupCommands(
-  approvalId: number,
-  businessId: string,
-  channel: string,
-  days: readonly number[],
-) {
-  return days.map((day, index) => ({
-    name: 'send-followup' as const,
-    payload: {
-      businessId,
-      followupIndex: index + 1,
-      approvalId,
-      channel,
-      idempotencyKey: followupIdempotencyKey(approvalId, index + 1),
-    },
-    options: { startAfterSeconds: Math.max(0, Math.round(day * 24 * 60 * 60)) },
-  }));
 }
 
 /**
@@ -298,7 +279,7 @@ export class OutreachDecisionService {
         state: 'contacted',
       }).onConflictDoNothing();
       confirmedBusinessId = approval.businessId;
-      return followupCommands(
+      return createFollowupCommands(
         approval.id,
         approval.businessId,
         message.channel,

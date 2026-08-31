@@ -17,19 +17,23 @@
  * `manual_pending`, and Roman's "I sent it" command is committed by
  * `OutreachDecisionService` together with status, audit and follow-up jobs.
  */
-import { and, eq, desc, gte, inArray, sql } from 'drizzle-orm';
+import { and, eq, desc } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 import { config } from '../config.js';
-import {
-  businessTransitions,
-  canContinueAfterTransition,
-  requireBusinessStatus,
-} from '../orchestrator/statuses.js';
+import { requireBusinessStatus } from '../orchestrator/statuses.js';
 import { enforceDoNotContact } from '../orchestrator/safetyTransitions.js';
-import { enqueue, type JobPayload } from '../orchestrator/queue.js';
-import { adapterFor, deepLinkFor, isManualChannel, type OutreachChannel, type OutreachDraft } from '../channels/index.js';
+import { commitWorkflow, type JobPayload } from '../orchestrator/queue.js';
+import {
+  adapterFor,
+  deepLinkFor,
+  isManualChannel,
+  NotConfiguredError,
+  type OutreachChannel,
+  type OutreachDraft,
+} from '../channels/index.js';
 import { notifyManualFollowup } from '../telegram/notify.js';
 import { log } from '../lib/logger.js';
+import { OutreachDeliveryService } from '../orchestrator/outreachDeliveryService.js';
 import {
   followupIdempotencyKey,
   sendIdempotencyKey,
@@ -37,8 +41,11 @@ import {
 
 export { followupIdempotencyKey, sendIdempotencyKey } from '../outreach/idempotency.js';
 
-/** States that count as "this message exists, do not create another". */
-const LIVE_STATES = ['queued', 'sent', 'delivered', 'simulated', 'manual_pending'];
+const outreachDelivery = new OutreachDeliveryService(
+  commitWorkflow,
+  db,
+  () => config.followupDays,
+);
 
 /** Live delivery is a two-key switch: global factory AND campaign must opt in. */
 export function resolveOutreachMode(
@@ -57,16 +64,6 @@ async function outreachModeForBusiness(businessId: string): Promise<'dry_run' | 
   return resolveOutreachMode(config.mode, row.campaignMode);
 }
 
-async function dailySendCount(): Promise<number> {
-  const since = new Date(Date.now() - 24 * 3600 * 1000);
-  const rows = await db.select({ n: sql<number>`count(*)` }).from(schema.outreachMessages)
-    .where(and(
-      inArray(schema.outreachMessages.state, ['sent', 'simulated']),
-      gte(schema.outreachMessages.sentAt, since),
-    ));
-  return Number(rows[0]?.n ?? 0);
-}
-
 /** DNC is checked against the business id and the concrete address being used. */
 async function isDoNotContact(businessId: string, toAddress: string): Promise<string | null> {
   const rows = await db.select().from(schema.doNotContact);
@@ -79,16 +76,31 @@ async function isDoNotContact(businessId: string, toAddress: string): Promise<st
   return null;
 }
 
-export async function scheduleFollowups(approvalId: number, businessId: string, channel: string): Promise<void> {
-  for (let i = 0; i < config.followupDays.length; i++) {
-    const key = followupIdempotencyKey(approvalId, i + 1);
-    await enqueue(
-      'send-followup',
-      { businessId, followupIndex: i + 1, approvalId, channel, idempotencyKey: key },
-      { startAfterSeconds: config.followupDays[i] * 24 * 3600 },
-    );
+function errorDetail(error: unknown): string {
+  return String(error instanceof Error ? error.stack ?? error.message : error);
+}
+
+async function markDeliveryFailure(
+  messageId: number,
+  businessId: string,
+  error: unknown,
+  mayHaveSent: boolean,
+): Promise<void> {
+  const detail = errorDetail(error);
+  try {
+    if (mayHaveSent) {
+      await outreachDelivery.markDeliveryUnknown(messageId, businessId, detail);
+    } else {
+      await outreachDelivery.markFailed(messageId, businessId, detail);
+    }
+  } catch (recordError) {
+    log.error('failed to persist outreach delivery failure', {
+      businessId,
+      messageId,
+      mayHaveSent,
+      err: errorDetail(recordError),
+    });
   }
-  log.info('followups scheduled', { businessId, approvalId, days: config.followupDays });
 }
 
 export async function sendOutreachHandler(job: JobPayload): Promise<void> {
@@ -154,36 +166,38 @@ export async function sendOutreachHandler(job: JobPayload): Promise<void> {
     return;
   }
 
-  // ── Gate 3: exactly once. The unique index on idempotency_key is the referee:
-  // a concurrent duplicate loses the insert race and returns no row.
-  const [msg] = await db.insert(schema.outreachMessages).values({
+  const manual = isManualChannel(draft.channel);
+
+  // ── Gates 3 + 4: exactly-once intent and the daily budget are reserved in
+  // one serialized transaction. Parallel workers cannot overshoot the limit.
+  const reservation = await outreachDelivery.reserveMessage({
     businessId,
     channel: draft.channel,
     toAddress: draft.toAddress,
     subject: draft.subject,
     body: draft.body,
     idempotencyKey: expectedKey,
-    kind: 'initial',
-    state: 'queued',
-  }).onConflictDoNothing({ target: schema.outreachMessages.idempotencyKey }).returning();
-
-  if (!msg) {
+    messageKind: 'initial',
+    dailyLimit: config.outreachDailyLimit,
+  });
+  if (reservation.kind === 'daily_limit') {
+    throw new Error(
+      `daily outreach limit (${reservation.limit}) reached; re-enqueue this send tomorrow`,
+    );
+  }
+  if (reservation.kind === 'duplicate') {
     log.warn('outreach already exists for this approval, refusing duplicate send', {
-      businessId, approvalId: approval.id, idempotencyKey: expectedKey,
+      businessId,
+      approvalId: approval.id,
+      idempotencyKey: expectedKey,
+      state: reservation.state,
     });
     return;
   }
-
-  // ── Gate 4: daily limit, checked at send time. The row is rolled back so the
-  // send can legitimately happen tomorrow under the same key.
-  if ((await dailySendCount()) >= config.outreachDailyLimit) {
-    await db.delete(schema.outreachMessages).where(eq(schema.outreachMessages.id, msg.id));
-    throw new Error(`daily outreach limit (${config.outreachDailyLimit}) reached; re-enqueue this send tomorrow`);
-  }
+  const messageId = reservation.messageId;
 
   const adapter = adapterFor(draft.channel);
-  const manual = isManualChannel(draft.channel);
-  let state: string;
+  let state: 'sent' | 'simulated' | 'manual_pending';
   let providerMessageId: string | null = null;
 
   try {
@@ -206,32 +220,45 @@ export async function sendOutreachHandler(job: JobPayload): Promise<void> {
       providerMessageId = res.providerMessageId;
     }
   } catch (err) {
-    await db.update(schema.outreachMessages).set({ state: 'failed' })
-      .where(eq(schema.outreachMessages.id, msg.id));
+    const mayHaveSent = outreachMode === 'live'
+      && !manual
+      && !(err instanceof NotConfiguredError);
+    await markDeliveryFailure(messageId, businessId, err, mayHaveSent);
     throw err; // never auto-retried (RETRY limit 0 for send-outreach)
   }
 
-  await db.update(schema.outreachMessages)
-    .set({ state, providerMessageId, sentAt: state === 'manual_pending' ? null : new Date() })
-    .where(eq(schema.outreachMessages.id, msg.id));
-  await db.insert(schema.outreachEvents).values({
-    businessId, messageId: msg.id,
-    event: state === 'manual_pending' ? 'queued_manual' : 'sent',
-    detail: { channel: draft.channel, state, mode: outreachMode, approvalId: approval.id },
-  });
-
-  // Manual channels only become `contacted` once Roman confirms he sent it.
-  if (state !== 'manual_pending') {
-    const transitioned = await businessTransitions.normal({
+  let finalized;
+  try {
+    finalized = await outreachDelivery.finalizeInitial({
+      messageId,
       businessId,
-      expectedStatus: 'outreach_approved',
-      to: 'contacted',
-      actor: 'outreach-worker',
-      reason: `${draft.channel} ${state}`,
+      approvalId: approval.id,
+      channel: draft.channel,
+      state,
+      providerMessageId,
+      mode: outreachMode,
     });
-    if (!canContinueAfterTransition(transitioned, { businessId, actor: 'outreach-worker' })) return;
-    await db.insert(schema.deals).values({ businessId, state: 'contacted' }).onConflictDoNothing();
-    await scheduleFollowups(approval.id, businessId, draft.channel);
+  } catch (err) {
+    await markDeliveryFailure(
+      messageId,
+      businessId,
+      err,
+      outreachMode === 'live' && !manual,
+    );
+    throw err;
+  }
+  if (finalized.kind === 'finalized' && !finalized.businessAdvanced && !manual) {
+    log.warn('outreach delivered after business status advanced; followups suppressed', {
+      businessId,
+      approvalId: approval.id,
+    });
+  }
+  if (finalized.kind === 'finalized' && finalized.followups.length) {
+    log.info('followups scheduled', {
+      businessId,
+      approvalId: approval.id,
+      days: config.followupDays,
+    });
   }
 
   log.info('outreach done', { businessId, channel: draft.channel, state, approvalId: approval.id });
@@ -298,34 +325,38 @@ export async function sendFollowupHandler(job: JobPayload): Promise<void> {
     ? followupIdempotencyKey(approvalId, idx)
     : `followup:${businessId}:${initial.channel}:${idx}`;
 
-  const [msg] = await db.insert(schema.outreachMessages).values({
+  const channel = initial.channel as OutreachChannel;
+  const manual = isManualChannel(channel);
+  const reservation = await outreachDelivery.reserveMessage({
     businessId,
-    channel: initial.channel,
+    channel,
     toAddress: initial.toAddress,
     subject: initial.subject ? `Re: ${initial.subject}` : null,
     body,
     idempotencyKey: key,
-    kind: `followup_${idx}`,
-    state: 'queued',
-  }).onConflictDoNothing({ target: schema.outreachMessages.idempotencyKey }).returning();
-  if (!msg) { log.warn('followup already exists', { businessId, key }); return; }
-
-  // Follow-ups count against the same daily budget as first contact.
-  if ((await dailySendCount()) >= config.outreachDailyLimit) {
-    await db.delete(schema.outreachMessages).where(eq(schema.outreachMessages.id, msg.id));
+    messageKind: `followup_${idx}`,
+    dailyLimit: config.outreachDailyLimit,
+  });
+  if (reservation.kind === 'daily_limit') {
     log.warn('followup postponed: daily limit reached', { businessId, idx });
-    throw new Error(`daily outreach limit (${config.outreachDailyLimit}) reached; follow-up ${idx} not sent`);
+    throw new Error(
+      `daily outreach limit (${reservation.limit}) reached; follow-up ${idx} not sent`,
+    );
   }
+  if (reservation.kind === 'duplicate') {
+    log.warn('followup already exists', { businessId, key, state: reservation.state });
+    return;
+  }
+  const messageId = reservation.messageId;
 
-  const channel = initial.channel as OutreachChannel;
   const adapter = adapterFor(channel);
   const draft: OutreachDraft = {
     channel, toAddress: initial.toAddress, subject: initial.subject, body,
   };
-  let state: string;
+  let state: 'sent' | 'simulated' | 'manual_pending';
   let providerMessageId: string | null = null;
   try {
-    if (isManualChannel(channel)) {
+    if (manual) {
       // Instagram/Viber: a follow-up is a Telegram card with a deep link, never
       // an automatic send (SPEC §2.2 — DM automation risks the account).
       state = 'manual_pending';
@@ -351,18 +382,31 @@ export async function sendFollowupHandler(job: JobPayload): Promise<void> {
       providerMessageId = res.providerMessageId;
     }
   } catch (err) {
-    await db.update(schema.outreachMessages).set({ state: 'failed' }).where(eq(schema.outreachMessages.id, msg.id));
+    const mayHaveSent = outreachMode === 'live'
+      && !manual
+      && !(err instanceof NotConfiguredError);
+    await markDeliveryFailure(messageId, businessId, err, mayHaveSent);
     throw err; // never auto-retried
   }
 
-  await db.update(schema.outreachMessages)
-    .set({ state, providerMessageId, sentAt: state === 'manual_pending' ? null : new Date() })
-    .where(eq(schema.outreachMessages.id, msg.id));
-  await db.insert(schema.outreachEvents).values({
-    businessId, messageId: msg.id, event: state === 'manual_pending' ? 'queued_manual' : 'sent',
-    detail: { kind: `followup_${idx}`, state, channel, mode: outreachMode },
-  });
+  try {
+    await outreachDelivery.finalizeFollowup({
+      messageId,
+      businessId,
+      followupIndex: idx,
+      channel,
+      state,
+      providerMessageId,
+      mode: outreachMode,
+    });
+  } catch (err) {
+    await markDeliveryFailure(
+      messageId,
+      businessId,
+      err,
+      outreachMode === 'live' && !manual,
+    );
+    throw err;
+  }
   log.info('followup processed', { businessId, idx, state });
 }
-
-export { LIVE_STATES };

@@ -283,15 +283,23 @@ export const outreachMessages = pgTable('outreach_messages', {
   idempotencyKey: text('idempotency_key').notNull(),
   providerMessageId: text('provider_message_id'),
   kind: text('kind').notNull().default('initial'), // initial | followup_1 | followup_2
-  state: text('state').notNull().default('queued'), // queued | sent | delivered | failed | simulated | manual_pending
+  state: text('state').notNull().default('queued'), // queued | sent | delivered | failed | delivery_unknown | simulated | manual_pending
   sentAt: timestamp('sent_at'),
-}, (t) => [uniqueIndex('outreach_idem_idx').on(t.idempotencyKey), index('outreach_biz_idx').on(t.businessId)]);
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex('outreach_idem_idx').on(t.idempotencyKey),
+  index('outreach_biz_idx').on(t.businessId),
+  index('outreach_budget_sent_idx').on(t.sentAt)
+    .where(sql`${t.channel} in ('email', 'whatsapp') and ${t.state} in ('sent', 'delivered', 'simulated', 'delivery_unknown')`),
+  index('outreach_budget_queued_idx').on(t.createdAt)
+    .where(sql`${t.channel} in ('email', 'whatsapp') and ${t.state} = 'queued'`),
+]);
 
 export const outreachEvents = pgTable('outreach_events', {
   id: serial('id').primaryKey(),
   businessId: text('business_id').notNull().references(() => businesses.id),
   messageId: integer('message_id').references(() => outreachMessages.id),
-  event: text('event').notNull(), // sent | delivered | bounced | replied | opted_out
+  event: text('event').notNull(), // sent | delivered | bounced | replied | opted_out | failed | delivery_unknown
   detail: jsonb('detail'),
   at: timestamp('at').notNull().defaultNow(),
 });

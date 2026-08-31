@@ -30,6 +30,7 @@ function executor(
     markDoNotContact: async (businessId) => ({ kind: 'blocked', businessId, blockedAddresses: 2 }),
     updateDealStage: async (businessId, state) => ({ kind: 'updated', businessId, state }),
     startBuild: async (businessId) => ({ kind: 'started', businessId, job: acceptedJob }),
+    recollectFacts: async (businessId) => ({ kind: 'started', businessId, job: acceptedJob }),
     ...overrides,
   };
 }
@@ -73,12 +74,14 @@ await check('valid commands preserve normalized service results', async () => {
   const dnc = await post(app, '/internal/businesses/a/do-not-contact', { reason: ' owner asked ' }, 'secret');
   const deal = await post(app, '/internal/businesses/a/deal-stage', { state: 'proposal' }, 'secret');
   const build = await post(app, '/internal/businesses/a/builds', undefined, 'secret');
+  const recollect = await post(app, '/internal/businesses/a/recollect-facts', undefined, 'secret');
   assert.equal(dnc.status, 200);
   assert.equal(dnc.body.result.blockedAddresses, 2);
   assert.equal(deal.status, 200);
   assert.equal(deal.body.result.state, 'proposal');
   assert.equal(build.status, 202);
   assert.equal(build.body.result.job.kind, 'accepted');
+  assert.equal(recollect.status, 202);
 });
 
 await check('domain conflicts are explicit and retryable by the UI', async () => {

@@ -566,6 +566,43 @@ await withDisposableFactoryDatabase(async ({ pool, db: testDb, boss }) => {
     assert.equal(await count(`select count(*) from status_history where business_id = $1`, [dealBusinessId]), 1);
   });
 
+  await check('manual fact recollection claims status and enrichment exactly once', async () => {
+    const suffix = randomUUID();
+    const campaignId = `campaign-recollect-${suffix}`;
+    const businessId = `e2e-recollect-${suffix}`;
+    await testDb.insert(schema.campaigns).values({
+      id: campaignId,
+      country: 'GR',
+      city: 'Patras',
+      niche: 'test',
+      language: 'el',
+      queries: ['test'],
+      geofence: { lat: 38.2, lng: 21.7, radiusKm: 1 },
+    });
+    await testDb.insert(schema.businesses).values({
+      id: businessId,
+      campaignId,
+      name: 'Recollect Test',
+      normalizedName: 'recollect test',
+      status: 'needs_review',
+    });
+    const service = new OperatorBusinessCommandService(store, testDb);
+    const results = await Promise.all(
+      Array.from({ length: 20 }, () => service.recollectFacts(businessId)),
+    );
+    assert.equal(results.filter((result) => result.kind === 'started').length, 1);
+    assert.equal(results.filter((result) => result.kind === 'already_active').length, 19);
+    assert.equal(await count(
+      `select count(*) from businesses where id = $1 and status = 'enriching'`,
+      [businessId],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from workflow_job_runs where business_id = $1 and job_type = 'enrich'`,
+      [businessId],
+    ), 1);
+    assert.equal(await count(`select count(*) from status_history where business_id = $1`, [businessId]), 1);
+  });
+
   await check('a terminal run permits a new logical run with the same key', async () => {
     const key = `terminal:${randomUUID()}`;
     const first = await store.enqueue(command(key));

@@ -7,7 +7,7 @@ import {
 
 export type OperatorBusinessCommandExecutor = Pick<
   OperatorBusinessCommandService,
-  'markDoNotContact' | 'updateDealStage' | 'startBuild'
+  'markDoNotContact' | 'updateDealStage' | 'startBuild' | 'recollectFacts'
 >;
 
 function isDealState(value: unknown): value is DealState {
@@ -59,5 +59,18 @@ export function registerOperatorBusinessCommandRoutes(
       return context.json({ ok: false, message: result.kind === 'not_found' ? 'business not found' : result.message, result }, conflictStatus(result.kind));
     }
     return context.json({ ok: true, message: 'build queued', result }, result.job.kind === 'accepted' ? 202 : 200);
+  });
+
+  app.post('/internal/businesses/:businessId/recollect-facts', internalAuth, async (context) => {
+    const businessId = context.req.param('businessId').trim();
+    if (!businessId) return context.json({ ok: false, message: 'businessId is required' }, 400);
+    const result = await execute.recollectFacts(businessId);
+    if (result.kind === 'already_active') {
+      return context.json({ ok: true, message: 'fact recollection already active', result });
+    }
+    if (result.kind !== 'started') {
+      return context.json({ ok: false, message: result.kind === 'not_found' ? 'business not found' : result.message, result }, conflictStatus(result.kind));
+    }
+    return context.json({ ok: true, message: 'fact recollection queued', result }, result.job.kind === 'accepted' ? 202 : 200);
   });
 }

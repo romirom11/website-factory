@@ -41,6 +41,10 @@ export type StartBuildResult = OperatorCommandConflict | {
   job: EnqueueResult;
 };
 
+export type RecollectFactsResult = OperatorCommandConflict
+  | { kind: 'already_active'; businessId: string }
+  | { kind: 'started'; businessId: string; job: EnqueueResult };
+
 /** Owns operator mutations that must stay consistent with workflow state. */
 export class OperatorBusinessCommandService {
   private readonly transitions: BusinessTransitionService;
@@ -226,6 +230,80 @@ export class OperatorBusinessCommandService {
         },
         options: {
           priority: buildJobPriority({ latestVerdict: audit?.verdict, score: business.score }),
+        },
+      }];
+    });
+    const job = jobs[0];
+    if (job) result = { kind: 'started', businessId, job };
+    return result;
+  }
+
+  async recollectFacts(businessId: string): Promise<RecollectFactsResult> {
+    let result: RecollectFactsResult = { kind: 'not_found', entity: 'business' };
+    const jobs = await this.runStore.enqueueTransaction(async (tx) => {
+      const [business] = await tx.select({
+        status: schema.businesses.status,
+        campaignId: schema.businesses.campaignId,
+      }).from(schema.businesses)
+        .where(eq(schema.businesses.id, businessId))
+        .limit(1)
+        .for('update');
+      if (!business) return [];
+      const status = requireBusinessStatus(business.status, `business ${businessId}`);
+      if (status !== 'needs_review' && status !== 'enriching') {
+        result = {
+          kind: 'state_conflict',
+          message: `business status ${status} cannot recollect facts`,
+        };
+        return [];
+      }
+      const [activeRun] = await tx.select({ id: schema.workflowJobRuns.id })
+        .from(schema.workflowJobRuns)
+        .where(and(
+          eq(schema.workflowJobRuns.businessId, businessId),
+          eq(schema.workflowJobRuns.jobType, 'enrich'),
+          inArray(schema.workflowJobRuns.status, ACTIVE_RUN_STATUSES),
+        ))
+        .limit(1);
+      if (activeRun) {
+        if (status === 'needs_review') {
+          const transition = await this.transitions.normalInTransaction(tx, {
+            businessId,
+            expectedStatus: 'needs_review',
+            to: 'enriching',
+            actor: 'roman',
+            reason: 'manual fact recollection already active',
+          });
+          if (transition.kind !== 'moved') {
+            throw new Error(`fact recollection lost its locked transition for ${businessId}`);
+          }
+        }
+        result = { kind: 'already_active', businessId };
+        return [];
+      }
+      if (status !== 'needs_review') {
+        result = {
+          kind: 'state_conflict',
+          message: 'business is enriching but has no active enrichment run',
+        };
+        return [];
+      }
+      const transition = await this.transitions.normalInTransaction(tx, {
+        businessId,
+        expectedStatus: 'needs_review',
+        to: 'enriching',
+        actor: 'roman',
+        reason: 'manual fact recollection requested',
+      });
+      if (transition.kind !== 'moved') {
+        throw new Error(`fact recollection lost its locked transition for ${businessId}`);
+      }
+      return [{
+        name: 'enrich',
+        payload: {
+          businessId,
+          campaignId: business.campaignId,
+          idempotencyKey: `enrich:${businessId}:roman`,
         },
       }];
     });

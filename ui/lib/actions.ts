@@ -523,49 +523,17 @@ export async function resolveBusinessReviewAction(input: {
     return { ok: true, message: `${biz.name}: закрито без статусу «Відхилено» і без контакту` };
   }
 
-  const [latest] = await db.select({ status: schema.workflowJobs.status })
-    .from(schema.workflowJobs)
-    .where(and(
-      eq(schema.workflowJobs.businessId, biz.id),
-      eq(schema.workflowJobs.jobType, 'enrich'),
-    ))
-    .orderBy(desc(schema.workflowJobs.createdAt))
-    .limit(1);
-  if (isActiveJobStatus(latest?.status)) {
-    const moved = await transitionBusinessFrom(
-      biz.id, 'needs_review', 'enriching', 'повторний збір фактів уже запущено Романом',
-    );
-    revalidatePath('/inbox');
-    if (!moved.ok) return moved;
-    return { ok: true, message: `${biz.name}: факти вже перезбираються` };
+  const response = await factoryFetch(`/internal/businesses/${biz.id}/recollect-facts`, {
+    method: 'POST',
+  });
+  if (!response.ok) {
+    return { ok: false, message: response.message || 'Не вдалося запустити повторний збір фактів.' };
   }
-
-  const claimReason = 'Роман попросив заново зібрати й перевірити факти';
-  const moved = await transitionBusinessFrom(
-    biz.id, 'needs_review', 'enriching', claimReason,
-  );
-  if (!moved.ok) return moved;
-
-  let result: Awaited<ReturnType<typeof enqueueJob>>;
-  try {
-    result = await enqueueJob({
-      name: 'enrich',
-      businessId: biz.id,
-      campaignId: biz.campaignId,
-      idempotencyKey: `enrich:${biz.id}:roman`,
-    });
-  } catch (error) {
-    await transitionBusinessFrom(
-      biz.id,
-      'enriching',
-      'needs_review',
-      biz.statusReason ?? 'повторний збір фактів не вдалося запустити',
-    );
-    throw error;
-  }
-
+  const result = response.body?.result as Record<string, unknown> | undefined;
   revalidatePath('/inbox');
-  if (result.kind === 'duplicate') return { ok: true, message: `${biz.name}: повторний збір уже стоїть у черзі` };
+  if (result?.kind === 'already_active') {
+    return { ok: true, message: `${biz.name}: повторний збір уже стоїть у черзі` };
+  }
   return { ok: true, message: `${biz.name}: заново збираю факти й джерела` };
 }
 

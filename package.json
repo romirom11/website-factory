@@ -32,6 +32,7 @@
     "test:discovery-resilience": "tsx scripts/test-discovery-resilience.ts",
     "test:business-transition-api": "tsx scripts/test-business-transition-command-api.ts",
     "test:outreach-decision-api": "tsx scripts/test-outreach-decision-command-api.ts",
+    "test:operator-business-api": "tsx scripts/test-operator-business-command-api.ts",
     "test:campaign-command-api": "tsx scripts/test-campaign-command-api.ts",
     "test:build-review-decision": "tsx scripts/test-build-review-decision.ts",
     "test:enrichment-barrier": "tsx scripts/test-enrichment-barrier.ts",

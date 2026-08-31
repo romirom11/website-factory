@@ -47,6 +47,8 @@ import { OutreachDecisionService } from '../orchestrator/outreachDecisionService
 import { WorkflowRunStore } from '../orchestrator/workflowRunStore.js';
 import { registerCampaignCommandRoutes } from './campaignCommands.js';
 import { CampaignCommandService } from '../orchestrator/campaignCommandService.js';
+import { registerOperatorBusinessCommandRoutes } from './operatorBusinessCommands.js';
+import { OperatorBusinessCommandService } from '../orchestrator/operatorBusinessCommandService.js';
 
 export async function startApi(): Promise<void> {
   // Queue creation is part of readiness. In API-only mode there may be no
@@ -91,6 +93,11 @@ export async function startApi(): Promise<void> {
     app,
     internalAuth,
     new CampaignCommandService(workflowRunStore, () => config.mode),
+  );
+  registerOperatorBusinessCommandRoutes(
+    app,
+    internalAuth,
+    new OperatorBusinessCommandService(workflowRunStore, db),
   );
 
   /**

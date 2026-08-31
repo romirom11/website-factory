@@ -17,8 +17,7 @@ import { db, schema } from './db';
 import { enqueueJob, type JobName } from './jobs';
 import { isManualChannel, deepLinkFor } from './keys';
 import {
-  BUILDABLE_STATUSES, BUILD_POLICY_LABELS, buildJobPriority, isActiveJobStatus,
-  isActiveProjectState, normalizeBuildPolicy,
+  BUILD_POLICY_LABELS, isActiveJobStatus, normalizeBuildPolicy,
 } from './buildPolicy';
 import { CLOSED_STATUSES, isSocialChannel, socialsButtonState } from './socials';
 import { humanStatus, reviewAsk } from './humanStatus';
@@ -227,30 +226,22 @@ export async function markDoNotContact(formData: FormData): Promise<ActionResult
   const reason = String(formData.get('reason') ?? '').trim() || 'позначено вручну в UI';
   if (!businessId) return { ok: false, message: 'Не вибрано бізнес' };
 
-  await db.insert(schema.doNotContact)
-    .values({ matchType: 'business_id', value: businessId, reason })
-    .onConflictDoNothing();
-
-  // Also block the concrete addresses, so a re-discovered duplicate stays blocked.
-  const contacts = await db.select().from(schema.businessContacts)
-    .where(eq(schema.businessContacts.businessId, businessId));
-  for (const c of contacts) {
-    const matchType = c.channel === 'email' ? 'email'
-      : ['phone', 'whatsapp', 'viber'].includes(c.channel) ? 'phone' : null;
-    if (!matchType) continue;
-    await db.insert(schema.doNotContact)
-      .values({ matchType, value: c.value, reason: `do_not_contact ${businessId}` })
-      .onConflictDoNothing();
+  const response = await factoryFetch(`/internal/businesses/${businessId}/do-not-contact`, {
+    method: 'POST',
+    body: { reason },
+  });
+  if (!response.ok) {
+    return { ok: false, message: response.message || 'Фабрика не зафіксувала заборону контакту.' };
   }
+  const result = response.body?.result as Record<string, unknown> | undefined;
+  const blockedAddresses = Number(result?.blockedAddresses ?? 0);
+  revalidatePath('/inbox');
+  revalidatePath(`/businesses/${businessId}`);
 
-  await transitionBusiness(businessId, 'do_not_contact', reason);
-
-  // Named by its consequence, and it says how many addresses went with the
-  // business — that is the part a person cannot see from the card afterwards.
   return {
     ok: true,
-    message: contacts.length
-      ? `Заблоковано назавжди — бізнес і ${contacts.length} його адрес`
+    message: blockedAddresses
+      ? `Заблоковано назавжди — бізнес і ${blockedAddresses} його адрес`
       : 'Заблоковано назавжди',
   };
 }
@@ -400,15 +391,12 @@ export async function updateDealStage(formData: FormData): Promise<ActionResult>
   const state = String(formData.get('state') ?? '');
   if (!businessId || !state) return { ok: false, message: 'Не вибрано етап' };
 
-  await db.insert(schema.deals).values({ businessId, state })
-    .onConflictDoUpdate({
-      target: schema.deals.businessId,
-      set: { state, updatedAt: new Date() },
-    });
-
-  // Keep the business status in step with the deal for the stages that mirror.
-  if (['replied', 'meeting', 'proposal', 'won', 'lost'].includes(state)) {
-    await transitionBusiness(businessId, state, `deal stage → ${state} (вручну)`);
+  const response = await factoryFetch(`/internal/businesses/${businessId}/deal-stage`, {
+    method: 'POST',
+    body: { state },
+  });
+  if (!response.ok) {
+    return { ok: false, message: response.message || 'Фабрика не оновила етап розмови.' };
   }
   revalidatePath('/inbox');
   revalidatePath(`/businesses/${businessId}`);
@@ -445,74 +433,23 @@ export async function funnelCounts(): Promise<Array<{ campaignId: string; status
  * still done by the content-and-design worker, never here.
  */
 export async function startDemoBuild(businessId: string): Promise<ActionResult> {
-  const [biz] = await db.select().from(schema.businesses)
-    .where(eq(schema.businesses.id, businessId));
-  if (!biz) return { ok: false, message: 'Бізнес не знайдено' };
-
-  if (!BUILDABLE_STATUSES.has(biz.status)) {
-    return { ok: false, message: `${biz.name}: статус ${biz.status} — збірка не запускається звідси` };
-  }
-
-  // Already building? Refuse. Two builders in one workspace is the failure mode
-  // this check exists for.
-  const [project] = await db.select().from(schema.siteProjects)
-    .where(eq(schema.siteProjects.businessId, businessId))
-    .orderBy(desc(schema.siteProjects.createdAt)).limit(1);
-  if (isActiveProjectState(project?.state)) {
-    return { ok: false, message: `${biz.name}: збірка вже йде (${project!.state})` };
-  }
-
-  const [job] = await db.select().from(schema.workflowJobs)
-    .where(and(
-      eq(schema.workflowJobs.businessId, businessId),
-      inArray(schema.workflowJobs.jobType, ['content-and-design', 'build-site']),
-    ))
-    .orderBy(desc(schema.workflowJobs.createdAt)).limit(1);
-  if (isActiveJobStatus(job?.status)) {
-    return { ok: false, message: `${biz.name}: job уже в черзі (${job!.status})` };
-  }
-
-  const [gaps] = await db.select({ n: sql<number>`count(*)` }).from(schema.productionGaps)
-    .where(and(
-      eq(schema.productionGaps.businessId, businessId),
-      eq(schema.productionGaps.resolved, false),
-      eq(schema.productionGaps.blockerLevel, 'hard'),
-    ));
-  const openGaps = Number(gaps?.n ?? 0);
-
-  if (biz.status === 'needs_review') {
-    // A demo built over an unresolved hard gap would have to invent the missing
-    // material, which the factory does not do (SPEC §5). Refuse, don't paper over.
-    if (openGaps > 0) {
-      return { ok: false, message: `${biz.name}: ${openGaps} незакритих gaps — спершу закрий їх` };
-    }
-    const moved = await transitionBusinessFrom(
-      businessId, 'needs_review', 'production_ready',
-      'ручний запуск збірки з UI: gaps закриті',
-    );
-    if (!moved.ok) return moved;
-  }
-
-  const verdict = await latestVerdict(businessId);
-
-  // Stable idempotency key: a second click resolves to the canonical active
-  // run, and the checks above already refuse it even earlier.
-  const result = await enqueueJob({
-    name: 'content-and-design',
-    businessId,
-    campaignId: biz.campaignId,
-    idempotencyKey: `content-and-design:${businessId}`,
-    priority: buildJobPriority({ latestVerdict: verdict, score: biz.score }),
+  const response = await factoryFetch(`/internal/businesses/${businessId}/builds`, {
+    method: 'POST',
   });
+  if (!response.ok) {
+    return { ok: false, message: response.message || 'Фабрика не запустила збірку.' };
+  }
+  const result = response.body?.result as Record<string, unknown> | undefined;
+  const job = result?.job as Record<string, unknown> | undefined;
 
   revalidatePath('/businesses');
   revalidatePath(`/businesses/${businessId}`);
   revalidatePath('/settings', 'layout');
 
-  if (result.kind === 'duplicate') {
-    return { ok: false, message: `${biz.name}: такий job уже активний у черзі` };
+  if (job?.kind === 'duplicate') {
+    return { ok: false, message: 'Такий build job уже активний у черзі' };
   }
-  return { ok: true, message: `${biz.name}: збірка демо поставлена в чергу` };
+  return { ok: true, message: 'Збірка демо поставлена в чергу' };
 }
 
 /** Latest audit verdict, or null when the business was never audited. */

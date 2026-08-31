@@ -15,6 +15,7 @@ import { sendIdempotencyKey } from '../src/outreach/idempotency.js';
 import { CampaignCommandService } from '../src/orchestrator/campaignCommandService.js';
 import { NormalizationService } from '../src/orchestrator/normalizationService.js';
 import type { RawCandidate } from '../src/discovery/candidate.js';
+import { OperatorBusinessCommandService } from '../src/orchestrator/operatorBusinessCommandService.js';
 import {
   WorkflowRunStore,
   type BossSender,
@@ -427,6 +428,144 @@ await withDisposableFactoryDatabase(async ({ pool, db: testDb, boss }) => {
     ), 0);
   });
 
+  await check('manual build transition and content handoff commit exactly once', async () => {
+    const suffix = randomUUID();
+    const campaignId = `campaign-build-${suffix}`;
+    const businessId = `e2e-build-${suffix}`;
+    await testDb.insert(schema.campaigns).values({
+      id: campaignId,
+      country: 'GR',
+      city: 'Patras',
+      niche: 'test',
+      language: 'el',
+      queries: ['test'],
+      geofence: { lat: 38.2, lng: 21.7, radiusKm: 1 },
+    });
+    await testDb.insert(schema.businesses).values({
+      id: businessId,
+      campaignId,
+      name: 'Manual Build Test',
+      normalizedName: 'manual build test',
+      status: 'needs_review',
+      score: 80,
+    });
+    const service = new OperatorBusinessCommandService(store, testDb);
+    const results = await Promise.all(
+      Array.from({ length: 20 }, () => service.startBuild(businessId)),
+    );
+    assert.equal(results.filter((result) => result.kind === 'started').length, 1);
+    assert.equal(results.filter((result) => result.kind === 'state_conflict').length, 19);
+    assert.equal(await count(
+      `select count(*) from businesses where id = $1 and status = 'production_ready'`,
+      [businessId],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from status_history where business_id = $1 and from_status = 'needs_review' and to_status = 'production_ready'`,
+      [businessId],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from workflow_job_runs where business_id = $1 and job_type = 'content-and-design'`,
+      [businessId],
+    ), 1);
+  });
+
+  await check('manual build enqueue failure rolls back the operator transition', async () => {
+    const suffix = randomUUID();
+    const campaignId = `campaign-build-rollback-${suffix}`;
+    const businessId = `e2e-build-rollback-${suffix}`;
+    await testDb.insert(schema.campaigns).values({
+      id: campaignId,
+      country: 'GR',
+      city: 'Patras',
+      niche: 'test',
+      language: 'el',
+      queries: ['test'],
+      geofence: { lat: 38.2, lng: 21.7, radiusKm: 1 },
+    });
+    await testDb.insert(schema.businesses).values({
+      id: businessId,
+      campaignId,
+      name: 'Manual Build Rollback Test',
+      normalizedName: 'manual build rollback test',
+      status: 'needs_review',
+    });
+    const failingStore = new WorkflowRunStore(pool, {
+      send: async () => { throw new Error('manual build send injection'); },
+    });
+    await assert.rejects(
+      new OperatorBusinessCommandService(failingStore, testDb).startBuild(businessId),
+      /manual build send injection/,
+    );
+    assert.equal(await count(
+      `select count(*) from businesses where id = $1 and status = 'needs_review'`,
+      [businessId],
+    ), 1);
+    assert.equal(await count(`select count(*) from status_history where business_id = $1`, [businessId]), 0);
+  });
+
+  await check('DNC and deal commands keep operator records and status consistent', async () => {
+    const suffix = randomUUID();
+    const campaignId = `campaign-operator-${suffix}`;
+    const dncBusinessId = `e2e-dnc-${suffix}`;
+    const dealBusinessId = `e2e-deal-${suffix}`;
+    await testDb.insert(schema.campaigns).values({
+      id: campaignId,
+      country: 'GR',
+      city: 'Patras',
+      niche: 'test',
+      language: 'el',
+      queries: ['test'],
+      geofence: { lat: 38.2, lng: 21.7, radiusKm: 1 },
+    });
+    await testDb.insert(schema.businesses).values([
+      {
+        id: dncBusinessId,
+        campaignId,
+        name: 'DNC Test',
+        normalizedName: 'dnc test',
+        status: 'contacted',
+      },
+      {
+        id: dealBusinessId,
+        campaignId,
+        name: 'Deal Test',
+        normalizedName: 'deal test',
+        status: 'contacted',
+      },
+    ]);
+    await testDb.insert(schema.businessContacts).values([
+      { businessId: dncBusinessId, channel: 'email', value: `owner-${suffix}@example.test` },
+      { businessId: dncBusinessId, channel: 'phone', value: `+30${suffix.slice(0, 8)}` },
+      { businessId: dncBusinessId, channel: 'instagram', value: `@${suffix.slice(0, 8)}` },
+    ]);
+    const service = new OperatorBusinessCommandService(store, testDb);
+    await Promise.all(Array.from({ length: 20 }, () => (
+      service.markDoNotContact(dncBusinessId, 'owner opted out')
+    )));
+    await Promise.all(Array.from({ length: 20 }, () => (
+      service.updateDealStage(dealBusinessId, 'proposal')
+    )));
+    assert.equal(await count(`select count(*) from do_not_contact where value = $1`, [dncBusinessId]), 1);
+    assert.equal(await count(
+      `select count(*) from do_not_contact where reason = $1`,
+      [`do_not_contact ${dncBusinessId}`],
+    ), 2);
+    assert.equal(await count(
+      `select count(*) from businesses where id = $1 and status = 'do_not_contact'`,
+      [dncBusinessId],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from deals where business_id = $1 and state = 'proposal'`,
+      [dealBusinessId],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from businesses where id = $1 and status = 'proposal'`,
+      [dealBusinessId],
+    ), 1);
+    assert.equal(await count(`select count(*) from status_history where business_id = $1`, [dncBusinessId]), 1);
+    assert.equal(await count(`select count(*) from status_history where business_id = $1`, [dealBusinessId]), 1);
+  });
+
   await check('a terminal run permits a new logical run with the same key', async () => {
     const key = `terminal:${randomUUID()}`;
     const first = await store.enqueue(command(key));
@@ -469,6 +608,7 @@ await withDisposableFactoryDatabase(async ({ pool, db: testDb, boss }) => {
       { batchSize: 1, pollingIntervalSeconds: 1 },
       async (jobs) => {
       for (const job of jobs) {
+        if (job.id !== enqueued.bossJobId) continue;
         seenIds.push(job.id);
         calls++;
         if (calls === 1) throw new Error('retry once');

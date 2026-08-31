@@ -59,6 +59,7 @@ const gates: Gate[] = [
   { name: 'deterministic layout quality gates', command: 'pnpm', args: ['test:layout-quality'] },
   { name: 'status transition CAS', command: 'pnpm', args: ['test:status-transitions'] },
   { name: 'outreach decision command API', command: 'pnpm', args: ['test:outreach-decision-api'] },
+  { name: 'operator business command API', command: 'pnpm', args: ['test:operator-business-api'] },
   { name: 'campaign command API', command: 'pnpm', args: ['test:campaign-command-api'] },
   { name: 'discovery transient recovery', command: 'pnpm', args: ['test:discovery-resilience'] },
   { name: 'enrichment fan-in barrier', command: 'pnpm', args: ['test:enrichment-barrier'] },

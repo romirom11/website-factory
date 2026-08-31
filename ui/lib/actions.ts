@@ -3,21 +3,19 @@
 /**
  * Server actions = every mutation Roman can make from the UI.
  *
- * These carry the same hard rules as the workers, because the UI is the thing
- * that triggers a send:
- *  - Approve writes an `approvals` row and enqueues exactly one `send-outreach`
- *    whose idempotency key is derived from the approval id. A second Approve on
- *    an already-decided approval is refused HERE, and the outreach worker's
- *    unique index refuses it again. Two independent locks, on purpose.
+ * State-changing workflow commands go through the authenticated factory API:
+ * approval/campaign domain writes and their jobs share one Postgres transaction.
+ * Direct DB access in this module is reserved for simple operator-owned records
+ * that do not have a queue side effect.
  *  - Manual status changes are recorded with actor 'roman' and a reason, so
  *    status_history stays a real audit trail (SPEC §5).
  */
 
-import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { revalidatePath } from 'next/cache';
 import { db, schema } from './db';
 import { enqueueJob, type JobName } from './jobs';
-import { sendIdempotencyKey, followupIdempotencyKey, isManualChannel, deepLinkFor } from './keys';
+import { isManualChannel, deepLinkFor } from './keys';
 import {
   BUILDABLE_STATUSES, BUILD_POLICY_LABELS, buildJobPriority, isActiveJobStatus,
   isActiveProjectState, normalizeBuildPolicy,
@@ -30,16 +28,11 @@ import { retryFailedJob, stopFailedBuild } from './buildFailureDecision';
 import { isJobName } from '@factory/jobDefinitions';
 import { isBusinessStatus } from '@factory/businessStatus';
 import { operatorTransition } from './businessTransitions';
+import { factoryFetch } from './factoryApi';
 
 // ─── Approvals ───────────────────────────────────────────────────────────────
 
-/**
- * Approve outreach for a business.
- *
- * Exactly-once is enforced by decision state: the UPDATE only matches an
- * approval whose decision IS NULL, so two concurrent clicks mean one UPDATE
- * matches a row and the other matches nothing — and only the winner enqueues.
- */
+/** Approve and enqueue as one factory-owned Postgres + pg-boss transaction. */
 export async function approveOutreach(input: {
   approvalId: number;
   channel: string;
@@ -47,12 +40,6 @@ export async function approveOutreach(input: {
   subject: string | null;
   body: string;
 }): Promise<ActionResult> {
-  const [approval] = await db.select().from(schema.approvals)
-    .where(eq(schema.approvals.id, input.approvalId));
-  if (!approval) return { ok: false, message: 'Approval не знайдено' };
-  if (approval.decision) {
-    return { ok: false, message: `Вже вирішено раніше: ${approval.decision}. Другий send неможливий.` };
-  }
   if (!input.channel || !input.toAddress) {
     return { ok: false, message: 'Не обрано канал або адресу — відправляти нікуди' };
   }
@@ -60,39 +47,28 @@ export async function approveOutreach(input: {
     return { ok: false, message: 'Порожній текст повідомлення' };
   }
 
-  const payload = {
-    ...(approval.payload as Record<string, unknown> ?? {}),
-    draft: {
-      channel: input.channel,
-      toAddress: input.toAddress,
-      subject: input.subject,
-      body: input.body,
+  const response = await factoryFetch(
+    `/internal/outreach-approvals/${input.approvalId}/decisions`,
+    {
+      method: 'POST',
+      body: {
+        decision: 'approve',
+        channel: input.channel,
+        toAddress: input.toAddress,
+        subject: input.subject,
+        body: input.body,
+      },
     },
-    // Record what Roman actually approved, distinct from what was proposed.
-    approvedAt: new Date().toISOString(),
-  };
-
-  // Conditional update = the lock. Losing click updates zero rows.
-  const updated = await db.update(schema.approvals)
-    .set({ decision: 'approved', decidedBy: 'roman', decidedAt: new Date(), payload })
-    .where(and(eq(schema.approvals.id, input.approvalId), isNull(schema.approvals.decision)))
-    .returning();
-
-  if (!updated.length) {
-    return { ok: false, message: 'Це approval вже вирішене іншим кліком — другий send не створено.' };
+  );
+  if (!response.ok) {
+    return { ok: false, message: response.message || 'Фабрика не підтвердила approval.' };
   }
-
-  await transitionBusiness(approval.businessId, 'outreach_approved', `approval #${approval.id}`);
-
-  await enqueueJob({
-    name: 'send-outreach',
-    businessId: approval.businessId,
-    idempotencyKey: sendIdempotencyKey(approval.id),
-    data: { approvalId: approval.id },
-  });
+  const result = response.body?.result as Record<string, unknown> | undefined;
+  const businessId = typeof result?.businessId === 'string' ? result.businessId : null;
+  if (!businessId) return { ok: false, message: 'Фабрика повернула некоректний результат approval.' };
 
   revalidatePath('/inbox');
-  revalidatePath(`/businesses/${approval.businessId}`);
+  revalidatePath(`/businesses/${businessId}`);
 
   if (isManualChannel(input.channel)) {
     return {
@@ -102,7 +78,7 @@ export async function approveOutreach(input: {
         channel: input.channel,
         deepLink: deepLinkFor(input.channel, input.toAddress, input.body),
         text: input.body,
-        approvalId: approval.id,
+        approvalId: input.approvalId,
       },
     };
   }
@@ -110,63 +86,42 @@ export async function approveOutreach(input: {
 }
 
 export async function rejectOutreach(input: { approvalId: number; reason: string }): Promise<ActionResult> {
-  const [approval] = await db.select().from(schema.approvals)
-    .where(eq(schema.approvals.id, input.approvalId));
-  if (!approval) return { ok: false, message: 'Approval не знайдено' };
-  if (approval.decision) return { ok: false, message: `Вже вирішено: ${approval.decision}` };
-
-  const updated = await db.update(schema.approvals)
-    .set({ decision: 'rejected', decidedBy: 'roman', decidedAt: new Date() })
-    .where(and(eq(schema.approvals.id, input.approvalId), isNull(schema.approvals.decision)))
-    .returning();
-  if (!updated.length) return { ok: false, message: 'Вже вирішене іншим кліком' };
-
-  await transitionBusiness(approval.businessId, 'rejected', input.reason || `approval #${approval.id} rejected`);
+  const response = await factoryFetch(
+    `/internal/outreach-approvals/${input.approvalId}/decisions`,
+    {
+      method: 'POST',
+      body: { decision: 'reject', reason: input.reason.trim() || 'відхилено Романом' },
+    },
+  );
+  if (!response.ok) {
+    return { ok: false, message: response.message || 'Фабрика не підтвердила відхилення.' };
+  }
+  const result = response.body?.result as Record<string, unknown> | undefined;
+  const businessId = typeof result?.businessId === 'string' ? result.businessId : null;
   revalidatePath('/inbox');
+  if (businessId) revalidatePath(`/businesses/${businessId}`);
   return { ok: true, message: 'Відхилено.' };
 }
 
-/**
- * Roman sent a manual-channel message by hand and confirms it.
- * Flips the pending outreach row to sent, moves the business to contacted and
- * schedules follow-ups. Idempotent: a second confirmation changes nothing.
- */
+/** Confirm the human send and schedule follow-ups in one factory transaction. */
 export async function confirmManualSent(input: { approvalId: number }): Promise<ActionResult> {
-  const key = sendIdempotencyKey(input.approvalId);
-  const [msg] = await db.select().from(schema.outreachMessages)
-    .where(eq(schema.outreachMessages.idempotencyKey, key));
-  if (!msg) {
-    return { ok: false, message: 'Повідомлення ще не створене воркером — зачекай секунду і онови.' };
+  const response = await factoryFetch(
+    `/internal/outreach-approvals/${input.approvalId}/manual-sent`,
+    { method: 'POST' },
+  );
+  if (!response.ok) {
+    return { ok: false, message: response.message || 'Фабрика не підтвердила ручне надсилання.' };
   }
-  if (msg.state !== 'manual_pending') {
-    return { ok: true, message: `Вже позначено як ${msg.state} — повторно нічого не робимо.` };
-  }
-
-  await db.update(schema.outreachMessages)
-    .set({ state: 'sent', sentAt: new Date() })
-    .where(and(eq(schema.outreachMessages.id, msg.id), eq(schema.outreachMessages.state, 'manual_pending')));
-  await db.insert(schema.outreachEvents).values({
-    businessId: msg.businessId, messageId: msg.id, event: 'sent',
-    detail: { channel: msg.channel, manualConfirmation: true, actor: 'roman' },
-  });
-  await transitionBusiness(msg.businessId, 'contacted', `${msg.channel} відправлено вручну`);
-  await db.insert(schema.deals).values({ businessId: msg.businessId, state: 'contacted' }).onConflictDoNothing();
-
-  // Follow-ups, same keying as the worker.
-  const followupDays = (process.env.FOLLOWUP_SCHEDULE_DAYS ?? '3,7').split(',').map(Number);
-  for (let i = 0; i < followupDays.length; i++) {
-    await enqueueJob({
-      name: 'send-followup',
-      businessId: msg.businessId,
-      idempotencyKey: followupIdempotencyKey(input.approvalId, i + 1),
-      data: { followupIndex: i + 1, approvalId: input.approvalId, channel: msg.channel },
-      startAfterSeconds: followupDays[i] * 24 * 3600,
-    });
-  }
-
+  const result = response.body?.result as Record<string, unknown> | undefined;
+  const businessId = typeof result?.businessId === 'string' ? result.businessId : null;
   revalidatePath('/inbox');
-  revalidatePath(`/businesses/${msg.businessId}`);
-  return { ok: true, message: 'Записано як відправлене вручну, follow-up заплановані.' };
+  if (businessId) revalidatePath(`/businesses/${businessId}`);
+  return {
+    ok: true,
+    message: result?.kind === 'already_confirmed'
+      ? `Вже позначено як ${String(result.state ?? 'sent')} — повторно нічого не робимо.`
+      : 'Записано як відправлене вручну, follow-up заплановані.',
+  };
 }
 
 // ─── Business-level manual actions ───────────────────────────────────────────
@@ -416,25 +371,24 @@ export async function createCampaign(formData: FormData): Promise<ActionResult> 
     return { ok: false, message: 'Потрібні місто, ніша і хоча б один пошуковий запит' };
   }
 
-  const slug = `${country}-${city}-${niche}`.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-  const id = `${slug}-${new Date().toISOString().slice(0, 7)}`;
-
-  // `onConflictDoNothing` means a repeat of this month's city+niche is a no-op,
-  // and the operator has to be told that rather than shown a success.
-  const created = await db.insert(schema.campaigns).values({
-    id, country, city, niche, language, queries,
-    geofence: { lat, lng, radiusKm },
-    targetCount,
-    autoBuild,
-    mode: process.env.FACTORY_MODE === 'live' ? 'live' : 'dry_run',
-    status: 'running',
-  }).onConflictDoNothing().returning({ id: schema.campaigns.id });
-
-  if (!created.length) {
-    return { ok: false, message: `Кампанія «${id}» уже існує — нову не створено` };
+  const response = await factoryFetch('/internal/campaigns', {
+    method: 'POST',
+    body: {
+      country,
+      city,
+      niche,
+      language,
+      queries,
+      targetCount,
+      lat,
+      lng,
+      radiusKm,
+      autoBuild,
+    },
+  });
+  if (!response.ok) {
+    return { ok: false, message: response.message || 'Фабрика не створила кампанію.' };
   }
-
-  await enqueueJob({ name: 'discover', campaignId: id, idempotencyKey: `discover:${id}` });
   revalidatePath('/campaigns');
   return { ok: true, message: `Кампанію «${city} · ${niche}» створено, пошук бізнесів поставлено в чергу` };
 }

@@ -10,6 +10,9 @@ import { randomUUID } from 'node:crypto';
 import { and, eq, inArray } from 'drizzle-orm';
 import * as schema from '../src/db/schema.js';
 import { getJobDefinition } from '../src/orchestrator/jobDefinitions.js';
+import { OutreachDecisionService } from '../src/orchestrator/outreachDecisionService.js';
+import { sendIdempotencyKey } from '../src/outreach/idempotency.js';
+import { CampaignCommandService } from '../src/orchestrator/campaignCommandService.js';
 import {
   WorkflowRunStore,
   type BossSender,
@@ -170,6 +173,167 @@ await withDisposableFactoryDatabase(async ({ pool, db: testDb, boss }) => {
     );
     assert.equal(await count(`select count(*) from campaigns where id = $1`, [campaignId]), 0);
     assert.equal(await count(`select count(*) from workflow_job_runs where idempotency_key = $1`, [key]), 0);
+  });
+
+  await check('campaign creation and discovery enqueue commit exactly once', async () => {
+    const suffix = randomUUID().slice(0, 8);
+    const service = new CampaignCommandService(
+      store,
+      () => 'live',
+      () => new Date('2026-08-30T12:00:00.000Z'),
+    );
+    const input = {
+      country: 'GR',
+      city: `Πάτρα ${suffix}`,
+      niche: 'Beauty',
+      language: 'el',
+      queries: ['beauty patras'],
+      targetCount: 20,
+      geofence: { lat: 38.2, lng: 21.7, radiusKm: 10 },
+      autoBuild: 'no_site_only' as const,
+    };
+    const results = await Promise.all(Array.from({ length: 20 }, () => service.create(input)));
+    const created = results.filter((result) => result.kind === 'created');
+    assert.equal(created.length, 1);
+    assert.equal(results.filter((result) => result.kind === 'exists').length, 19);
+    const campaignId = results[0]!.campaignId;
+    assert.match(campaignId, /πάτρα/);
+    assert.equal(await count(
+      `select count(*) from campaigns where id = $1 and status = 'running' and mode = 'live'`,
+      [campaignId],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from workflow_job_runs where job_type = 'discover' and idempotency_key = $1`,
+      [`discover:${campaignId}`],
+    ), 1);
+  });
+
+  await check('approval, status transition, and send job commit exactly once', async () => {
+    const suffix = randomUUID();
+    const campaignId = `campaign-${suffix}`;
+    const businessId = `e2e-approval-${suffix}`;
+    await testDb.insert(schema.campaigns).values({
+      id: campaignId,
+      country: 'GR',
+      city: 'Patras',
+      niche: 'test',
+      language: 'el',
+      queries: ['test'],
+      geofence: { lat: 38.2, lng: 21.7, radiusKm: 1 },
+    });
+    await testDb.insert(schema.businesses).values({
+      id: businessId,
+      campaignId,
+      name: 'Approval Test',
+      normalizedName: 'approval test',
+      status: 'site_ready',
+    });
+    const [approval] = await testDb.insert(schema.approvals).values({
+      businessId,
+      kind: 'outreach',
+      payload: { proposed: true },
+    }).returning({ id: schema.approvals.id });
+    const service = new OutreachDecisionService(store, testDb, () => [3, 7]);
+    const decisions = await Promise.all(Array.from({ length: 20 }, () => service.approve({
+      approvalId: approval!.id,
+      channel: 'instagram',
+      toAddress: '@approval-test',
+      subject: null,
+      body: 'Approved body',
+    })));
+
+    assert.equal(decisions.filter((result) => result.kind === 'approved').length, 1);
+    assert.equal(decisions.filter((result) => result.kind === 'already_decided').length, 19);
+    assert.equal(await count(
+      `select count(*) from workflow_job_runs where job_type = 'send-outreach' and idempotency_key = $1`,
+      [sendIdempotencyKey(approval!.id)],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from approvals where id = $1 and decision = 'approved'`,
+      [approval!.id],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from businesses where id = $1 and status = 'outreach_approved'`,
+      [businessId],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from status_history where business_id = $1 and from_status = 'site_ready' and to_status = 'outreach_approved'`,
+      [businessId],
+    ), 1);
+
+    await testDb.insert(schema.outreachMessages).values({
+      businessId,
+      channel: 'instagram',
+      toAddress: '@approval-test',
+      body: 'Approved body',
+      idempotencyKey: sendIdempotencyKey(approval!.id),
+      state: 'manual_pending',
+    });
+    const confirmations = await Promise.all(
+      Array.from({ length: 20 }, () => service.confirmManualSend(approval!.id)),
+    );
+    assert.equal(confirmations.filter((result) => result.kind === 'confirmed').length, 1);
+    assert.equal(confirmations.filter((result) => result.kind === 'already_confirmed').length, 19);
+    assert.equal(await count(
+      `select count(*) from outreach_events where business_id = $1 and event = 'sent'`,
+      [businessId],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from workflow_job_runs where business_id = $1 and job_type = 'send-followup'`,
+      [businessId],
+    ), 2);
+    assert.equal(await count(
+      `select count(*) from businesses where id = $1 and status = 'contacted'`,
+      [businessId],
+    ), 1);
+    assert.equal(await count(`select count(*) from deals where business_id = $1`, [businessId]), 1);
+  });
+
+  await check('a send enqueue failure rolls back the approval decision and status', async () => {
+    const suffix = randomUUID();
+    const campaignId = `campaign-${suffix}`;
+    const businessId = `e2e-approval-rollback-${suffix}`;
+    await testDb.insert(schema.campaigns).values({
+      id: campaignId,
+      country: 'GR',
+      city: 'Patras',
+      niche: 'test',
+      language: 'el',
+      queries: ['test'],
+      geofence: { lat: 38.2, lng: 21.7, radiusKm: 1 },
+    });
+    await testDb.insert(schema.businesses).values({
+      id: businessId,
+      campaignId,
+      name: 'Approval Rollback Test',
+      normalizedName: 'approval rollback test',
+      status: 'site_ready',
+    });
+    const [approval] = await testDb.insert(schema.approvals).values({ businessId, kind: 'outreach' })
+      .returning({ id: schema.approvals.id });
+    const failingStore = new WorkflowRunStore(pool, {
+      send: async () => { throw new Error('approval send injection'); },
+    });
+    const service = new OutreachDecisionService(failingStore, testDb, () => [3, 7]);
+    await assert.rejects(service.approve({
+      approvalId: approval!.id,
+      channel: 'email',
+      toAddress: 'owner@example.test',
+      subject: 'Demo',
+      body: 'Approved body',
+    }), /approval send injection/);
+    assert.equal(await count(
+      `select count(*) from approvals where id = $1 and decision is null`,
+      [approval!.id],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from businesses where id = $1 and status = 'site_ready'`,
+      [businessId],
+    ), 1);
+    assert.equal(await count(
+      `select count(*) from status_history where business_id = $1`,
+      [businessId],
+    ), 0);
   });
 
   await check('a terminal run permits a new logical run with the same key', async () => {

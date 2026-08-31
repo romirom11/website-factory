@@ -14,8 +14,8 @@
  *  4. Sends are NEVER auto-retried (queue.ts RETRY limit 0).
  *
  * Manual channels (instagram/viber) never send from here: they land as
- * `manual_pending`, and Roman's "I sent it" confirmation in the UI flips them
- * to sent and schedules the follow-ups (see confirmManualSend).
+ * `manual_pending`, and Roman's "I sent it" command is committed by
+ * `OutreachDecisionService` together with status, audit and follow-up jobs.
  */
 import { and, eq, desc, gte, inArray, sql } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
@@ -30,15 +30,12 @@ import { enqueue, type JobPayload } from '../orchestrator/queue.js';
 import { adapterFor, deepLinkFor, isManualChannel, type OutreachChannel, type OutreachDraft } from '../channels/index.js';
 import { notifyManualFollowup } from '../telegram/notify.js';
 import { log } from '../lib/logger.js';
+import {
+  followupIdempotencyKey,
+  sendIdempotencyKey,
+} from '../outreach/idempotency.js';
 
-/** The one place that derives a send's idempotency key. Approval id => one send. */
-export function sendIdempotencyKey(approvalId: number): string {
-  return `send-outreach:approval:${approvalId}`;
-}
-
-export function followupIdempotencyKey(approvalId: number, index: number): string {
-  return `followup:approval:${approvalId}:${index}`;
-}
+export { followupIdempotencyKey, sendIdempotencyKey } from '../outreach/idempotency.js';
 
 /** States that count as "this message exists, do not create another". */
 const LIVE_STATES = ['queued', 'sent', 'delivered', 'simulated', 'manual_pending'];
@@ -238,53 +235,6 @@ export async function sendOutreachHandler(job: JobPayload): Promise<void> {
   }
 
   log.info('outreach done', { businessId, channel: draft.channel, state, approvalId: approval.id });
-}
-
-/**
- * Roman tapped "I sent it" for a manual channel in the UI.
- * Flips the pending message to sent, moves the business to contacted and
- * schedules the follow-ups. Idempotent: a second confirmation is a no-op.
- */
-export async function confirmManualSend(businessId: string, approvalId: number): Promise<'confirmed' | 'already'> {
-  const key = sendIdempotencyKey(approvalId);
-  const [msg] = await db.select().from(schema.outreachMessages)
-    .where(eq(schema.outreachMessages.idempotencyKey, key));
-  if (!msg) throw new Error(`no outreach message for approval #${approvalId}`);
-  if (msg.state !== 'manual_pending') return 'already';
-
-  const [business] = await db.select({ status: schema.businesses.status })
-    .from(schema.businesses)
-    .where(eq(schema.businesses.id, businessId));
-  if (!business) throw new Error(`business not found: ${businessId}`);
-  const expectedStatus = requireBusinessStatus(business.status, `business ${businessId}`);
-  if (expectedStatus !== 'outreach_approved' && expectedStatus !== 'contacted') {
-    log.info('manual send confirmation skipped: business already changed state', {
-      businessId,
-      approvalId,
-      status: expectedStatus,
-    });
-    return 'already';
-  }
-
-  await db.update(schema.outreachMessages)
-    .set({ state: 'sent', sentAt: new Date() })
-    .where(eq(schema.outreachMessages.id, msg.id));
-  await db.insert(schema.outreachEvents).values({
-    businessId, messageId: msg.id, event: 'sent',
-    detail: { channel: msg.channel, manualConfirmation: true, actor: 'roman' },
-  });
-  const transitioned = await businessTransitions.normal({
-    businessId,
-    expectedStatus,
-    to: 'contacted',
-    actor: 'roman',
-    reason: `${msg.channel} sent manually`,
-  });
-  if (!canContinueAfterTransition(transitioned, { businessId, actor: 'roman' })) return 'already';
-  await db.insert(schema.deals).values({ businessId, state: 'contacted' }).onConflictDoNothing();
-  await scheduleFollowups(approvalId, businessId, msg.channel);
-  log.info('manual send confirmed', { businessId, approvalId, channel: msg.channel });
-  return 'confirmed';
 }
 
 /** Statuses past `contacted`: the business has moved on, a nudge would be noise. */

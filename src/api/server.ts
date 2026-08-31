@@ -14,7 +14,7 @@ import path from 'node:path';
 import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { and, desc, eq, inArray } from 'drizzle-orm';
-import { db, schema } from '../db/client.js';
+import { db, pool, schema } from '../db/client.js';
 import { ensureDemoServer, registerPreview, startDemoServer } from '../lib/serveDir.js';
 import { writeQaIssues } from '../build/workspace.js';
 import { buildLogPath, readBuildLog } from '../build/buildLog.js';
@@ -34,8 +34,7 @@ import { reloadSettings } from '../lib/settingsStore.js';
 import { writeSetting } from '../lib/settingsStore.js';
 import { usesRemoteAgentTransport } from '../agents/transport.js';
 import { remoteAgentTransport } from '../agents/remoteTransport.js';
-import { ensureQueues } from '../orchestrator/queue.js';
-import { enqueue } from '../orchestrator/queue.js';
+import { ensureQueues, enqueue, getBoss } from '../orchestrator/queue.js';
 import { createInternalAuth } from './internalAuth.js';
 import { registerJobCommandRoute } from './jobCommands.js';
 import { registerBusinessTransitionCommandRoute } from './businessTransitionCommands.js';
@@ -43,6 +42,11 @@ import { businessTransitions } from '../orchestrator/statuses.js';
 import { registerBuildFailureCommandRoute } from './buildFailureCommands.js';
 import { stopFailedBuild } from '../orchestrator/buildFailureDecision.js';
 import { registerBuildReviewCommandRoute } from './buildReviewCommands.js';
+import { registerOutreachDecisionCommandRoutes } from './outreachDecisionCommands.js';
+import { OutreachDecisionService } from '../orchestrator/outreachDecisionService.js';
+import { WorkflowRunStore } from '../orchestrator/workflowRunStore.js';
+import { registerCampaignCommandRoutes } from './campaignCommands.js';
+import { CampaignCommandService } from '../orchestrator/campaignCommandService.js';
 
 export async function startApi(): Promise<void> {
   // Queue creation is part of readiness. In API-only mode there may be no
@@ -65,6 +69,7 @@ export async function startApi(): Promise<void> {
   // so a working setup needs no extra .env line. Empty secret = the endpoints
   // refuse everything rather than opening up.
   const internalAuth = createInternalAuth();
+  const workflowRunStore = new WorkflowRunStore(pool, await getBoss());
   registerJobCommandRoute(app, internalAuth, enqueue);
   registerBusinessTransitionCommandRoute(
     app,
@@ -73,6 +78,20 @@ export async function startApi(): Promise<void> {
   );
   registerBuildFailureCommandRoute(app, internalAuth, stopFailedBuild);
   registerBuildReviewCommandRoute(app, internalAuth);
+  registerOutreachDecisionCommandRoutes(
+    app,
+    internalAuth,
+    new OutreachDecisionService(
+      workflowRunStore,
+      db,
+      () => config.followupDays,
+    ),
+  );
+  registerCampaignCommandRoutes(
+    app,
+    internalAuth,
+    new CampaignCommandService(workflowRunStore, () => config.mode),
+  );
 
   /**
    * Run one connectivity check and report the REAL result (never a throw).

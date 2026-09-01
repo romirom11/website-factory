@@ -4,7 +4,7 @@
 anthropic.com:53 claude.ai:53 openai.com:53 chatgpt.com:53 oaiusercontent.com:53 opencode.ai:53 openrouter.ai:53 kimi.com:53 moonshot.ai:53 moonshot.cn:53 npmjs.org:53 yarnpkg.com:53 {
     errors
     cache 300
-    forward . 1.1.1.1 8.8.8.8 {
+    forward . /etc/resolv.conf {
         policy sequential
         max_fails 2
     }

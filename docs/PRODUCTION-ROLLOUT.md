@@ -69,6 +69,12 @@ credentials для gateway, exact-workspace isolation та падіння readin
 
 Після будь-якої такої зміни повтори весь isolation gate.
 
+`RUNNER_DNS_PROTECTION_ENABLED=true` є production default. Значення `false`
+дозволяє unrestricted **public DNS** для аварійної діагностики або сумісності,
+але не змінює internal-only runner topology, HTTP(S) allowlist чи блокування
+Compose service names. Після зміни прапорця також повтори
+`pnpm test:runner-isolation`.
+
 ### 3. Застосувати тільки адитивну схему
 
 ```bash

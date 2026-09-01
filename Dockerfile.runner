@@ -27,11 +27,12 @@ EXPOSE 3128
 CMD ["squid", "-N", "-f", "/etc/squid/squid.conf", "-d", "1"]
 
 FROM coredns/coredns:1.12.4 AS egress-dns
-COPY infra/agent-dns/Corefile /Corefile
+COPY infra/agent-dns/Corefile /Corefile.true
+COPY infra/agent-dns/Corefile.unprotected /Corefile.false
 COPY --from=health-tools /bin/busybox /busybox
 EXPOSE 53/udp 53/tcp 8080 8181
 ENTRYPOINT ["/coredns"]
-CMD ["-conf", "/Corefile"]
+CMD ["-conf", "/Corefile.true"]
 
 FROM dependencies AS gateway
 COPY . .

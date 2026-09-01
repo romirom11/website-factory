@@ -112,6 +112,14 @@ function assertExecutorEnvironment(): void {
   }
 }
 
+function runnerDnsProtectionEnabled(): boolean {
+  const value = process.env.RUNNER_DNS_PROTECTION_ENABLED ?? 'true';
+  if (value !== 'true' && value !== 'false') {
+    throw new Error('RUNNER_DNS_PROTECTION_ENABLED must be true or false');
+  }
+  return value === 'true';
+}
+
 export async function initializeRunnerIsolation(): Promise<RunnerIsolationReport> {
   const required = runnerConfinementRequired();
   if (!required) {
@@ -124,6 +132,7 @@ export async function initializeRunnerIsolation(): Promise<RunnerIsolationReport
   if (process.platform !== 'linux') throw new Error('production runner isolation requires Linux');
   assertExecutorEnvironment();
   await configureCodexConfinement();
+  const dnsProtectionEnabled = runnerDnsProtectionEnabled();
 
   const workspace = await mkdtemp(path.join(tmpdir(), 'runner-isolation-'));
   try {
@@ -141,7 +150,9 @@ export async function initializeRunnerIsolation(): Promise<RunnerIsolationReport
         'test ! -r "$2/claude/oauth-token"',
         'test ! -r /proc/1/environ',
         'getent ahosts registry.npmjs.org >/dev/null',
-        '! getent ahosts example.com >/dev/null',
+        dnsProtectionEnabled
+          ? '! getent ahosts example.com >/dev/null'
+          : 'getent ahosts example.com >/dev/null',
         'curl -fsS -o /dev/null --connect-timeout 5 --max-time 15 https://registry.npmjs.org/-/ping',
         '! curl -fsS -o /dev/null --connect-timeout 3 --max-time 5 https://example.com 2>/dev/null',
         '! curl --noproxy "*" -fsS -o /dev/null --connect-timeout 3 --max-time 5 https://registry.npmjs.org/-/ping 2>/dev/null',

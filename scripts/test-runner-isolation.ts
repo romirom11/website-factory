@@ -25,6 +25,7 @@ interface ContainerInspect {
     PidsLimit: number | null;
     ReadonlyRootfs: boolean;
     SecurityOpt: string[] | null;
+    Sysctls: Record<string, string> | null;
   };
   Mounts: Array<{ Destination: string; Name?: string; Type: string }>;
   NetworkSettings: {
@@ -55,7 +56,7 @@ async function freePort(): Promise<number> {
 const baseEnv = { ...process.env };
 delete baseEnv.RUNNER_EGRESS_SUBNET;
 delete baseEnv.RUNNER_EGRESS_DNS_IP;
-const composeEnv = {
+const composeEnv: NodeJS.ProcessEnv = {
   ...baseEnv,
   RUNNER_API_KEY: 'runner-isolation-public-key',
   RUNNER_EXECUTOR_API_KEY: 'runner-isolation-private-key',
@@ -64,10 +65,15 @@ const composeEnv = {
   RUNNER_MEMORY_LIMIT: '2g',
 };
 
-function run(program: string, args: string[], allowFailure = false): CommandResult {
+function run(
+  program: string,
+  args: string[],
+  allowFailure = false,
+  environment: NodeJS.ProcessEnv = composeEnv,
+): CommandResult {
   const result = spawnSync(program, args, {
     encoding: 'utf8',
-    env: composeEnv,
+    env: environment,
     maxBuffer: 10 * 1024 * 1024,
   });
   const output: CommandResult = {
@@ -83,6 +89,17 @@ function run(program: string, args: string[], allowFailure = false): CommandResu
 
 const compose = (args: string[], allowFailure = false): CommandResult =>
   run('docker', ['compose', '-p', project, ...args], allowFailure);
+
+const composeWithEnv = (
+  environment: NodeJS.ProcessEnv,
+  args: string[],
+  allowFailure = false,
+): CommandResult => run(
+  'docker',
+  ['compose', '-p', project, ...args],
+  allowFailure,
+  { ...composeEnv, ...environment },
+);
 
 const docker = (args: string[], allowFailure = false): CommandResult =>
   run('docker', args, allowFailure);
@@ -128,13 +145,26 @@ let started = false;
 let collisionNetworkCreated = false;
 
 try {
-  await check('Compose delegates runner subnet selection to Docker IPAM', () => {
+  await check('Compose renders portable runner DNS topology and policy modes', () => {
     const config = JSON.parse(compose(['config', '--format', 'json']).stdout) as {
-      services: Record<string, { dns?: string[] }>;
+      services: Record<string, {
+        command?: string[];
+        dns?: string[];
+        sysctls?: Record<string, string>;
+      }>;
       networks: Record<string, { ipam?: Record<string, unknown> }>;
     };
+    const executorConfig = config.services['agent-runner-executor'];
     assert.deepEqual(config.networks['runner-egress-v2']?.ipam, {});
-    assert.deepEqual(config.services['agent-runner-executor']?.dns, ['127.0.0.53']);
+    assert.deepEqual(executorConfig?.dns, ['127.0.0.53']);
+    assert.equal(executorConfig?.sysctls?.['net.ipv4.ip_unprivileged_port_start'], '0');
+    assert.deepEqual(config.services['agent-egress-dns']?.command, ['-conf', '/Corefile.true']);
+
+    const openConfig = JSON.parse(composeWithEnv(
+      { RUNNER_DNS_PROTECTION_ENABLED: 'false' },
+      ['config', '--format', 'json'],
+    ).stdout) as typeof config;
+    assert.deepEqual(openConfig.services['agent-egress-dns']?.command, ['-conf', '/Corefile.false']);
   });
 
   const collision = docker([
@@ -201,6 +231,7 @@ try {
     assert.ok(host.SecurityOpt?.includes('seccomp=unconfined'));
     assert.equal(host.PidsLimit, 512);
     assert.ok(host.Memory > 0);
+    assert.equal(host.Sysctls?.['net.ipv4.ip_unprivileged_port_start'], '0');
   });
 
   await check('executor mounts no factory data or Docker socket', () => {
@@ -353,6 +384,28 @@ try {
   await check('proxy logs omit URL paths and query payloads', () => {
     const logs = docker(['logs', proxy]).stdout;
     assert.doesNotMatch(logs, /\/pnpm|\?.+=/);
+  });
+
+  await check('DNS protection can be disabled without changing runner topology', async () => {
+    composeEnv.RUNNER_DNS_PROTECTION_ENABLED = 'false';
+    compose(['up', '-d', '--force-recreate', 'agent-egress-dns', 'agent-runner-executor']);
+    executor = compose(['ps', '-q', 'agent-runner-executor']).stdout.trim();
+    assert.ok(executor, 'executor was not recreated with open DNS policy');
+    await waitHealthy(executor);
+    const script = `
+      const dns=require('node:dns').promises;
+      (async()=>{
+        await dns.lookup('example.com');
+        for(const host of ['postgres','minio','factory','host.docker.internal']){
+          try { await dns.lookup(host); process.exit(81); } catch {}
+        }
+      })().catch(()=>process.exit(82));
+    `;
+    docker(['exec', executor, 'node', '-e', script]);
+    docker(['exec', executor, 'sh', '-lc', [
+      "if curl -fsS -o /dev/null --connect-timeout 3 --max-time 5 https://example.com 2>/dev/null; then exit 83; fi",
+      "node -e \"fetch('https://example.com',{signal:AbortSignal.timeout(3000)}).then(()=>process.exit(84)).catch(()=>{})\"",
+    ].join('; ')]);
   });
 
   await check('readiness fails closed when the egress boundary disappears', () => {

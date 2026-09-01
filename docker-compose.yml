@@ -272,6 +272,7 @@ services:
       DO_NOT_TRACK: "1"
       NEXT_TELEMETRY_DISABLED: "1"
       RUNNER_REQUIRE_ISOLATION: "true"
+      RUNNER_DNS_PROTECTION_ENABLED: ${RUNNER_DNS_PROTECTION_ENABLED:-true}
       # Claude's first-run/trust state must be writable but ephemeral. Provider
       # credentials live only in their dedicated named volumes below.
       HOME: /home/node/runtime-home
@@ -291,6 +292,11 @@ services:
       # Docker's embedded resolver answers private service names itself and
       # forwards public lookups to the executor's unprivileged loopback relay.
       - 127.0.0.53
+    # Port 53 is privileged by default on a plain Linux network namespace.
+    # Declare the executor's namespaced requirement explicitly so the non-root
+    # relay behaves the same on Docker Engine and Docker Desktop.
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
     read_only: true
     tmpfs:
       - /tmp:size=1g,mode=1777
@@ -349,6 +355,7 @@ services:
       context: .
       dockerfile: Dockerfile.runner
       target: egress-dns
+    command: ["-conf", "/Corefile.${RUNNER_DNS_PROTECTION_ENABLED:-true}"]
     restart: unless-stopped
     networks:
       runner-egress-v2: {}

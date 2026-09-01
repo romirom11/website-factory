@@ -1,0 +1,20 @@
+# Operational escape hatch: resolve every public name through the Docker
+# host's configured resolvers. The executor remains on internal-only networks,
+# and HTTP(S) traffic still has to cross the allowlisting proxy.
+.:53 {
+    errors
+    cache 300
+    health 0.0.0.0:8080
+    ready 0.0.0.0:8181
+    # Open mode relaxes only the public-domain allowlist. Keep Compose service
+    # names and host-local pseudo-domains outside the executor's DNS view.
+    template IN ANY . {
+        match "^[^.]+[.]$" "(^|[.])(localhost|internal)[.]$"
+        rcode REFUSED
+        fallthrough
+    }
+    forward . /etc/resolv.conf {
+        policy sequential
+        max_fails 2
+    }
+}

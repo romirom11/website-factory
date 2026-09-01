@@ -1,7 +1,7 @@
 /**
  * Real Docker Compose conformance probes for the production runner boundary.
  *
- * Uses a dedicated project/subnet/volumes, then removes only those resources.
+ * Uses a dedicated project/networks/volumes, then removes only those resources.
  * Runner images must be built from the current checkout before this test.
  */
 import assert from 'node:assert/strict';
@@ -17,6 +17,7 @@ interface CommandResult {
 
 interface ContainerInspect {
   Config: { Env: string[] };
+  RestartCount: number;
   HostConfig: {
     CapAdd: string[] | null;
     CapDrop: string[] | null;
@@ -32,9 +33,8 @@ interface ContainerInspect {
 }
 
 const project = `wf-runner-isolation-${process.pid}`;
-const subnetOctet = 100 + (process.pid % 100);
-const subnet = `172.31.${subnetOctet}.0/24`;
-const dnsIp = `172.31.${subnetOctet}.53`;
+const legacySubnet = '172.31.250.0/24';
+const collisionNetwork = `${project}-legacy-subnet`;
 const services = [
   'agent-egress-dns',
   'agent-egress-proxy',
@@ -52,14 +52,15 @@ async function freePort(): Promise<number> {
   return address.port;
 }
 
+const baseEnv = { ...process.env };
+delete baseEnv.RUNNER_EGRESS_SUBNET;
+delete baseEnv.RUNNER_EGRESS_DNS_IP;
 const composeEnv = {
-  ...process.env,
+  ...baseEnv,
   RUNNER_API_KEY: 'runner-isolation-public-key',
   RUNNER_EXECUTOR_API_KEY: 'runner-isolation-private-key',
   UI_PASSWORD: 'runner-isolation-ui-password',
   BUILD_TERMINAL_PORT: String(await freePort()),
-  RUNNER_EGRESS_SUBNET: subnet,
-  RUNNER_EGRESS_DNS_IP: dnsIp,
   RUNNER_MEMORY_LIMIT: '2g',
 };
 
@@ -111,12 +112,44 @@ async function waitHealthy(container: string): Promise<void> {
   throw new Error(`container did not become healthy: ${container}\n${logs.stdout}${logs.stderr}`);
 }
 
+async function waitRestart(container: string, previousCount: number): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if (inspect(container).RestartCount > previousCount) return;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`container did not restart after its DNS relay exited: ${container}`);
+}
+
 let executor = '';
 let gateway = '';
 let proxy = '';
 let started = false;
+let collisionNetworkCreated = false;
 
 try {
+  await check('Compose delegates runner subnet selection to Docker IPAM', () => {
+    const config = JSON.parse(compose(['config', '--format', 'json']).stdout) as {
+      services: Record<string, { dns?: string[] }>;
+      networks: Record<string, { ipam?: Record<string, unknown> }>;
+    };
+    assert.deepEqual(config.networks['runner-egress-v2']?.ipam, {});
+    assert.deepEqual(config.services['agent-runner-executor']?.dns, ['127.0.0.53']);
+  });
+
+  const collision = docker([
+    'network', 'create', '--driver', 'bridge', '--subnet', legacySubnet, collisionNetwork,
+  ], true);
+  if (collision.status === 0) {
+    collisionNetworkCreated = true;
+  } else {
+    assert.match(
+      `${collision.stdout}${collision.stderr}`,
+      /overlap/i,
+      `could not reserve the legacy runner subnet:\n${collision.stdout}${collision.stderr}`,
+    );
+  }
+
   started = true;
   compose(['up', '-d', '--force-recreate', ...services]);
   executor = compose(['ps', '-q', 'agent-runner-executor']).stdout.trim();
@@ -150,7 +183,7 @@ try {
     const networks = Object.entries(data.NetworkSettings.Networks);
     assert.deepEqual(networks.map(([name]) => name).sort(), [
       `${project}_runner-control`,
-      `${project}_runner-egress`,
+      `${project}_runner-egress-v2`,
     ]);
     assert.ok(networks.every(([, value]) => value.Gateway === ''));
     for (const [, value] of networks) {
@@ -251,6 +284,17 @@ try {
     docker(['exec', executor, 'node', '-e', script]);
   });
 
+  await check('executor restarts if its loopback DNS relay exits', async () => {
+    const previousCount = inspect(executor).RestartCount;
+    docker(['exec', executor, 'pkill', '-f', '^socat UDP4-RECVFROM:53,']);
+    await waitRestart(executor, previousCount);
+    await waitHealthy(executor);
+    docker([
+      'exec', executor, 'node', '-e',
+      "require('node:dns').lookup('registry.npmjs.org',(error)=>process.exit(error?1:0))",
+    ]);
+  });
+
   await check('Codex exact-root sandbox hides auth, siblings, secrets and parent proc', () => {
     const command = String.raw`
       set -eu
@@ -329,4 +373,5 @@ try {
   console.log(`\n🔐 RUNNER ISOLATION TESTS PASSED (${passed})`);
 } finally {
   if (started) compose(['down', '-v', '--remove-orphans'], true);
+  if (collisionNetworkCreated) docker(['network', 'rm', collisionNetwork], true);
 }

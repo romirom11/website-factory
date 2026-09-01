@@ -91,6 +91,7 @@ RUN set -eux; \
     ttyd --version
 
 COPY . .
+COPY --chmod=0555 infra/agent-dns/start-executor.sh /usr/local/bin/start-runner-executor
 RUN mkdir -p /app/runner-work/.private/credentials /app/.claude/skills \
       /app/runner-work/.private/codex \
       /app/runner-work/.private/provider/opencode \
@@ -104,4 +105,4 @@ ENV XDG_CACHE_HOME=/home/node/.cache
 ENV HOME=/home/node/runtime-home
 ENV OPENCODE_DISABLE_AUTOUPDATE=1
 USER node
-CMD ["pnpm", "runner:executor"]
+CMD ["start-runner-executor"]

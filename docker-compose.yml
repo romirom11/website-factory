@@ -239,6 +239,7 @@ services:
         condition: service_healthy
       agent-egress-dns:
         condition: service_healthy
+        restart: true
     environment:
       RUNNER_EXECUTOR_PORT: 8791
       EXECUTOR_API_KEY: ${RUNNER_EXECUTOR_API_KEY:?RUNNER_EXECUTOR_API_KEY must be set for the private executor hop}
@@ -285,9 +286,11 @@ services:
       - opencodehome:/app/runner-work/.private/provider/opencode
     networks:
       - runner-control
-      - runner-egress
+      - runner-egress-v2
     dns:
-      - ${RUNNER_EGRESS_DNS_IP:-172.31.250.53}
+      # Docker's embedded resolver answers private service names itself and
+      # forwards public lookups to the executor's unprivileged loopback relay.
+      - 127.0.0.53
     read_only: true
     tmpfs:
       - /tmp:size=1g,mode=1777
@@ -322,7 +325,7 @@ services:
       target: egress-proxy
     restart: unless-stopped
     networks:
-      - runner-egress
+      - runner-egress-v2
       - default
     read_only: true
     tmpfs:
@@ -348,8 +351,7 @@ services:
       target: egress-dns
     restart: unless-stopped
     networks:
-      runner-egress:
-        ipv4_address: ${RUNNER_EGRESS_DNS_IP:-172.31.250.53}
+      runner-egress-v2: {}
       default: {}
     read_only: true
     cap_drop: ["ALL"]
@@ -529,8 +531,7 @@ volumes:
 networks:
   runner-control:
     internal: true
-  runner-egress:
+  # Versioned because changing IPAM in place can leave existing containers
+  # attached to the removed v1 network during a rolling Compose upgrade.
+  runner-egress-v2:
     internal: true
-    ipam:
-      config:
-        - subnet: ${RUNNER_EGRESS_SUBNET:-172.31.250.0/24}

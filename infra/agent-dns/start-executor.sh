@@ -23,7 +23,7 @@ socat \
   "TCP4:${resolver_host}:${resolver_port}" &
 tcp_relay_pid=$!
 
-pnpm runner:executor &
+node /app/dist/runner/executor.js &
 executor_pid=$!
 
 readonly child_pids=("$udp_relay_pid" "$tcp_relay_pid" "$executor_pid")

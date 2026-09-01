@@ -234,6 +234,15 @@ try {
     assert.equal(host.Sysctls?.['net.ipv4.ip_unprivileged_port_start'], '0');
   });
 
+  await check('read-only runner services bypass package-manager launchers', () => {
+    const executorProcesses = docker(['top', executor, '-eo', 'pid,args']).stdout;
+    const gatewayProcesses = docker(['top', gateway, '-eo', 'pid,args']).stdout;
+    assert.match(executorProcesses, /node \/app\/dist\/runner\/executor\.js/);
+    assert.match(gatewayProcesses, /node dist\/runner\/gateway\.js/);
+    assert.doesNotMatch(executorProcesses, /(?:^|\s)pnpm(?:\s|$)/m);
+    assert.doesNotMatch(gatewayProcesses, /(?:^|\s)pnpm(?:\s|$)/m);
+  });
+
   await check('executor mounts no factory data or Docker socket', () => {
     const data = inspect(executor);
     assert.deepEqual(data.Mounts.map((mount) => mount.Destination).sort(), [

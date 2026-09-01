@@ -8,6 +8,13 @@ WORKDIR /app
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 
+# Runtime containers have a read-only root filesystem. Compile once while the
+# image is writable so their entrypoints can execute Node directly instead of
+# asking pnpm to perform a dependency-status check under /app at every start.
+FROM dependencies AS runner-build
+COPY . .
+RUN pnpm build
+
 # A single static binary supplies dependency-free TCP/HTTP health probes for
 # the otherwise minimal proxy and DNS images.
 FROM busybox:1.37.0-musl AS health-tools
@@ -34,12 +41,11 @@ EXPOSE 53/udp 53/tcp 8080 8181
 ENTRYPOINT ["/coredns"]
 CMD ["-conf", "/Corefile.true"]
 
-FROM dependencies AS gateway
-COPY . .
+FROM runner-build AS gateway
 RUN mkdir -p /app/sites /app/agent-inputs /app/runner-work \
     && chown -R node:node /app /home/node
 USER node
-CMD ["pnpm", "runner:gateway"]
+CMD ["node", "dist/runner/gateway.js"]
 
 FROM dependencies AS executor
 
@@ -91,7 +97,11 @@ RUN set -eux; \
     chmod +x /usr/local/bin/ttyd; \
     ttyd --version
 
+# Keep application changes after the expensive pinned CLI/toolchain layers so
+# normal releases reuse those Docker cache entries. The compiled output comes
+# from the single shared build stage used by both runner services.
 COPY . .
+COPY --from=runner-build /app/dist ./dist
 COPY --chmod=0555 infra/agent-dns/start-executor.sh /usr/local/bin/start-runner-executor
 RUN mkdir -p /app/runner-work/.private/credentials /app/.claude/skills \
       /app/runner-work/.private/codex \

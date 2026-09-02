@@ -20,6 +20,7 @@ import { getSetting, masterKeyConfigured, settingSource } from '../lib/settings.
 import * as waha from '../channels/waha.js';
 import { claudeCodeRuntime } from '../agents/claudeCodeRuntime.js';
 import { opencodeRuntime } from '../agents/opencodeRuntime.js';
+import { connectedOpenCodeProviderIds } from '../runner/credentials.js';
 import { getRuntime } from '../agents/runtime.js';
 import { effectiveModel, effectiveModels } from '../agents/modelPolicy.js';
 import { z } from 'zod';
@@ -135,12 +136,14 @@ async function checkCodex(): Promise<CheckResult> {
 /**
  * Same philosophy as checkClaude: the cheapest real agent call proves both the
  * login and the whole path, which no credential-file inspection could.
- * The credential lives in OpenCode's own home (`auth.json`); if it is missing
- * or its provider refuses, the remedy is `opencode auth login` in the executor.
+ * The credential lives in OpenCode's own home (`auth.json`), written by the
+ * «Підключити» form in the accounts card; if it is missing or the provider
+ * refuses, that form is the remedy.
  */
 async function checkOpenCode(modelOverride?: string): Promise<CheckResult> {
   const bin = config.agents.openCodeBin;
   const model = modelOverride ?? effectiveModel('opencode', false, config.agents.modelInputs());
+  const providers = (await connectedOpenCodeProviderIds().catch(() => [])).join(', ');
   try {
     // This runtime explicitly, not `getRuntime()`: the button says "OpenCode".
     const res = await opencodeRuntime.structured(
@@ -155,17 +158,19 @@ async function checkOpenCode(modelOverride?: string): Promise<CheckResult> {
       message: res?.pong === true
         ? 'OpenCode відповідає — провайдер робочий.'
         : 'Виклик пройшов, але відповідь несподівана.',
-      detail: { bin, model: model || 'типова модель CLI' },
+      detail: { bin, model: model || 'типова модель CLI', providers: providers || null },
     };
   } catch (err) {
     const text = short(err);
-    const needsLogin = /auth|credential|login|provider/i.test(text);
+    const needsLogin = !providers || /auth|credential|login|provider|401|403/i.test(text);
     return {
       ok: false,
       message: needsLogin
-        ? 'OpenCode не залогінений — виконай `docker compose exec agent-runner-executor opencode auth login` і залогінь потрібного провайдера.'
+        ? (providers
+          ? `Провайдер відхилив ключ: ${text.replace(/\.+$/, '')}. Перепідключи його в цій картці.`
+          : 'Жоден провайдер OpenCode не підключений — вибери провайдера і встав ключ у цій картці.')
         : `OpenCode не відповів: ${text}`,
-      detail: { bin, model: model || 'типова модель CLI' },
+      detail: { bin, model: model || 'типова модель CLI', providers: providers || null },
     };
   }
 }

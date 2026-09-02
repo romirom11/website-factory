@@ -127,7 +127,7 @@ export const SETTINGS: SettingDef[] = [
   {
     key: 'AGENT_RUNTIME', label: 'Чим виконувати агентні етапи', group: 'agents',
     kind: 'select', options: ['claude-code', 'codex', 'opencode'], default: 'claude-code',
-    hint: 'Усі працюють по підписці. Оплата за токени недоступна в принципі. OpenCode юзає провайдера, залогіненого в runner executor (`opencode auth list`).',
+    hint: 'Усі працюють по підписці. Оплата за токени недоступна в принципі. OpenCode ходить до провайдера, підключеного в «Акаунтах» (ключ GLM Coding Plan, Kimi тощо); у проді провайдер має бути в OPENCODE_PROVIDERS.',
   },
   {
     key: 'AGENT_MODEL', label: 'Модель для звичайних етапів', group: 'agents', kind: 'text',

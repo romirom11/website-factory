@@ -9,7 +9,7 @@ Code-first мультиагентна система: **PostgreSQL = state machi
 - **claude-code (default)**: Claude Code по підписці Pro/Max. Два режими виклику — headless structured (enrichment, brief, дизайн-напрямки, QA, текст outreach) і code agent з workspace (builder + QA-fix loop): ізольований Next.js-шаблон, immutable snapshot, brief, design contract і локальні assets; агент сам пише код, сам ганяє `pnpm install`/`pnpm build`, сам фіксить помилки. QA-issues повертаються в той самий workspace.
 - **codex**: те саме через Codex CLI по підписці ChatGPT; один вибір у UI застосовується до всіх агентних етапів.
 
-OpenCode також реалізує tool-free structured-виклики. Його tool-enabled builder у production fail-closed вимкнений, бо pinned CLI не має OS sandbox для subprocess tools; вибір OpenCode для збірки дає явний `needs_human`, а не слабший security mode.
+OpenCode — третій рівноправний runtime: ключ провайдера по підписці (GLM Coding Plan, Kimi, Zen…) підключається в UI, у production процес працює всередині Codex exact-root sandbox, а ключ доходить до моделі через credential broker executor-а; провайдери, які пропускає egress, задає `OPENCODE_PROVIDERS` (див. `docs/AGENT-RUNTIME.md`).
 
 `ANTHROPIC_API_KEY` не потрібен ніде.
 

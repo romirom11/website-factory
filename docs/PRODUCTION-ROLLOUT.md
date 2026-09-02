@@ -17,7 +17,9 @@ factory або послаблення runner sandbox. Якщо canary не пр�
 
 1. Переконайся, що `.env` містить окремі `RUNNER_API_KEY` і
    `RUNNER_EXECUTOR_API_KEY`, `UI_PASSWORD`, `UI_SESSION_SECRET`,
-   `SETTINGS_MASTER_KEY`; provider credentials тут не зберігаються.
+   `SETTINGS_MASTER_KEY`; provider credentials тут не зберігаються. Якщо
+   агентні етапи йдуть через OpenCode — `OPENCODE_PROVIDERS` перелічує id
+   провайдерів, яким відкрито egress (ключі підключаються в UI).
 2. Зроби backup БД і перевір, що dump читається:
 
    ```bash
@@ -104,15 +106,15 @@ pnpm test:runner-isolation
 
 Gate має довести approved package egress, deny довільного CONNECT/DNS/raw IP,
 відсутність route до factory/Postgres/MinIO/host, невидимість provider
-credentials для gateway, exact-workspace isolation та падіння readiness після
-зупинки proxy. Розширення allowlist дозволене лише синхронною зміною:
+credentials для gateway, exact-workspace isolation, падіння readiness після
+зупинки proxy та OpenCode-шлях (connect → sandboxed run через broker →
+NEEDS_HUMAN на відхиленому ключі). Allowlist живе в одному реєстрі
+`infra/agent-egress/`: inherent-домени в `runtime-domains.txt`, провайдери
+OpenCode — у згенерованому `opencode-providers.tsv` (`pnpm egress:catalog`),
+увімкнені через `OPENCODE_PROVIDERS`. Squid і CoreDNS рендерять свої списки з
+нього при старті, Claude tool-sandbox і broker читають його ж у runtime.
 
-- `infra/agent-proxy/squid.conf`;
-- `infra/agent-dns/Corefile`;
-- `APPROVED_TOOL_DOMAINS` у `src/agents/confinement.ts`, якщо домен потрібен
-  tool subprocess.
-
-Після будь-якої такої зміни повтори весь isolation gate.
+Після будь-якої зміни реєстру чи `OPENCODE_PROVIDERS` повтори весь isolation gate.
 
 `RUNNER_DNS_PROTECTION_ENABLED=true` є production default. Значення `false`
 дозволяє unrestricted **public DNS** для аварійної діагностики або сумісності,
@@ -220,9 +222,10 @@ Green status у чаті чи ручний smoke не заміняє цей фа
    `0600` тільки в `runnerclaude` volume і робить реальний check.
 2. `/settings/accounts` → Codex → `Підключити`; browser/device login зберігає
    credential тільки в `codexhome`.
-3. OpenCode: `docker compose exec agent-runner-executor opencode auth login`.
-   У production він дозволений для tool-free structured calls; builder/QA-fix
-   fail-closed переходить у `needs_human`.
+3. `/settings/accounts` → OpenCode → провайдер + API-ключ → `Підключити`;
+   ключ лягає в `auth.json` тільки в `opencodehome` і перевіряється реальним
+   викликом. Провайдер має бути в `OPENCODE_PROVIDERS`; у production збірки
+   йдуть усередині Codex-пісочниці через credential broker executor-а.
 4. Telegram перевіряється кнопкою в UI. Він лише сповіщає і лінкує в UI —
    жодних approval/command handlers у боті немає.
 

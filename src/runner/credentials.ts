@@ -2,6 +2,7 @@
 import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { setSensitiveValues } from '../lib/redaction.js';
+import { openCodeDataRoot } from '../agents/confinement.js';
 
 function credentialRoot(): string | null {
   const configured = (process.env.RUNNER_CREDENTIAL_ROOT ?? '').trim();
@@ -95,10 +96,71 @@ export async function runnerSensitiveValues(): Promise<string[]> {
   }
   const workRoot = path.resolve(process.env.RUNNER_WORK_ROOT ?? '/app/runner-work');
   const codexHome = path.resolve(process.env.CODEX_HOME ?? path.join(workRoot, '.private', 'codex'));
-  const openCodeData = path.resolve(process.env.XDG_DATA_HOME ?? path.join(workRoot, '.private', 'provider'));
   for (const value of await secretsFromJson(path.join(codexHome, 'auth.json'))) values.add(value);
-  for (const value of await secretsFromJson(path.join(openCodeData, 'opencode', 'auth.json'))) values.add(value);
+  for (const value of await secretsFromJson(openCodeAuthFile())) values.add(value);
   return [...values];
+}
+
+// ─── OpenCode provider keys ──────────────────────────────────────────────────
+//
+// OpenCode keeps `{ "<provider id>": { "type": "api", "key": "…" } }` in
+// `$XDG_DATA_HOME/opencode/auth.json` — the file `opencode auth login` writes.
+// The factory writes the same file directly: the CLI's login is an interactive
+// TUI that cannot be driven from a button, while the file format is one object
+// per provider. Only `type: "api"` entries are understood (the broker forwards
+// them); OAuth-style entries the CLI may add by other means are left untouched.
+
+export interface OpenCodeAuthEntry { type: string; key?: string; [extra: string]: unknown }
+
+export function openCodeAuthFile(): string {
+  return path.join(openCodeDataRoot(), 'opencode', 'auth.json');
+}
+
+export async function readOpenCodeAuth(): Promise<Record<string, OpenCodeAuthEntry>> {
+  try {
+    const parsed = JSON.parse(await readFile(openCodeAuthFile(), 'utf8')) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, OpenCodeAuthEntry>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+async function writeOpenCodeAuth(auth: Record<string, OpenCodeAuthEntry>): Promise<void> {
+  const file = openCodeAuthFile();
+  await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  await writeFile(file, `${JSON.stringify(auth, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  await chmod(file, 0o600);
+  await refreshRunnerSensitiveValues();
+}
+
+/** Provider ids that currently hold an api key (never the keys themselves). */
+export async function connectedOpenCodeProviderIds(): Promise<string[]> {
+  return Object.entries(await readOpenCodeAuth())
+    .filter(([, entry]) => entry?.type === 'api' && typeof entry.key === 'string' && entry.key.length > 0)
+    .map(([id]) => id);
+}
+
+export async function connectOpenCodeProvider(providerId: string, key: string): Promise<void> {
+  const trimmed = key.trim();
+  if (!trimmed || /\s/.test(trimmed)) throw new Error('an API key must be a single non-empty token');
+  const auth = await readOpenCodeAuth();
+  auth[providerId] = { type: 'api', key: trimmed };
+  await writeOpenCodeAuth(auth);
+}
+
+export async function disconnectOpenCodeProvider(providerId: string): Promise<boolean> {
+  const auth = await readOpenCodeAuth();
+  if (!(providerId in auth)) return false;
+  delete auth[providerId];
+  if (Object.keys(auth).length === 0) {
+    await rm(openCodeAuthFile(), { force: true });
+    await refreshRunnerSensitiveValues();
+  } else {
+    await writeOpenCodeAuth(auth);
+  }
+  return true;
 }
 
 export async function refreshRunnerSensitiveValues(): Promise<string[]> {

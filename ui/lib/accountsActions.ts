@@ -117,13 +117,53 @@ export async function cancelAccount(provider: string): Promise<AccountSession> {
   return r.data.session;
 }
 
-export async function disconnectAccount(provider: string): Promise<{ ok: boolean; message: string }> {
+export async function disconnectAccount(
+  provider: string,
+  /** OpenCode only: which provider's key to remove. */
+  providerId?: string,
+): Promise<{ ok: boolean; message: string }> {
   const r = await callFactory<{ ok: boolean; message: string }>(
-    `/internal/accounts/${encodeURIComponent(provider)}/disconnect`, { method: 'POST' },
+    `/internal/accounts/${encodeURIComponent(provider)}/disconnect`,
+    { method: 'POST', body: providerId ? { providerId } : {} },
   );
   if (!r.ok) return { ok: false, message: r.message ?? 'Не вдалося.' };
   revalidatePath('/settings', 'layout');
   return { ok: Boolean(r.data?.ok), message: r.data?.message ?? '' };
+}
+
+// ─── OpenCode helper ─────────────────────────────────────────────────────────
+
+export interface OpenCodeProviderStatus { id: string; name: string; connected: boolean }
+
+/**
+ * Providers the operator may connect (OPENCODE_PROVIDERS ∩ catalog in
+ * production, the whole catalog in local development) and which of them
+ * already hold a key. Comes from the runtime owner: it is the only place that
+ * can see auth.json.
+ */
+export async function opencodeProviders(): Promise<{ providers: OpenCodeProviderStatus[]; message?: string }> {
+  const r = await callFactory<{ ok: boolean; providers?: OpenCodeProviderStatus[]; message?: string }>(
+    '/internal/accounts/opencode/status', { timeoutMs: 15_000 },
+  );
+  if (!r.ok) return { providers: [], message: r.message ?? 'Фабрика недоступна.' };
+  return { providers: r.data?.providers ?? [], message: r.data?.message };
+}
+
+/** Store one provider key in OpenCode's auth.json (runner volume) and verify it with a real call. */
+export async function connectOpenCode(providerId: string, key: string): Promise<AccountSession> {
+  const id = providerId.trim();
+  const k = key.trim();
+  if (!id) return { provider: 'opencode', phase: 'error', message: 'Вибери провайдера.', startedAt: 0, expiresInMs: 0 };
+  if (!k) return { provider: 'opencode', phase: 'error', message: 'Порожній ключ.', startedAt: 0, expiresInMs: 0 };
+  const r = await callFactory<{ ok: boolean; session?: AccountSession; message?: string }>(
+    '/internal/accounts/opencode/connect',
+    { method: 'POST', body: { providerId: id, key: k }, timeoutMs: 150_000 },
+  );
+  if (!r.ok || !r.data?.session) {
+    return { provider: 'opencode', phase: 'error', message: r.message ?? r.data?.message ?? 'Не вдалося підключити.', startedAt: 0, expiresInMs: 0 };
+  }
+  revalidatePath('/settings', 'layout');
+  return r.data.session;
 }
 
 // ─── Telegram helper ─────────────────────────────────────────────────────────

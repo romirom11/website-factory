@@ -51,11 +51,18 @@ import { log } from '../lib/logger.js';
 import { runLocalAgentCheck, type CheckResult } from './checks.js';
 import {
   clearRunnerClaudeCredential,
+  connectOpenCodeProvider,
+  connectedOpenCodeProviderIds,
+  disconnectOpenCodeProvider,
   runnerCredentialStoreEnabled,
   seedRunnerClaudeCredential,
 } from '../runner/credentials.js';
+import { enabledOpenCodeProviders, openCodeCatalog } from '../runner/egressRegistry.js';
+import { runnerConfinementRequired } from '../agents/confinement.js';
 
-export type AccountProvider = 'claude' | 'codex';
+export type AccountProvider = 'claude' | 'codex' | 'opencode';
+/** Providers whose login is an interactive CLI session (URL + code / device auth). */
+export type CliAccountProvider = 'claude' | 'codex';
 
 /** Where a connection flow currently is. The UI renders one screen per phase. */
 export type SessionPhase =
@@ -103,7 +110,7 @@ const TTL_MS = 5 * 60_000;
 /** Keep the tail of the CLI chatter, never let a chatty child eat memory. */
 const MAX_BUFFER = 64_000;
 
-const sessions = new Map<AccountProvider, Session>();
+const sessions = new Map<CliAccountProvider, Session>();
 
 // ─── Terminal output parsing ─────────────────────────────────────────────────
 
@@ -560,7 +567,7 @@ function startCodex(s: Session): void {
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /** Provider is mid-flight (so the UI can refuse to start a second one). */
-export function activeSession(provider: AccountProvider): AccountSession | null {
+export function activeSession(provider: CliAccountProvider): AccountSession | null {
   const s = sessions.get(provider);
   if (!s) return null;
   sweep(s);
@@ -581,7 +588,7 @@ function sweep(s: Session): void {
  * a fresh URL, and two `claude setup-token` children racing for the same token
  * would be worse than either.
  */
-export function startSession(provider: AccountProvider): AccountSession {
+export function startSession(provider: CliAccountProvider): AccountSession {
   const existing = sessions.get(provider);
   if (existing && !existing.finished) {
     finish(existing, 'cancelled', 'Скасовано новим запуском.');
@@ -620,7 +627,7 @@ export function startSession(provider: AccountProvider): AccountSession {
  * The trailing `\r` is what the PTY delivers as Enter; `\n` alone leaves Ink's
  * input sitting there with the code typed but never submitted.
  */
-export function submitCode(provider: AccountProvider, code: string): AccountSession {
+export function submitCode(provider: CliAccountProvider, code: string): AccountSession {
   const s = sessions.get(provider);
   if (!s) return { provider, phase: 'error', message: 'Немає активної сесії. Натисни «Підключити».', startedAt: 0, expiresInMs: 0 };
   sweep(s);
@@ -659,7 +666,7 @@ export function submitCode(provider: AccountProvider, code: string): AccountSess
 }
 
 /** Explicit "Скасувати". Kills the child; the credential is untouched. */
-export function cancelSession(provider: AccountProvider): AccountSession {
+export function cancelSession(provider: CliAccountProvider): AccountSession {
   const s = sessions.get(provider);
   if (!s) return { provider, phase: 'cancelled', message: 'Немає активної сесії.', startedAt: 0, expiresInMs: 0 };
   finish(s, 'cancelled', 'Скасовано.');
@@ -674,7 +681,11 @@ export function cancelSession(provider: AccountProvider): AccountSession {
  * override. Codex: invoke the CLI's own logout command against the credential
  * volume; deleting files behind the CLI's back would make its format our API.
  */
-export async function disconnect(provider: AccountProvider): Promise<{ ok: boolean; message: string }> {
+export async function disconnect(
+  provider: AccountProvider,
+  providerId?: string,
+): Promise<{ ok: boolean; message: string }> {
+  if (provider === 'opencode') return disconnectOpenCode(providerId ?? '');
   if (provider === 'claude') {
     const runnerStore = runnerCredentialStoreEnabled();
     try {
@@ -714,7 +725,104 @@ export async function disconnect(provider: AccountProvider): Promise<{ ok: boole
 }
 
 export function isAccountProvider(v: string): v is AccountProvider {
+  return v === 'claude' || v === 'codex' || v === 'opencode';
+}
+
+export function isCliAccountProvider(v: string): v is CliAccountProvider {
   return v === 'claude' || v === 'codex';
+}
+
+// ─── OpenCode ────────────────────────────────────────────────────────────────
+//
+// No CLI session here: `opencode auth login` is an interactive TUI, but what it
+// produces is one JSON object per provider in auth.json, which the runtime
+// owner writes directly. The provider list comes from the shared egress
+// registry (OPENCODE_PROVIDERS ∩ catalog): in production a key for a provider
+// the proxy/DNS do not allow would only ever fail at the first call, so it is
+// refused up front with the reason.
+
+export interface OpenCodeProviderStatus {
+  id: string;
+  name: string;
+  connected: boolean;
+}
+
+/** Providers the operator may connect, with whether a key is stored for each. */
+export async function openCodeAccountStatus(): Promise<{
+  providers: OpenCodeProviderStatus[];
+  message?: string;
+}> {
+  const connected = new Set(await connectedOpenCodeProviderIds());
+  try {
+    const enabled = enabledOpenCodeProviders();
+    // Outside production (no egress allowlist) every catalog provider is fair
+    // game; inside, only the enabled ones. A stored key for a provider that is
+    // no longer enabled still shows, so it can be disconnected.
+    const catalog = openCodeCatalog();
+    const visible = runnerConfinementRequired()
+      ? [...enabled, ...[...connected].filter((id) => !enabled.some((p) => p.id === id)).map((id) => catalog.get(id) ?? { id, name: id, api: '' })]
+      : [...catalog.values()];
+    return {
+      providers: visible.map((provider) => ({
+        id: provider.id, name: provider.name, connected: connected.has(provider.id),
+      })),
+      message: runnerConfinementRequired() && enabled.length === 0
+        ? 'OPENCODE_PROVIDERS порожній: додай id провайдерів (напр. zai-coding-plan) у .env і перезапусти compose — без цього egress їх не пропустить.'
+        : undefined,
+    };
+  } catch (err) {
+    return { providers: [], message: `OPENCODE_PROVIDERS некоректний: ${String(err instanceof Error ? err.message : err).slice(0, 200)}` };
+  }
+}
+
+/** Store a provider key, then prove it with a real call — one button, one answer. */
+export async function connectOpenCode(providerId: string, key: string): Promise<AccountSession> {
+  const base = { provider: 'opencode' as const, startedAt: Date.now(), expiresInMs: 0 };
+  const provider = openCodeCatalog().get(providerId);
+  if (!provider) {
+    return { ...base, phase: 'error', message: `Невідомий провайдер OpenCode: ${providerId}. Список — infra/agent-egress/opencode-providers.tsv.` };
+  }
+  if (runnerConfinementRequired()) {
+    let enabled: string[];
+    try { enabled = enabledOpenCodeProviders().map((p) => p.id); } catch (err) {
+      return { ...base, phase: 'error', message: `OPENCODE_PROVIDERS некоректний: ${String(err instanceof Error ? err.message : err).slice(0, 200)}` };
+    }
+    if (!enabled.includes(providerId)) {
+      return {
+        ...base, phase: 'error',
+        message: `${provider.name} не увімкнений у OPENCODE_PROVIDERS, тому egress-проксі і DNS його не пропустять. Додай «${providerId}» у OPENCODE_PROVIDERS, зроби docker compose up -d і повтори.`,
+      };
+    }
+  }
+  try {
+    await connectOpenCodeProvider(providerId, key);
+  } catch (err) {
+    return { ...base, phase: 'error', message: `Ключ не зберігся: ${String(err instanceof Error ? err.message : err).slice(0, 200)}` };
+  }
+  const check = await runLocalAgentCheck('opencode').catch((err): CheckResult => ({
+    ok: false, message: `Ключ збережено, але перевірка впала: ${String(err).slice(0, 200)}`,
+  }));
+  log.info('opencode provider connected', { providerId, checkOk: check.ok });
+  return {
+    ...base,
+    phase: check.ok ? 'done' : 'error',
+    check,
+    message: check.ok
+      ? `${provider.name} підключений — ключ збережено і перевірено справжнім викликом.`
+      : `Ключ ${provider.name} збережено, але перевірка не пройшла: ${check.message}`,
+  };
+}
+
+export async function disconnectOpenCode(providerId: string): Promise<{ ok: boolean; message: string }> {
+  if (!providerId) return { ok: false, message: 'Не вказано, який провайдер OpenCode відключити.' };
+  try {
+    const removed = await disconnectOpenCodeProvider(providerId);
+    return removed
+      ? { ok: true, message: `Ключ ${openCodeCatalog().get(providerId)?.name ?? providerId} видалено з auth.json OpenCode.` }
+      : { ok: false, message: `${providerId} не був підключений.` };
+  } catch (err) {
+    return { ok: false, message: `Не вдалося видалити: ${String(err instanceof Error ? err.message : err).slice(0, 200)}` };
+  }
 }
 
 // ─── Telegram chat-id discovery ──────────────────────────────────────────────

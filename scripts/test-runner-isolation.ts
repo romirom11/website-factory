@@ -25,6 +25,8 @@ interface ContainerInspect {
     PidsLimit: number | null;
     ReadonlyRootfs: boolean;
     SecurityOpt: string[] | null;
+    MaskedPaths: string[] | null;
+    ReadonlyPaths: string[] | null;
     Sysctls: Record<string, string> | null;
   };
   Mounts: Array<{ Destination: string; Name?: string; Type: string }>;
@@ -66,6 +68,9 @@ const composeEnv: NodeJS.ProcessEnv = {
   UI_PASSWORD: 'runner-isolation-ui-password',
   BUILD_TERMINAL_PORT: String(await freePort()),
   RUNNER_MEMORY_LIMIT: '2g',
+  // One OpenCode provider enabled end-to-end: proxy ACL, DNS zone, broker
+  // routing and the accounts flow are all exercised against it below.
+  OPENCODE_PROVIDERS: 'zai-coding-plan',
 };
 
 function run(
@@ -154,6 +159,7 @@ try {
       services: Record<string, {
         command?: string[];
         dns?: string[];
+        environment?: Record<string, string>;
         security_opt?: string[];
         sysctls?: Record<string, string>;
       }>;
@@ -164,13 +170,17 @@ try {
     assert.deepEqual(executorConfig?.dns, ['127.0.0.53']);
     assert.ok(executorConfig?.security_opt?.includes('apparmor=wf-runner-executor'));
     assert.equal(executorConfig?.sysctls?.['net.ipv4.ip_unprivileged_port_start'], '0');
-    assert.deepEqual(config.services['agent-egress-dns']?.command, ['-conf', '/Corefile.true']);
+    // One egress registry value reaches all three readers of it.
+    for (const service of ['agent-egress-dns', 'agent-egress-proxy', 'agent-runner-executor']) {
+      assert.equal(config.services[service]?.environment?.OPENCODE_PROVIDERS, 'zai-coding-plan', service);
+    }
+    assert.equal(config.services['agent-egress-dns']?.environment?.RUNNER_DNS_PROTECTION_ENABLED, 'true');
 
     const openConfig = JSON.parse(composeWithEnv(
       { RUNNER_DNS_PROTECTION_ENABLED: 'false' },
       ['config', '--format', 'json'],
     ).stdout) as typeof config;
-    assert.deepEqual(openConfig.services['agent-egress-dns']?.command, ['-conf', '/Corefile.false']);
+    assert.equal(openConfig.services['agent-egress-dns']?.environment?.RUNNER_DNS_PROTECTION_ENABLED, 'false');
   });
 
   const collision = docker([
@@ -210,7 +220,7 @@ try {
     assert.deepEqual(health.isolation.codeRuntimes, {
       'claude-code': true,
       codex: true,
-      opencode: false,
+      opencode: true,
     });
   });
 
@@ -278,6 +288,11 @@ try {
     assert.ok(host.SecurityOpt?.includes('no-new-privileges:true'));
     assert.ok(host.SecurityOpt?.includes('seccomp=unconfined'));
     assert.ok(host.SecurityOpt?.includes('apparmor=wf-runner-executor'));
+    // `systempaths=unconfined` is not echoed in SecurityOpt; Docker records it
+    // as empty masked/read-only path lists. Needed for the nested procfs the
+    // OpenCode sandbox mounts.
+    assert.deepEqual(host.MaskedPaths ?? [], [], 'systempaths=unconfined must clear Docker masked paths');
+    assert.deepEqual(host.ReadonlyPaths ?? [], [], 'systempaths=unconfined must clear Docker read-only paths');
     assert.equal(host.PidsLimit, 512);
     assert.ok(host.Memory > 0);
     assert.equal(host.Sysctls?.['net.ipv4.ip_unprivileged_port_start'], '0');
@@ -437,6 +452,90 @@ try {
         curl -fsS -o /dev/null --connect-timeout 5 --max-time 15 https://registry.npmjs.org/pnpm
     `;
     docker(['exec', executor, 'sh', '-lc', command]);
+  });
+
+  await check('enabled OpenCode provider hosts pass DNS and the proxy; other providers do not', () => {
+    const script = `
+      const dns=require('node:dns').promises;
+      (async()=>{
+        await dns.lookup('api.z.ai');
+        try { await dns.lookup('api.mistral.ai'); process.exit(91); } catch {}
+      })().catch(()=>process.exit(92));
+    `;
+    docker(['exec', executor, 'node', '-e', script]);
+    // Squid answers CONNECT for an allowed host (any upstream status is fine)
+    // and refuses the tunnel outright for a catalog host that is not enabled.
+    const allowed = docker([
+      'exec', executor, 'curl', '-sS', '-o', '/dev/null', '-w', '%{http_code}',
+      '--connect-timeout', '5', '--max-time', '20', 'https://api.z.ai/',
+    ]).stdout.trim();
+    assert.notEqual(allowed, '403', 'proxy must allow the enabled provider host');
+    assert.notEqual(allowed, '000', 'enabled provider host must be reachable through the proxy');
+    const denied = docker([
+      'exec', executor, 'sh', '-lc',
+      "if curl -fsS -o /dev/null --connect-timeout 3 --max-time 5 https://api.mistral.ai/ 2>/dev/null; then exit 93; fi",
+    ]);
+    assert.equal(denied.status, 0);
+  });
+
+  await check('sandboxed OpenCode cannot read auth.json but reaches the credential broker', () => {
+    const command = String.raw`
+      set -eu
+      workspace="$(mktemp -d /app/runner-work/opencode-a-XXXXXX)"
+      probe="$XDG_DATA_HOME/opencode/.broker-probe"
+      cleanup() { rm -rf "$workspace"; rm -f "$probe"; }
+      trap cleanup EXIT
+      printf secret > "$probe"
+      codex sandbox -P factory-tools -C "$workspace" sh -c '
+        set -eu
+        test ! -r "$1"
+        curl -fsS --noproxy "*" --connect-timeout 3 --max-time 5 http://127.0.0.1:8792/healthz | grep -q zai-coding-plan
+      ' opencode-inner "$probe"
+    `;
+    docker(['exec', executor, 'sh', '-lc', command]);
+  });
+
+  await check('OpenCode connect/run/disconnect crosses the whole runner path and fails as NEEDS_HUMAN on a bad key', () => {
+    const control = (body: Record<string, unknown>): { status: number; data: Record<string, unknown> } => JSON.parse(docker([
+      'exec', executor, 'node', '-e',
+      [
+        "fetch('http://127.0.0.1:8791/v1/accounts',{",
+        "method:'POST',",
+        "headers:{'content-type':'application/json','x-executor-key':'runner-isolation-private-key'},",
+        `body:${JSON.stringify(JSON.stringify(body))}`,
+        "}).then(async r=>console.log(JSON.stringify({status:r.status,data:await r.json()})))",
+      ].join(''),
+    ]).stdout.trim()) as { status: number; data: Record<string, unknown> };
+
+    const status = control({ version: 1, operation: 'status', provider: 'opencode' });
+    assert.equal(status.status, 200);
+    const providers = (status.data.data as { providers: Array<{ id: string; connected: boolean }> }).providers;
+    assert.deepEqual(providers.map((p) => p.id), ['zai-coding-plan']);
+    assert.equal(providers[0]!.connected, false);
+
+    // A syntactically valid but bogus key: the provider answers 401, which
+    // must come back as NEEDS_HUMAN (reconnect), never RATE_LIMITED or a crash.
+    const connect = control({
+      version: 1, operation: 'connect', provider: 'opencode',
+      providerId: 'zai-coding-plan', secret: 'runner-isolation-bogus-key',
+    });
+    assert.equal(connect.status, 200);
+    const session = (connect.data.data as { session: { phase: string; message: string; check?: { ok: boolean; message: string } } }).session;
+    assert.equal(session.phase, 'error', session.message);
+    assert.equal(session.check?.ok, false);
+    assert.match(session.check?.message ?? '', /відхилив ключ|401|403/i, session.check?.message);
+    assert.doesNotMatch(session.check?.message ?? '', /docker compose exec/);
+
+    const after = control({ version: 1, operation: 'status', provider: 'opencode' });
+    assert.equal((after.data.data as { providers: Array<{ connected: boolean }> }).providers[0]!.connected, true);
+
+    // The key stays in the executor volume, hidden from the gateway, and is
+    // gone after disconnect.
+    docker(['exec', executor, 'sh', '-lc', 'grep -q runner-isolation-bogus-key "$XDG_DATA_HOME/opencode/auth.json"']);
+    docker(['exec', gateway, 'sh', '-lc', 'test ! -e /app/runner-work/.private/provider/opencode/auth.json']);
+    const disconnect = control({ version: 1, operation: 'disconnect', provider: 'opencode', providerId: 'zai-coding-plan' });
+    assert.equal((disconnect.data.data as { ok: boolean }).ok, true);
+    docker(['exec', executor, 'sh', '-lc', 'test ! -e "$XDG_DATA_HOME/opencode/auth.json"']);
   });
 
   await check('proxy logs omit URL paths and query payloads', () => {

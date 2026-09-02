@@ -85,11 +85,12 @@ export async function loadAccounts(): Promise<AccountsSnapshot> {
     detail: 'логін у volume codexhome — статус лише за перевіркою',
   };
 
-  // Same shape as Codex: OpenCode keeps its provider credentials in its own
-  // home (`~/.local/share/opencode/auth.json`), invisible from the database.
+  // Same shape as Codex: OpenCode keeps its provider keys in its own home
+  // (`auth.json` in the runner volume), invisible from the database. The card
+  // lists connected providers live from the runtime owner.
   const opencode: AccountStatus = {
     id: 'opencode', readiness: 'partial',
-    detail: 'логін у auth.json OpenCode — статус лише за перевіркою',
+    detail: 'ключі провайдерів в auth.json OpenCode — статус лише за перевіркою',
   };
 
   const telegram: AccountStatus = tgToken && tgChat

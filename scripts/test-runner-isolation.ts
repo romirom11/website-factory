@@ -36,6 +36,7 @@ interface ContainerInspect {
 const project = `wf-runner-isolation-${process.pid}`;
 const legacySubnet = '172.31.250.0/24';
 const collisionNetwork = `${project}-legacy-subnet`;
+const injectedPublicNetwork = `${project}-dokploy-injection`;
 const services = [
   'agent-egress-dns',
   'agent-egress-proxy',
@@ -143,6 +144,7 @@ let gateway = '';
 let proxy = '';
 let started = false;
 let collisionNetworkCreated = false;
+let injectedPublicNetworkCreated = false;
 
 try {
   await check('Compose renders portable runner DNS topology and policy modes', () => {
@@ -150,6 +152,7 @@ try {
       services: Record<string, {
         command?: string[];
         dns?: string[];
+        security_opt?: string[];
         sysctls?: Record<string, string>;
       }>;
       networks: Record<string, { ipam?: Record<string, unknown> }>;
@@ -157,6 +160,7 @@ try {
     const executorConfig = config.services['agent-runner-executor'];
     assert.deepEqual(config.networks['runner-egress-v2']?.ipam, {});
     assert.deepEqual(executorConfig?.dns, ['127.0.0.53']);
+    assert.ok(executorConfig?.security_opt?.includes('apparmor=unconfined'));
     assert.equal(executorConfig?.sysctls?.['net.ipv4.ip_unprivileged_port_start'], '0');
     assert.deepEqual(config.services['agent-egress-dns']?.command, ['-conf', '/Corefile.true']);
 
@@ -222,6 +226,37 @@ try {
     }
   });
 
+  await check('readiness rejects a public network injected by the deployment platform', async () => {
+    docker(['network', 'create', '--driver', 'bridge', injectedPublicNetwork]);
+    injectedPublicNetworkCreated = true;
+    docker(['network', 'connect', injectedPublicNetwork, executor]);
+
+    const route = docker(['exec', executor, 'sh', '-lc', "awk '$2 == \"00000000\" { print $0 }' /proc/net/route"])
+      .stdout.trim();
+    assert.notEqual(route, '', 'the injected bridge must create a default route for this regression probe');
+
+    const status = docker([
+      'exec', executor, 'node', '-e',
+      "fetch('http://127.0.0.1:8791/health').then(r=>console.log(r.status))",
+    ]).stdout.trim();
+    assert.equal(status, '503');
+
+    const executionStatus = docker([
+      'exec', executor, 'node', '-e',
+      [
+        "fetch('http://127.0.0.1:8791/v1/executions',{",
+        "method:'POST',",
+        "headers:{'content-type':'application/json','x-executor-key':'runner-isolation-private-key'},",
+        "body:'{}'",
+        "}).then(r=>console.log(r.status))",
+      ].join(''),
+    ]).stdout.trim();
+    assert.equal(executionStatus, '503');
+
+    docker(['network', 'disconnect', injectedPublicNetwork, executor]);
+    await waitHealthy(executor);
+  });
+
   await check('executor is read-only, capability-free and resource-bounded', () => {
     const host = inspect(executor).HostConfig;
     assert.equal(host.ReadonlyRootfs, true);
@@ -229,6 +264,7 @@ try {
     assert.ok(host.CapDrop?.includes('ALL'));
     assert.ok(host.SecurityOpt?.includes('no-new-privileges:true'));
     assert.ok(host.SecurityOpt?.includes('seccomp=unconfined'));
+    assert.ok(host.SecurityOpt?.includes('apparmor=unconfined'));
     assert.equal(host.PidsLimit, 512);
     assert.ok(host.Memory > 0);
     assert.equal(host.Sysctls?.['net.ipv4.ip_unprivileged_port_start'], '0');
@@ -435,5 +471,6 @@ try {
   console.log(`\n🔐 RUNNER ISOLATION TESTS PASSED (${passed})`);
 } finally {
   if (started) compose(['down', '-v', '--remove-orphans'], true);
+  if (injectedPublicNetworkCreated) docker(['network', 'rm', injectedPublicNetwork], true);
   if (collisionNetworkCreated) docker(['network', 'rm', collisionNetwork], true);
 }

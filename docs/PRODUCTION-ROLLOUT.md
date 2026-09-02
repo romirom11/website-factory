@@ -37,6 +37,31 @@ factory або послаблення runner sandbox. Якщо canary не пр�
 
 ## Безпечна послідовність deploy
 
+### Dokploy: не дозволяти платформі розширювати executor network
+
+У Compose → Advanced вимкни deprecated **Isolated Deployment**. Цей режим
+Dokploy додає свою зовнішню мережу до **кожного** сервісу, навіть якщо вихідний
+compose явно залишив executor лише у двох internal-мережах.
+
+Після цього у Compose → Networks для `agent-runner-executor` увімкни
+**Detach dokploy-network** і redeploy. Gateway лишається на звичайній мережі для
+зв'язку з factory, а proxy/DNS — для контрольованого public egress. Від
+зовнішньої/default мережі від'єднується тільки executor.
+
+Перед запуском jobs відкрий Converted Compose та перевір, що executor має рівно:
+
+```yaml
+networks:
+  - runner-control
+  - runner-egress-v2
+```
+
+`dokploy-network`, `<app-name>-<suffix>`, `default` або інша external network у
+цьому списку є помилкою конфігурації. Executor тепер також перевіряє kernel route
+table на startup, в `/health` і перед кожним authenticated control request; за
+наявності default route він навмисно лишається unhealthy та не приймає нову
+агентну роботу з прямим виходом у мережу.
+
 ### 1. Поставити jobs на maintenance pause
 
 Не змінюй статуси jobs вручну й не видаляй pg-boss rows. Зупини обидва процеси,

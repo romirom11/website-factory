@@ -304,11 +304,14 @@ services:
       - /home/node/runtime-home:size=512m,uid=1000,gid=1000,mode=700
       - /home/node/.local/state:size=256m,uid=1000,gid=1000,mode=700
     cap_drop: ["ALL"]
-    # Nested bubblewrap needs clone/unshare syscalls. No capabilities are added;
-    # the tool sandbox itself applies filesystem/network/seccomp restrictions.
+    # Nested bubblewrap needs clone/unshare syscalls and mount propagation inside
+    # its own user namespace. Docker's default seccomp and AppArmor profiles block
+    # those operations. Scope both overrides to the executor only; no capabilities
+    # are added, and the tool sandbox still applies filesystem/network restrictions.
     security_opt:
       - no-new-privileges:true
       - seccomp=unconfined
+      - apparmor=unconfined
     pids_limit: 512
     mem_limit: ${RUNNER_MEMORY_LIMIT:-6g}
     init: true

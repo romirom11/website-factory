@@ -1,7 +1,7 @@
 /** Startup/readiness checks for the real executor security boundary. */
 import { spawn } from 'node:child_process';
 import { lookup } from 'node:dns/promises';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -14,6 +14,7 @@ import { codeAgentEnv } from '../agents/sandbox.js';
 import { redactSensitiveText } from '../lib/redaction.js';
 
 const FORBIDDEN_FACTORY_ENV = /^(DATABASE_URL|S3_|AWS_|SMTP_|IMAP_|TELEGRAM_|WAHA_|WHATSAPP_|POSTGRES_|MINIO_|SETTINGS_MASTER_KEY|UI_SESSION_SECRET)/;
+const IPV6_DEFAULT_DESTINATION = '0'.repeat(32);
 
 export interface RunnerIsolationReport {
   required: boolean;
@@ -39,11 +40,43 @@ function proxyReachable(timeoutMs = 1_500): Promise<void> {
   });
 }
 
+async function readOptionalKernelRoutes(file: string): Promise<string> {
+  try {
+    return await readFile(file, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
+    throw error;
+  }
+}
+
+async function assertNoDefaultRoute(): Promise<void> {
+  const [ipv4, ipv6] = await Promise.all([
+    readFile('/proc/net/route', 'utf8'),
+    readOptionalKernelRoutes('/proc/net/ipv6_route'),
+  ]);
+  const hasIpv4Default = ipv4.split('\n').slice(1).some((line) => {
+    const fields = line.trim().split(/\s+/);
+    return fields[1] === '00000000' && fields[7] === '00000000';
+  });
+  const hasIpv6Default = ipv6.split('\n').some((line) => {
+    const fields = line.trim().split(/\s+/);
+    return fields[0] === IPV6_DEFAULT_DESTINATION
+      && fields[1] === '00'
+      && fields[9] !== 'lo';
+  });
+  if (hasIpv4Default || hasIpv6Default) {
+    throw new Error(
+      'executor has a default network route; detach external/default networks from the executor',
+    );
+  }
+}
+
 /** Revalidates dependencies that can disappear after the startup probe passed. */
 export async function runnerIsolationLive(report: RunnerIsolationReport): Promise<boolean> {
   if (!report.ready) return false;
   if (!report.required) return true;
   try {
+    await assertNoDefaultRoute();
     await lookup('registry.npmjs.org');
     await proxyReachable();
     return true;
@@ -131,6 +164,7 @@ export async function initializeRunnerIsolation(): Promise<RunnerIsolationReport
   }
   if (process.platform !== 'linux') throw new Error('production runner isolation requires Linux');
   assertExecutorEnvironment();
+  await assertNoDefaultRoute();
   await configureCodexConfinement();
   const dnsProtectionEnabled = runnerDnsProtectionEnabled();
 

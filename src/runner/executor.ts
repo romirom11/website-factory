@@ -254,8 +254,14 @@ async function executeOnce(request: ExecutionRequest): Promise<ExecutionResponse
   return promise;
 }
 
-export function createExecutorApp(): Hono {
+/**
+ * `startExecutor()` runs the real isolation probe before serving. Tests that
+ * mount the app in-process pass their own report; without one the app stays
+ * fail-closed (503) until the probe has run.
+ */
+export function createExecutorApp(overrides: { isolationReport?: RunnerIsolationReport } = {}): Hono {
   const app = new Hono();
+  const currentReport = (): RunnerIsolationReport => overrides.isolationReport ?? isolationReport;
   const guardRequest = async (c: Context, requestId?: string): Promise<Response | undefined> => {
     if (!runnerCredentialAuthorized(c.req.header('x-executor-key') ?? '', process.env.EXECUTOR_API_KEY ?? '')) {
       return c.json({
@@ -265,7 +271,7 @@ export function createExecutorApp(): Hono {
         error: { code: 'UNAUTHORIZED', message: 'invalid executor credential' },
       }, 401);
     }
-    if (!await runnerIsolationLive(isolationReport)) {
+    if (!await runnerIsolationLive(currentReport())) {
       return c.json({
         version: RUNNER_PROTOCOL_VERSION,
         ...(requestId ? { requestId } : {}),
@@ -276,7 +282,7 @@ export function createExecutorApp(): Hono {
     return undefined;
   };
   app.get('/health', async (c) => {
-    const live = await runnerIsolationLive(isolationReport);
+    const live = await runnerIsolationLive(currentReport());
     return c.json({
       ok: live,
       role: 'executor',

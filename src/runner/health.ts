@@ -11,7 +11,10 @@ import {
   runnerConfinementRequired,
 } from '../agents/confinement.js';
 import { codeAgentEnv } from '../agents/sandbox.js';
+import { confinedCommand, openCodeSandboxEnv } from '../agents/confinement.js';
 import { redactSensitiveText } from '../lib/redaction.js';
+import { enabledOpenCodeProviderIds } from './egressRegistry.js';
+import { providerBrokerPort } from './providerBroker.js';
 
 const FORBIDDEN_FACTORY_ENV = /^(DATABASE_URL|S3_|AWS_|SMTP_|IMAP_|TELEGRAM_|WAHA_|WHATSAPP_|POSTGRES_|MINIO_|SETTINGS_MASTER_KEY|UI_SESSION_SECRET)/;
 const IPV6_DEFAULT_DESTINATION = '0'.repeat(32);
@@ -167,6 +170,10 @@ export async function initializeRunnerIsolation(): Promise<RunnerIsolationReport
   await assertNoDefaultRoute();
   await configureCodexConfinement();
   const dnsProtectionEnabled = runnerDnsProtectionEnabled();
+  // A typo here would leave the proxy/DNS containers refusing to start while
+  // the executor happily reported healthy; fail on the same value they read.
+  enabledOpenCodeProviderIds();
+  const brokerPort = providerBrokerPort();
 
   const workspace = await mkdtemp(path.join(tmpdir(), 'runner-isolation-'));
   try {
@@ -182,7 +189,11 @@ export async function initializeRunnerIsolation(): Promise<RunnerIsolationReport
         'test -z "$(printenv EXECUTOR_API_KEY || true)"',
         'test ! -r "$1/auth.json"',
         'test ! -r "$2/claude/oauth-token"',
-        'test ! -r /proc/1/environ',
+        'test ! -r "$3/opencode/auth.json"',
+        // With a private PID namespace /proc/1 is the sandbox's own init, so
+        // "readable" proves nothing; what must hold is that no process
+        // environment visible in there carries the executor's secret.
+        '! grep -qs EXECUTOR_API_KEY /proc/[0-9]*/environ',
         'getent ahosts registry.npmjs.org >/dev/null',
         dnsProtectionEnabled
           ? '! getent ahosts example.com >/dev/null'
@@ -194,9 +205,37 @@ export async function initializeRunnerIsolation(): Promise<RunnerIsolationReport
       'runner-isolation-probe',
       path.resolve(process.env.CODEX_HOME!),
       path.resolve(process.env.RUNNER_CREDENTIAL_ROOT!),
+      path.resolve(process.env.XDG_DATA_HOME!),
     ], workspace);
     if (probe.code !== 0) {
       throw new Error(`Codex exact-root sandbox probe failed: ${probe.output.slice(-500)}`);
+    }
+
+    // The OpenCode sandbox (own bubblewrap profile, private procfs): the CLI
+    // must start, the credential broker must be reachable over shared
+    // loopback, and neither the key file nor any executor process environment
+    // may be visible from inside.
+    const opencodeEnv = Object.entries(openCodeSandboxEnv(workspace))
+      .map(([name, value]) => `${name}=${JSON.stringify(value)}`)
+      .join(' ');
+    const opencodeLaunch = confinedCommand('sh', [
+      '-c',
+      [
+        // Same XDG/HOME redirection the adapter applies: the real data root is
+        // hidden by the sandbox, so OpenCode must not even try to create it.
+        `env ${opencodeEnv} OPENCODE_DISABLE_AUTOUPDATE=1 opencode --version >/dev/null`,
+        'test ! -r "$1/opencode/auth.json"',
+        'test ! -e "$2"',
+        '! grep -qs EXECUTOR_API_KEY /proc/[0-9]*/environ',
+        `curl -fsS -o /dev/null --noproxy '*' --connect-timeout 3 --max-time 5 http://127.0.0.1:${brokerPort}/healthz`,
+      ].join(' && '),
+      'opencode-sandbox-probe',
+      path.resolve(process.env.XDG_DATA_HOME!),
+      path.resolve(process.env.CODEX_HOME!, 'auth.json'),
+    ], workspace);
+    const opencodeProbe = await exec(opencodeLaunch.command, opencodeLaunch.args, workspace);
+    if (opencodeProbe.code !== 0) {
+      throw new Error(`OpenCode sandbox probe failed: ${opencodeProbe.output.slice(-500)}`);
     }
   } finally {
     await rm(workspace, { recursive: true, force: true });
@@ -205,6 +244,6 @@ export async function initializeRunnerIsolation(): Promise<RunnerIsolationReport
   return {
     required: true,
     ready: true,
-    codeRuntimes: { 'claude-code': true, codex: true, opencode: false },
+    codeRuntimes: { 'claude-code': true, codex: true, opencode: true },
   };
 }

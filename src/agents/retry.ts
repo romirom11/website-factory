@@ -8,12 +8,14 @@
  * Contract:
  *  - `RateLimitedError` is NOT an attempt: it propagates immediately, the job
  *    goes to `retry_wait`, and the retry budget is untouched (SPEC §2.3б);
+ *  - an error already marked NEEDS_HUMAN (a rejected credential) propagates
+ *    as-is: another attempt with the same key cannot succeed;
  *  - anything else is retried with linear backoff, then raised as
  *    `AgentSchemaError` (code NEEDS_HUMAN — SPEC §7: a schema failure never
  *    spins in a retry loop at the queue level).
  */
 import { log } from '../lib/logger.js';
-import { AgentSchemaError, isRateLimitedError, type AgentRuntimeId } from './types.js';
+import { AgentSchemaError, isNeedsHumanError, isRateLimitedError, type AgentRuntimeId } from './types.js';
 
 export async function withStructuredRetries<T>(args: {
   name: string;
@@ -28,7 +30,7 @@ export async function withStructuredRetries<T>(args: {
     try {
       return await args.attempt(attempt);
     } catch (err) {
-      if (isRateLimitedError(err)) throw err;
+      if (isRateLimitedError(err) || isNeedsHumanError(err)) throw err;
       lastErr = err;
       log.warn('agent attempt failed', {
         name: args.name, attempt, runtime: args.runtime,

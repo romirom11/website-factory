@@ -21,6 +21,7 @@ import {
   type ExecutionRequest,
   type ExecutionResponse,
   type RunnerError,
+  type AccountControlRequest,
 } from './protocol.js';
 import { executionPaths, runnerRoots } from './workspace.js';
 import { executeCodeAgentLocally, getRuntimeById } from '../agents/runtime.js';
@@ -37,6 +38,9 @@ import {
   disconnect,
   startSession,
   submitCode,
+  connectOpenCode,
+  disconnectOpenCode,
+  openCodeAccountStatus,
 } from '../api/accounts.js';
 import { runLocalAgentCheck } from '../api/checks.js';
 import {
@@ -46,10 +50,8 @@ import {
   seedRunnerClaudeCredential,
 } from './credentials.js';
 import { cancelTmuxSession, liveTerminal } from '../agents/tmuxRuntime.js';
-import {
-  assertCodeRuntimeConfined,
-  runConstrainedPackageCommand,
-} from '../agents/confinement.js';
+import { runConstrainedPackageCommand } from '../agents/confinement.js';
+import { startRunnerProviderBroker } from './providerBroker.js';
 import {
   initializeRunnerIsolation,
   runnerIsolationLive,
@@ -137,7 +139,6 @@ async function executeInWorkerGroup(request: ExecutionRequest): Promise<Executio
   const onUsage = (value: AgentUsage): void => { usage = value; };
 
   try {
-    if (request.operation === 'code') assertCodeRuntimeConfined(request.runtime);
     if (request.claudeCredential) await seedRunnerClaudeCredential(request.claudeCredential);
     // Codex/OpenCode login files may have changed since executor startup. Load
     // their latest values before any CLI output can reach logs.
@@ -254,6 +255,17 @@ async function executeOnce(request: ExecutionRequest): Promise<ExecutionResponse
   return promise;
 }
 
+/** OpenCode has no CLI session: status lists providers, connect/disconnect edit auth.json. */
+async function openCodeAccountControl(request: AccountControlRequest): Promise<Record<string, unknown>> {
+  if (request.operation === 'status') return { ok: true, session: null, ...(await openCodeAccountStatus()) };
+  if (request.operation === 'connect') {
+    if (!request.providerId || !request.secret) throw new Error('connect needs providerId and secret');
+    return { ok: true, session: await connectOpenCode(request.providerId, request.secret) };
+  }
+  if (request.operation === 'disconnect') return await disconnectOpenCode(request.providerId ?? '');
+  throw new Error(`operation ${request.operation} is not an OpenCode account operation`);
+}
+
 /**
  * `startExecutor()` runs the real isolation probe before serving. Tests that
  * mount the app in-process pass their own report; without one the app stays
@@ -336,6 +348,12 @@ export function createExecutorApp(overrides: { isolationReport?: RunnerIsolation
     if (guarded) return guarded;
     try {
       const request = AccountControlRequestSchema.parse(await parseRunnerJson(c));
+      if (request.provider === 'opencode') {
+        return c.json({ version: RUNNER_PROTOCOL_VERSION, ok: true, data: await openCodeAccountControl(request) });
+      }
+      if (request.operation === 'connect') {
+        throw new Error(`${request.provider} connects through its CLI login session, not a stored key`);
+      }
       if (request.operation === 'start') {
         return c.json({ version: RUNNER_PROTOCOL_VERSION, ok: true, data: { ok: true, session: startSession(request.provider) } });
       }
@@ -392,6 +410,10 @@ function randomRequestId(c: Context): string {
 
 export async function startExecutor(): Promise<void> {
   await loadRunnerCredentials();
+  // Loopback credential broker for sandboxed OpenCode runs; the isolation
+  // probe below checks it is reachable from inside the sandbox.
+  const broker = await startRunnerProviderBroker();
+  console.log(JSON.stringify({ level: 'info', msg: 'opencode credential broker listening', port: broker.port }));
   isolationReport = await initializeRunnerIsolation();
   const roots = runnerRoots();
   const port = Number(process.env.RUNNER_EXECUTOR_PORT ?? 8791);

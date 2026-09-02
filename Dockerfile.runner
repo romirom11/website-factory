@@ -16,8 +16,11 @@ COPY . .
 RUN pnpm build
 
 # A single static binary supplies dependency-free TCP/HTTP health probes for
-# the otherwise minimal proxy and DNS images.
+# the otherwise minimal proxy and DNS images. The distroless CoreDNS image has
+# no shell utilities at all, so the applets the egress render script needs are
+# exposed as symlinks to that binary (resolved at /busybox in the final image).
 FROM busybox:1.37.0-musl AS health-tools
+RUN mkdir -p /bb && for applet in sh awk cat cut dirname grep sed sort tr; do ln -s /busybox "/bb/$applet"; done
 
 FROM debian:bookworm-slim AS egress-proxy
 RUN apt-get update \
@@ -26,20 +29,29 @@ RUN apt-get update \
     && mkdir -p /var/spool/squid /var/log/squid \
     && chown -R proxy:proxy /var/spool/squid /var/log/squid
 COPY infra/agent-proxy/squid.conf /etc/squid/squid.conf
+COPY --chmod=0555 infra/agent-proxy/start-proxy.sh /usr/local/bin/start-egress-proxy
+# The allowlist is rendered at container start from the shared egress registry
+# (OPENCODE_PROVIDERS is a runtime fact); render it once here so the config
+# parses at build time too.
+COPY --chmod=0555 infra/agent-egress /etc/agent-egress
 COPY --from=health-tools /bin/busybox /busybox
-RUN squid -z -f /etc/squid/squid.conf \
-    && squid -k parse -f /etc/squid/squid.conf
+RUN /etc/agent-egress/render.sh squid /tmp/allowed-domains.acl \
+    && squid -z -f /etc/squid/squid.conf \
+    && squid -k parse -f /etc/squid/squid.conf \
+    && rm -f /tmp/allowed-domains.acl
 USER proxy
 EXPOSE 3128
-CMD ["squid", "-N", "-f", "/etc/squid/squid.conf", "-d", "1"]
+CMD ["start-egress-proxy"]
 
 FROM coredns/coredns:1.12.4 AS egress-dns
-COPY infra/agent-dns/Corefile /Corefile.true
+COPY infra/agent-dns/Corefile.template /Corefile.template
 COPY infra/agent-dns/Corefile.unprotected /Corefile.false
+COPY --chmod=0555 infra/agent-dns/start-dns.sh /start-dns.sh
+COPY --chmod=0555 infra/agent-egress /etc/agent-egress
 COPY --from=health-tools /bin/busybox /busybox
+COPY --from=health-tools /bb /bb
 EXPOSE 53/udp 53/tcp 8080 8181
-ENTRYPOINT ["/coredns"]
-CMD ["-conf", "/Corefile.true"]
+ENTRYPOINT ["/busybox", "sh", "/start-dns.sh"]
 
 FROM runner-build AS gateway
 RUN mkdir -p /app/sites /app/agent-inputs /app/runner-work \

@@ -27,9 +27,10 @@ import { verifyApiKey, verifyHmac } from '../outreach/wahaWebhook.js';
 import { effectiveConfig, isCheckKind, runCheck } from './checks.js';
 import { cacheCheckResult, collectChecks, invalidateCheck } from './checkCache.js';
 import {
-  activeSession, cancelSession, disconnect, isAccountProvider,
-  startSession, submitCode, telegramChats,
+  activeSession, cancelSession, connectOpenCode, disconnect, isAccountProvider,
+  isCliAccountProvider, openCodeAccountStatus, startSession, submitCode, telegramChats,
 } from './accounts.js';
+import type { AccountOperation, AccountProviderInput } from '../agents/transport.js';
 import { reloadSettings } from '../lib/settingsStore.js';
 import { writeSetting } from '../lib/settingsStore.js';
 import { usesRemoteAgentTransport } from '../agents/transport.js';
@@ -167,12 +168,13 @@ export async function startApi(): Promise<void> {
   // credentials, so they are strictly more sensitive than a read.
 
   async function remoteAccount(
-    operation: 'start' | 'status' | 'submit-code' | 'cancel' | 'disconnect',
-    provider: 'claude' | 'codex',
+    operation: AccountOperation,
+    provider: 'claude' | 'codex' | 'opencode',
     code?: string,
+    input?: AccountProviderInput,
   ) {
     try {
-      return await remoteAgentTransport.account(operation, provider, code);
+      return await remoteAgentTransport.account(operation, provider, code, input);
     } catch (error) {
       log.warn('remote account control failed', { operation, provider, error });
       return {
@@ -185,9 +187,27 @@ export async function startApi(): Promise<void> {
   /** Begin a flow. Returns the first snapshot; the UI then polls /status. */
   app.post('/internal/accounts/:provider/start', internalAuth, async (c) => {
     const p = c.req.param('provider');
-    if (!isAccountProvider(p)) return c.json({ ok: false, message: `невідомий провайдер: ${p}` }, 400);
+    if (!isCliAccountProvider(p)) {
+      return c.json({ ok: false, message: `${p}: немає інтерактивного логіну — OpenCode підключається ключем провайдера` }, 400);
+    }
     if (usesRemoteAgentTransport()) return c.json(await remoteAccount('start', p));
     return c.json({ ok: true, session: startSession(p) });
+  });
+
+  /**
+   * OpenCode: store one provider's API key (auth.json in the runtime owner's
+   * volume) and prove it with a real call. The key never comes back.
+   */
+  app.post('/internal/accounts/opencode/connect', internalAuth, async (c) => {
+    const body = await c.req.json().catch(() => null) as { providerId?: string; key?: string } | null;
+    const providerId = String(body?.providerId ?? '').trim();
+    const key = String(body?.key ?? '').trim();
+    if (!providerId || !key) return c.json({ ok: false, message: 'Потрібні провайдер і ключ.' }, 400);
+    const res = usesRemoteAgentTransport()
+      ? await remoteAccount('connect', 'opencode', undefined, { providerId, secret: key })
+      : { ok: true, session: await connectOpenCode(providerId, key) };
+    await invalidateCheck('opencode');
+    return c.json(res);
   });
 
   /**
@@ -199,13 +219,14 @@ export async function startApi(): Promise<void> {
     const p = c.req.param('provider');
     if (!isAccountProvider(p)) return c.json({ ok: false, message: `невідомий провайдер: ${p}` }, 400);
     if (usesRemoteAgentTransport()) return c.json(await remoteAccount('status', p));
+    if (p === 'opencode') return c.json({ ok: true, session: null, ...(await openCodeAccountStatus()) });
     return c.json({ ok: true, session: activeSession(p) });
   });
 
   /** Claude only: pipe the pasted code into the waiting CLI prompt. */
   app.post('/internal/accounts/:provider/submit-code', internalAuth, async (c) => {
     const p = c.req.param('provider');
-    if (!isAccountProvider(p)) return c.json({ ok: false, message: `невідомий провайдер: ${p}` }, 400);
+    if (!isCliAccountProvider(p)) return c.json({ ok: false, message: `невідомий провайдер: ${p}` }, 400);
     const body = await c.req.json().catch(() => null) as { code?: string } | null;
     if (usesRemoteAgentTransport()) {
       return c.json(await remoteAccount('submit-code', p, String(body?.code ?? '')));
@@ -215,7 +236,7 @@ export async function startApi(): Promise<void> {
 
   app.post('/internal/accounts/:provider/cancel', internalAuth, async (c) => {
     const p = c.req.param('provider');
-    if (!isAccountProvider(p)) return c.json({ ok: false, message: `невідомий провайдер: ${p}` }, 400);
+    if (!isCliAccountProvider(p)) return c.json({ ok: false, message: `невідомий провайдер: ${p}` }, 400);
     if (usesRemoteAgentTransport()) return c.json(await remoteAccount('cancel', p));
     return c.json({ ok: true, session: cancelSession(p) });
   });
@@ -224,9 +245,13 @@ export async function startApi(): Promise<void> {
   app.post('/internal/accounts/:provider/disconnect', internalAuth, async (c) => {
     const p = c.req.param('provider');
     if (!isAccountProvider(p)) return c.json({ ok: false, message: `невідомий провайдер: ${p}` }, 400);
+    // OpenCode holds one key per provider; the body names which one goes.
+    const body = await c.req.json().catch(() => null) as { providerId?: string } | null;
+    const providerId = p === 'opencode' ? String(body?.providerId ?? '').trim() : undefined;
+    if (p === 'opencode' && !providerId) return c.json({ ok: false, message: 'Не вказано провайдера OpenCode.' }, 400);
     const res = usesRemoteAgentTransport()
-      ? await remoteAccount('disconnect', p)
-      : await disconnect(p);
+      ? await remoteAccount('disconnect', p, undefined, providerId ? { providerId } : undefined)
+      : await disconnect(p, providerId);
     if (usesRemoteAgentTransport() && p === 'claude' && res.ok) {
       await writeSetting('CLAUDE_CODE_OAUTH_TOKEN', '', 'runner-disconnect').catch(() => undefined);
       await reloadSettings().catch(() => undefined);

@@ -37,6 +37,7 @@ import {
   type AgentCheckOutcome,
   type AgentExecutionTransport,
   type RemoteTerminalInfo,
+  type AccountProviderInput,
 } from './transport.js';
 
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -244,9 +245,10 @@ export const remoteAgentTransport: AgentExecutionTransport = {
     return response.data.data as AgentCheckOutcome;
   },
 
-  async account(operation, provider: AgentAccountProvider, code?: string): Promise<AccountControlOutcome> {
+  async account(operation, provider: AgentAccountProvider, code?: string, input?: AccountProviderInput): Promise<AccountControlOutcome> {
     const body = AccountControlRequestSchema.parse({
       version: RUNNER_PROTOCOL_VERSION, operation, provider, code,
+      providerId: input?.providerId, secret: input?.secret,
     });
     const raw = await post('/v1/accounts', body, 30_000);
     const response = ControlResponseSchema.safeParse(raw);

@@ -490,7 +490,7 @@ export async function runCodeAgentTmux<T>(
     // beats the option.
     args.push(';', 'set-option', '-w', '-t', session, 'remain-on-exit', 'on');
 
-    const env = codeAgentEnv(runtime.authEnv(), opts.cwd);
+    const env = { ...codeAgentEnv(runtime.authEnv(), opts.cwd), ...(launch.env ?? {}) };
     const started = await exec('tmux', args, { env, timeoutMs: 30_000 });
     if (started.code !== 0) {
       throw new Error(

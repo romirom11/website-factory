@@ -294,6 +294,10 @@ services:
       NEXT_TELEMETRY_DISABLED: "1"
       RUNNER_REQUIRE_ISOLATION: "true"
       RUNNER_DNS_PROTECTION_ENABLED: ${RUNNER_DNS_PROTECTION_ENABLED:-true}
+      # Same value the egress containers render their allowlists from: the
+      # executor validates it at start, exposes the provider list to the
+      # accounts UI and lets its credential broker forward only to these.
+      OPENCODE_PROVIDERS: ${OPENCODE_PROVIDERS:-}
       # Claude's first-run/trust state must be writable but ephemeral. Provider
       # credentials live only in their dedicated named volumes below.
       HOME: /home/node/runtime-home
@@ -340,6 +344,13 @@ services:
       - no-new-privileges:true
       - seccomp=unconfined
       - apparmor=wf-runner-executor
+      # OpenCode (a Bun binary) needs /proc/self, so the Codex sandbox it runs
+      # in must mount a private procfs. The kernel refuses a nested procfs
+      # mount while Docker's masked/read-only /proc and /sys entries are in
+      # place; lifting them here is safe because the container is non-root
+      # with every capability dropped and the AppArmor profile above keeps
+      # docker-default's /proc and /sys write denials.
+      - systempaths=unconfined
     pids_limit: 512
     mem_limit: ${RUNNER_MEMORY_LIMIT:-6g}
     init: true
@@ -361,6 +372,11 @@ services:
       dockerfile: Dockerfile.runner
       target: egress-proxy
     restart: unless-stopped
+    environment:
+      # Which OpenCode providers may be reached (ids from
+      # infra/agent-egress/opencode-providers.tsv). Rendered into the Squid
+      # ACL and CoreDNS zones at container start; change = `docker compose up -d`.
+      OPENCODE_PROVIDERS: ${OPENCODE_PROVIDERS:-}
     networks:
       - runner-egress-v2
       - default
@@ -386,12 +402,17 @@ services:
       context: .
       dockerfile: Dockerfile.runner
       target: egress-dns
-    command: ["-conf", "/Corefile.${RUNNER_DNS_PROTECTION_ENABLED:-true}"]
     restart: unless-stopped
+    environment:
+      RUNNER_DNS_PROTECTION_ENABLED: ${RUNNER_DNS_PROTECTION_ENABLED:-true}
+      OPENCODE_PROVIDERS: ${OPENCODE_PROVIDERS:-}
     networks:
       runner-egress-v2: {}
       default: {}
     read_only: true
+    # The zone list is rendered here at start from the shared egress registry.
+    tmpfs:
+      - /tmp:size=4m,mode=1777
     cap_drop: ["ALL"]
     # CoreDNS runs non-root but its binary carries CAP_NET_BIND_SERVICE so it
     # can bind the standard resolver port. Keeping only that capability avoids

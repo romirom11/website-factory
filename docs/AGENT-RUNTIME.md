@@ -8,7 +8,7 @@
 |---|---|---|
 | `claude-code` (default) | підписка Claude Pro/Max Романа | UI запускає `claude setup-token` у runner; токен у runner credential volume |
 | `codex` | підписка ChatGPT | UI запускає `codex login`; credential у runner `$CODEX_HOME` |
-| `opencode` | підписка провайдера, залогіненого в opencode (Kimi, Zen, …) | `docker compose exec agent-runner-executor opencode auth login`; у production дозволений лише tool-free `structured()` |
+| `opencode` | підписка провайдера з каталогу models.dev (GLM Coding Plan, Kimi, Zen, …) | форма «провайдер + ключ» в «Акаунтах» пише `auth.json` у runner volume `opencodehome`; провайдер має бути в `OPENCODE_PROVIDERS` |
 
 Усі реалізують `AgentRuntime` (`src/agents/types.ts`):
 
@@ -44,6 +44,9 @@ import { runCodeAgent } from '../agents/codeAgent.js';   // workspace
 | `src/agents/retry.ts` | спільний retry-цикл `structured()` (rate-limit не витрачає спробу, фінал — `NEEDS_HUMAN`) |
 | `src/agents/schema.ts` | zod → JSON Schema, стійкий парсер JSON з відповіді |
 | `src/agents/semaphore.ts` | обмеження конкурентності агентних викликів |
+| `src/agents/confinement.ts` | production confinement: Codex exact-root profiles, `confinedCommand()` (той самий `codex sandbox`) для рантаймів без власної пісочниці, Claude tool-sandbox allowlist з egress-реєстру |
+| `src/runner/egressRegistry.ts` | єдине джерело egress-доменів (`infra/agent-egress/`): каталог провайдерів OpenCode + inherent domains; читають Squid/CoreDNS (через `render.sh`), Claude sandbox, broker і UI |
+| `src/runner/providerBroker.ts` | loopback credential broker executor-а: підміняє placeholder на ключ з `auth.json` і форвардить на API base провайдера через egress-проксі |
 
 ### Як додати новий harness (чекліст)
 
@@ -56,7 +59,12 @@ import { runCodeAgent } from '../agents/codeAgent.js';   // workspace
    `normalizeRuntime` (`src/config.ts`).
 4. Якщо CLI має інтерактивний логін — додай флоу в `src/api/accounts.ts`
    (PTY через `script -q`, як у claude; plain spawn, як у codex) і картку в
-   `ui/components/ConnectedAccounts.tsx`.
+   `ui/components/ConnectedAccounts.tsx`. Якщо credential — це файл з ключем
+   (як `auth.json` OpenCode), пиши його напряму з `src/runner/credentials.ts`
+   через форму в картці, а не жени TUI.
+5. Якщо CLI не має власної OS-пісочниці — запускай його через
+   `confinedCommand()` (Codex exact-root sandbox) і не давай йому ключа:
+   маршрутизуй провайдера через `src/runner/providerBroker.ts`.
 
 Більше ніщо не гілкується за id рантайму: tmux-транспорт, черга, перевірки й
 консоль ідуть через capability-методи інтерфейсу (`terminalLaunch`,
@@ -68,7 +76,7 @@ import { runCodeAgent } from '../agents/codeAgent.js';   // workspace
 
 **Codex:** `codex exec --output-schema <file> --output-last-message <file> --ephemeral`; у production CLI отримує runner-owned exact-root profile `factory-read-only`, у локальній розробці — legacy `--sandbox read-only`. JSON береться з останнього повідомлення агента і валідується тією ж zod-схемою.
 
-**OpenCode:** `opencode run --format json` без нативного schema-прапора — контракт JSON вкладається в промпт (`jsonOnlyInstruction`), відповідь — останній `text`-івент, парситься тим самим `extractJson`. Помилки стріму класифікуються в `errorFromEvents`: statusCode 401/402/429 чи "payment required" → `RateLimitedError` (пауза), інше → звичайна помилка.
+**OpenCode:** `opencode run --format json` без нативного schema-прапора — контракт JSON вкладається в промпт (`jsonOnlyInstruction`), відповідь — останній `text`-івент, парситься тим самим `extractJson`. Помилки стріму класифікуються в `errorFromEvents`: statusCode 402/429 чи "payment required" → `RateLimitedError` (пауза); 401/403 → `AgentAuthError` (`NEEDS_HUMAN` з підказкою перепідключити провайдера в «Акаунтах», без retry); інше → звичайна помилка.
 
 **Мультимодальність (visual QA):** скриншоти пишуться у тимчасову теку, агенту дозволяється лише `Read` і передаються шляхи до файлів — картинки читає він сам. Жодних base64-payload'ів в API.
 
@@ -146,11 +154,11 @@ Builder працює без ручних permission prompt-ів (він муси
 
 **3. Native tool sandbox.** Claude SDK отримує `sandbox.enabled=true`, `failIfUnavailable=true`, exact workspace read/write, deny для всього runner root, auth і `/proc`, credentials deny та strict network allowlist. Codex використовує runner-owned profiles у `$CODEX_HOME/config.toml`: весь `/app/runner-work` прихований, назад відкривається тільки поточний workspace; package store повертається лише tool/package profiles. `TMPDIR` теж лежить усередині workspace. Якщо native sandbox не стартує, readiness executor-а падає і gateway/factory не запускаються.
 
-**4. Docker/мережевий периметр.** Executor не підключений до звичайної Compose-мережі й не має default gateway. Він бачить тільки дві `internal: true` мережі: gateway-control та runner-egress. Startup, live health і спільний guard усіх authenticated control requests читають kernel route tables та fail-closed відхиляють будь-який IPv4/IPv6 default route, зокрема мережу, яку deployment platform додала після конвертації compose. Public DNS проходить через CoreDNS, який за замовчуванням forward-ить лише provider/package zones; HTTP(S) — через Squid, який дозволяє тільки затверджені provider/package domains і відсікає private/link-local/direct-IP/довільний CONNECT. `RUNNER_DNS_PROTECTION_ENABLED=false` є явним operator escape hatch для unrestricted public DNS, але не відкриває внутрішні service names, HTTP allowlist або прямий network route. `node fetch`, Python urllib без proxy, raw sockets, Postgres/MinIO/factory/host і Docker socket недоступні. Root FS read-only, capabilities скинуті, `no-new-privileges`, PID/memory limits; auth — у nested named-volume overlays, яких gateway не монтує. Executor окремо вимикає Docker `seccomp` profile і працює під власним AppArmor-профілем `wf-runner-executor` (`deploy/apparmor/`; у ядро хоста його завантажує privileged сервіс `agent-runner-apparmor` з того ж compose, executor чекає на його healthcheck): це docker-default плюс `userns`/`mount`/`pivot_root`, без яких вкладений bubblewrap не стартує. `apparmor=unconfined` не підходить — на Ubuntu 24.04 (`kernel.apparmor_restrict_unprivileged_userns=1`) unconfined-процес при створенні userns переводиться в профіль `unprivileged_userns` без capabilities, і bwrap падає на `setting up uid map: Permission denied`. Нічого з цього не додає `privileged` чи `SYS_ADMIN`, а решта контейнерів лишається під стандартними host profiles.
+**4. Docker/мережевий периметр.** Executor не підключений до звичайної Compose-мережі й не має default gateway. Він бачить тільки дві `internal: true` мережі: gateway-control та runner-egress. Startup, live health і спільний guard усіх authenticated control requests читають kernel route tables та fail-closed відхиляють будь-який IPv4/IPv6 default route, зокрема мережу, яку deployment platform додала після конвертації compose. Public DNS проходить через CoreDNS, який за замовчуванням forward-ить лише provider/package zones; HTTP(S) — через Squid, який дозволяє тільки затверджені provider/package domains і відсікає private/link-local/direct-IP/довільний CONNECT. Обидва allowlist-и рендеряться при старті контейнерів з одного реєстру `infra/agent-egress/` (`runtime-domains.txt` + `opencode-providers.tsv`, відфільтрований `OPENCODE_PROVIDERS`), той самий реєстр читає `src/runner/egressRegistry.ts` для Claude tool-sandbox і broker-а — жодних дубльованих списків доменів. `RUNNER_DNS_PROTECTION_ENABLED=false` є явним operator escape hatch для unrestricted public DNS, але не відкриває внутрішні service names, HTTP allowlist або прямий network route. `node fetch`, Python urllib без proxy, raw sockets, Postgres/MinIO/factory/host і Docker socket недоступні. Root FS read-only, capabilities скинуті, `no-new-privileges`, PID/memory limits; auth — у nested named-volume overlays, яких gateway не монтує. Executor окремо вимикає Docker `seccomp` profile і працює під власним AppArmor-профілем `wf-runner-executor` (`deploy/apparmor/`; у ядро хоста його завантажує privileged сервіс `agent-runner-apparmor` з того ж compose, executor чекає на його healthcheck): це docker-default плюс `userns`/`mount`/`pivot_root`, без яких вкладений bubblewrap не стартує. `apparmor=unconfined` не підходить — на Ubuntu 24.04 (`kernel.apparmor_restrict_unprivileged_userns=1`) unconfined-процес при створенні userns переводиться в профіль `unprivileged_userns` без capabilities, і bwrap падає на `setting up uid map: Permission denied`. Нічого з цього не додає `privileged` чи `SYS_ADMIN`, а решта контейнерів лишається під стандартними host profiles.
 
 **5. Output gate.** Значення credentials завантажуються тільки в coordinator memory, рекурсивно маскуються у structured logs/build-log і перед sync шукаються в output як точні byte sequences. Збіг або symlink/special file → `SECURITY_VIOLATION`; gateway у такому випадку не синхронізує жоден output назад у factory storage.
 
-OpenCode 1.18 має permission rules, але не має enforceable OS sandbox для tool subprocesses. Тому production gate свідомо дозволяє його tool-free `structured()`, але відхиляє `codeAgent()` до запуску. Для builder/QA-fix треба обрати Claude Code або Codex. Це fail-closed compatibility rule, а не тимчасовий fallback.
+OpenCode 1.18 має permission rules, але не має enforceable OS sandbox для tool subprocesses. Тому в production весь процес `opencode` (і `structured()`, і `codeAgent()`, і TUI у tmux) запускається через `confinedCommand()` — `codex sandbox -P factory-tools -C <workspace> -- opencode …`, тобто в тому самому bubblewrap-профілі, що застосовується до tool-процесів Codex і перевіряється startup-пробою: система read-only, весь `/app/runner-work` (а з ним і справжній `auth.json`) прихований, назад rw відкриваються лише поточний workspace і pnpm store, приватні PID/IPC/UTS namespaces, спільна мережа (loopback до broker-а, egress лише через проксі). Одна умова на рівні хоста: Bun-рантайм OpenCode без `/proc/self` падає на старті, а вкладений procfs ядро не дає змонтувати, поки діють masked paths Docker-а. Тому executor у compose має `systempaths=unconfined` (безпечно: non-root, усі capabilities скинуті, AppArmor-профіль зберігає docker-default deny на запис у `/proc`/`/sys`); з ним `codex sandbox` монтує приватний `/proc`, і startup-проба перевіряє, що з пісочниці не видно ні `auth.json`, ні env жодного процесу executor-а (`grep EXECUTOR_API_KEY /proc/*/environ` порожній). XDG-теки OpenCode переносяться у `<workspace>/.factory-tmp/opencode-xdg`. Ключ до моделі доходить через **credential broker** executor-а (`src/runner/providerBroker.ts`, loopback `127.0.0.1:8792`): згенерований `OPENCODE_CONFIG` містить `provider.<id>.options.{baseURL: http://127.0.0.1:8792/<id>, apiKey: placeholder}` для кожного підключеного провайдера, broker підміняє placeholder на ключ з `auth.json` (у тому заголовку, який обрав SDK: `Authorization` чи `x-api-key`) і форвардить на API base з каталогу через Squid. Пісочниця може лише витрачати підписку підключеного провайдера — не прочитати ключ і не дістатись іншого хоста. Перевірено на 1.18.23 (порожній XDG + такий конфіг → запит на broker з placeholder-ключем; всередині runner-а → реальний 401 від api.z.ai на bogus-ключ) і в `test:runner-isolation`.
 
 > **Другий транспорт того самого гарда.** Коли збірка йде в tmux (`BUILDER_MODE=tmux`, див. `docs/BUILD-PIPELINE.md`), агент — це інтерактивний CLI, а CLI вміє тільки *командний* хук, не JS-замикання. Тому `src/agents/guardHook.ts` загортає ту саму `evaluateToolCall()` у процес «payload зі stdin → рішення в stdout» і вмикається через `--settings`. Рішуча функція одна на два шляхи; різниця тільки в транспорті, і `pnpm test:tmux-agent` звіряє їх на однакових входах, щоб tmux-шлях не став мовчки нергардженим. Хук fail-closed так само: нечитабельний payload, відсутній аргумент воркспейсу чи виняток — усе deny.
 >
@@ -224,10 +232,12 @@ pnpm tsx scripts/test-agent-salvage.ts     # рятування результа
 pnpm tsx scripts/test-agent-sandbox.ts     # env-allowlist + guard (33 офлайн); --live = реальна атака
 pnpm tsx scripts/verify-agent-runtime.ts   # реальні виклики по підписці
 AGENT_RUNTIME=codex pnpm tsx scripts/verify-agent-runtime.ts
-AGENT_RUNTIME=opencode AGENT_MODEL=opencode/x-preview-f-free pnpm tsx scripts/verify-agent-runtime.ts
+AGENT_RUNTIME=opencode AGENT_MODEL=zai-coding-plan/glm-4.7 pnpm tsx scripts/verify-agent-runtime.ts
+pnpm test:provider-broker               # credential broker офлайн: підміна ключа, стрім, відмови
 pnpm tsx scripts/test-tmux-agent.ts --live-opencode  # реальна tmux-сесія opencode TUI
 pnpm test:agent-runner                 # protocol + gateway/executor + sync, без підписок
-pnpm test:runner-isolation              # реальний Compose: egress/DNS/raw sockets/auth/workspaces/readiness
+pnpm test:runner-isolation              # реальний Compose: egress/DNS/raw sockets/auth/workspaces/readiness + OpenCode connect→run→NEEDS_HUMAN
+pnpm egress:catalog                     # оновити infra/agent-egress/opencode-providers.tsv з models.dev
 ```
 
 ## Групи воркерів і capacity через runner (оновлено 2026-08-28)

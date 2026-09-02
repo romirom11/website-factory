@@ -216,6 +216,12 @@ export interface TerminalLaunchSpec {
    * kickoff line; without a pattern it falls back to Claude's.
    */
   kickoffReadyPattern?: string;
+  /**
+   * Extra environment for the launched CLI beyond the sandbox allowlist and
+   * `authEnv()` — per-workspace paths a runtime needs in the terminal path
+   * (OpenCode: its generated config and XDG dirs inside the workspace).
+   */
+  env?: Record<string, string>;
 }
 
 /** What `prepareTerminal` receives: call options plus where its settings file goes. */
@@ -314,6 +320,24 @@ export class AgentSchemaError extends Error {
     super(message);
     this.name = 'AgentSchemaError';
   }
+}
+
+/**
+ * The provider rejected the credential (401/403): a key was revoked, expired or
+ * never connected. Retrying cannot help and a subscription window is not the
+ * cause, so this is NEEDS_HUMAN with a reconnect hint — not RATE_LIMITED.
+ */
+export class AgentAuthError extends Error {
+  readonly code = 'NEEDS_HUMAN';
+  constructor(message: string) {
+    super(message);
+    this.name = 'AgentAuthError';
+  }
+}
+
+/** Errors that should leave a retry loop immediately and reach a human. */
+export function isNeedsHumanError(error: unknown): boolean {
+  return (error as { code?: string } | null)?.code === 'NEEDS_HUMAN';
 }
 
 /**

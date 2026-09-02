@@ -157,14 +157,24 @@ export interface SuccessfulExecutionResponse {
   usage?: AgentUsage;
 }
 
-export type AgentAccountProvider = 'claude' | 'codex';
+export type AgentAccountProvider = 'claude' | 'codex' | 'opencode';
 export type AgentCheckProvider = 'claude' | 'codex' | 'opencode';
+
+/** OpenCode provider ids are catalog keys (models.dev), e.g. `zai-coding-plan`. */
+export const OpenCodeProviderIdSchema = z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/);
 
 export const AccountControlRequestSchema = z.object({
   version: z.literal(RUNNER_PROTOCOL_VERSION),
-  operation: z.enum(['start', 'status', 'submit-code', 'cancel', 'disconnect']),
-  provider: z.enum(['claude', 'codex']),
+  /**
+   * start/submit-code/cancel drive the interactive Claude/Codex CLIs;
+   * connect stores an OpenCode provider key (providerId + secret);
+   * disconnect removes a credential (OpenCode: the one provider named).
+   */
+  operation: z.enum(['start', 'status', 'submit-code', 'cancel', 'connect', 'disconnect']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
   code: z.string().max(10_000).optional(),
+  providerId: OpenCodeProviderIdSchema.optional(),
+  secret: z.string().min(1).max(4_000).optional(),
 });
 export type AccountControlRequest = z.infer<typeof AccountControlRequestSchema>;
 

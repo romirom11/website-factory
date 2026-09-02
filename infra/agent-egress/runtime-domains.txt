@@ -1,0 +1,17 @@
+# Egress destinations that are inherent to the runner, independent of which
+# OpenCode providers an operator enables. One `<group> <domain>` per line;
+# each domain also covers its subdomains. Read by infra/agent-egress/render.sh
+# (Squid ACL + CoreDNS zones) and src/runner/egressRegistry.ts (Claude tool
+# sandbox network allowlist uses the `package` group only).
+#
+# provider = subscription CLIs bundled in the executor image (Claude Code,
+#            Codex). OpenCode providers are NOT listed here: they come from
+#            opencode-providers.tsv filtered by OPENCODE_PROVIDERS.
+# package  = registries the staged website workspace installs from.
+provider anthropic.com
+provider claude.ai
+provider openai.com
+provider chatgpt.com
+provider oaiusercontent.com
+package npmjs.org
+package yarnpkg.com

@@ -1,7 +1,10 @@
 # External DNS is limited to the same provider/package zones as the proxy.
+# The zone list below is rendered at container start by
+# infra/agent-egress/render.sh from the shared egress registry
+# (runtime-domains.txt + OPENCODE_PROVIDERS).
 # Docker's embedded resolver still answers service names on the executor's own
 # internal networks, then forwards public queries here.
-anthropic.com:53 claude.ai:53 openai.com:53 chatgpt.com:53 oaiusercontent.com:53 opencode.ai:53 openrouter.ai:53 kimi.com:53 moonshot.ai:53 moonshot.cn:53 npmjs.org:53 yarnpkg.com:53 {
+__ZONES__ {
     errors
     cache 300
     forward . /etc/resolv.conf {

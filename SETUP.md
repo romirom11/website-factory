@@ -120,6 +120,7 @@ Deployment** (Compose → Advanced; деталі: `docs/PRODUCTION-ROLLOUT.md`),
 | `miniodata` | raw evidence, скриншоти, QA-звіти | докази під фактами |
 | `wahasessions` | сесія WhatsApp | новий QR-скан |
 | `codexhome` | логін Codex CLI | новий `codex login` |
+| `opencodehome` | ключі провайдерів OpenCode (`auth.json`) | заново вставити ключі в «Акаунтах» |
 | `.env` (файл, не volume) | `SETTINGS_MASTER_KEY` | **усі збережені секрети стають нечитабельними** — доведеться ввести заново в `/settings` |
 | томи `deploysdata`, `sitesdata` | задеплоєні демо і воркспейси збірок | демо (перебудовуються); глянути з хоста: `docker compose cp factory:/app/deploys ./` |
 
@@ -193,9 +194,12 @@ docker compose exec agent-runner-executor node -e "console.log(require('crypto')
 > з бічним меню) з кнопкою **Підключити** в кожному рядку. Термінал більше не
 > потрібен для Claude або Codex: UI просить runner executor запустити
 > `claude setup-token` / `codex login`, показує посилання (і код, де він
-> потрібен) та зберігає credential у його окремому volume. OpenCode поки має
-> власний інтерактивний TUI, тому логіниться командою
-> `docker compose exec agent-runner-executor opencode auth login`.
+> потрібен) та зберігає credential у його окремому volume. OpenCode
+> підключається в тому ж розділі формою «провайдер + API-ключ» (GLM Coding
+> Plan, Kimi, Zen…); ключ лягає в `auth.json` runner volume і одразу
+> перевіряється реальним викликом. Які провайдери пропускає egress runner-а,
+> задає `OPENCODE_PROVIDERS` у `.env` compose (id з
+> `infra/agent-egress/opencode-providers.tsv`, напр. `zai-coding-plan`).
 >
 > Коротка версія всього кроку (г): **відкрий `/settings` → «Акаунти», клікни
 > рядок і натисни «Підключити».** Розгорнуті пояснення нижче — на випадок,
@@ -247,11 +251,13 @@ mount/network/capability topology та fail-closed readiness. Після себ�
 видаляє тільки власні test volumes/networks.
 
 Allowlist не розширюється лише в одному місці. Для нового provider/package
-domain онови `infra/agent-proxy/squid.conf`, `infra/agent-dns/Corefile` і, якщо
-домен потрібен tool subprocess Claude, `APPROVED_TOOL_DOMAINS` у
-`src/agents/confinement.ts`; потім перебудуй образи й обов'язково повтори тест.
-OpenCode дозволений у production лише для tool-free structured stages; для
-builder/QA-fix обери Claude Code або Codex.
+domain онови єдиний реєстр `infra/agent-egress/` (`runtime-domains.txt` для
+inherent-доменів; провайдери OpenCode беруться з `opencode-providers.tsv`,
+який оновлює `pnpm egress:catalog`, і вмикаються через `OPENCODE_PROVIDERS`);
+Squid, CoreDNS, Claude tool-sandbox і broker читають саме його. Потім
+`docker compose up -d` (allowlist рендериться при старті) й обов'язково повтори
+тест. OpenCode у production повноцінний: збірки йдуть усередині Codex-пісочниці,
+ключ провайдера в неї не потрапляє (credential broker executor-а).
 
 ### 1. Claude Code по підписці (без цього агентні етапи не працюють)
 

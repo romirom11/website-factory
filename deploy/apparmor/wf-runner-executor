@@ -1,0 +1,55 @@
+# AppArmor profile for the websites-factory agent-runner-executor container.
+#
+# Docker's docker-default profile denies every mount() call and, on Ubuntu 24.04
+# (kernel.apparmor_restrict_unprivileged_userns=1), an *unconfined* process that
+# creates a user namespace is transitioned into the capability-less
+# `unprivileged_userns` profile. Both break the nested bubblewrap sandbox that
+# Codex/Claude Code use inside the executor. This profile is docker-default with
+# user namespaces, mounts and pivot_root allowed. The container still runs with
+# cap_drop ALL, no-new-privileges and a read-only root, so these mount
+# permissions are only usable inside a bubblewrap user namespace.
+#
+# Install: sudo scripts/install-runner-apparmor.sh
+abi <abi/4.0>,
+#include <tunables/global>
+
+profile wf-runner-executor flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  network,
+  capability,
+  file,
+  umount,
+  mount,
+  remount,
+  pivot_root,
+  userns,
+
+  # Host (privileged) processes may send signals to container processes.
+  signal (receive) peer=unconfined,
+  # runc/crun may send signals to container processes (for "docker stop").
+  signal (receive) peer=runc,
+  signal (receive) peer=crun,
+  # Container processes may send signals amongst themselves.
+  signal (send,receive) peer=wf-runner-executor,
+
+  deny @{PROC}/* w,   # deny write for all files directly in /proc (not in a subdir)
+  # deny write to files not in /proc/<number>/** or /proc/sys/**
+  deny @{PROC}/{[^1-9],[^1-9][^0-9],[^1-9s][^0-9y][^0-9s],[^1-9][^0-9][^0-9][^0-9/]*}/** w,
+  deny @{PROC}/sys/[^k]** w,  # deny /proc/sys except /proc/sys/k* (effectively /proc/sys/kernel)
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,  # deny everything except shm* in /proc/sys/kernel/
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  # suppress ptrace denials when using 'docker ps' or using 'ps' inside a container
+  ptrace (trace,read,tracedby,readby) peer=wf-runner-executor,
+}

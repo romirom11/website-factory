@@ -256,6 +256,25 @@ async function executeOnce(request: ExecutionRequest): Promise<ExecutionResponse
 
 export function createExecutorApp(): Hono {
   const app = new Hono();
+  const guardRequest = async (c: Context, requestId?: string): Promise<Response | undefined> => {
+    if (!runnerCredentialAuthorized(c.req.header('x-executor-key') ?? '', process.env.EXECUTOR_API_KEY ?? '')) {
+      return c.json({
+        version: RUNNER_PROTOCOL_VERSION,
+        ...(requestId ? { requestId } : {}),
+        ok: false,
+        error: { code: 'UNAUTHORIZED', message: 'invalid executor credential' },
+      }, 401);
+    }
+    if (!await runnerIsolationLive(isolationReport)) {
+      return c.json({
+        version: RUNNER_PROTOCOL_VERSION,
+        ...(requestId ? { requestId } : {}),
+        ok: false,
+        error: { code: 'RUNNER_UNAVAILABLE', message: 'runner isolation boundary is unavailable' },
+      }, 503);
+    }
+    return undefined;
+  };
   app.get('/health', async (c) => {
     const live = await runnerIsolationLive(isolationReport);
     return c.json({
@@ -266,14 +285,9 @@ export function createExecutorApp(): Hono {
     }, live ? 200 : 503);
   });
   app.post('/v1/executions', async (c) => {
-    if (!runnerCredentialAuthorized(c.req.header('x-executor-key') ?? '', process.env.EXECUTOR_API_KEY ?? '')) {
-      return c.json({
-        version: RUNNER_PROTOCOL_VERSION,
-        requestId: randomRequestId(c),
-        ok: false,
-        error: { code: 'UNAUTHORIZED', message: 'invalid executor credential' },
-      }, 401);
-    }
+    const requestId = randomRequestId(c);
+    const guarded = await guardRequest(c, requestId);
+    if (guarded) return guarded;
     try {
       const parsed = ExecutionRequestSchema.safeParse(await parseRunnerJson(c));
       if (!parsed.success) {
@@ -295,13 +309,8 @@ export function createExecutorApp(): Hono {
     }
   });
   app.post('/v1/checks', async (c) => {
-    if (!runnerCredentialAuthorized(c.req.header('x-executor-key') ?? '', process.env.EXECUTOR_API_KEY ?? '')) {
-      return c.json({
-        version: RUNNER_PROTOCOL_VERSION,
-        ok: false,
-        error: { code: 'UNAUTHORIZED', message: 'invalid executor credential' },
-      }, 401);
-    }
+    const guarded = await guardRequest(c);
+    if (guarded) return guarded;
     try {
       const request = AgentCheckRequestSchema.parse(await parseRunnerJson(c));
       if (request.claudeCredential) await seedRunnerClaudeCredential(request.claudeCredential);
@@ -317,13 +326,8 @@ export function createExecutorApp(): Hono {
     }
   });
   app.post('/v1/accounts', async (c) => {
-    if (!runnerCredentialAuthorized(c.req.header('x-executor-key') ?? '', process.env.EXECUTOR_API_KEY ?? '')) {
-      return c.json({
-        version: RUNNER_PROTOCOL_VERSION,
-        ok: false,
-        error: { code: 'UNAUTHORIZED', message: 'invalid executor credential' },
-      }, 401);
-    }
+    const guarded = await guardRequest(c);
+    if (guarded) return guarded;
     try {
       const request = AccountControlRequestSchema.parse(await parseRunnerJson(c));
       if (request.operation === 'start') {
@@ -353,13 +357,8 @@ export function createExecutorApp(): Hono {
     }
   });
   app.post('/v1/terminals', async (c) => {
-    if (!runnerCredentialAuthorized(c.req.header('x-executor-key') ?? '', process.env.EXECUTOR_API_KEY ?? '')) {
-      return c.json({
-        version: RUNNER_PROTOCOL_VERSION,
-        ok: false,
-        error: { code: 'UNAUTHORIZED', message: 'invalid executor credential' },
-      }, 401);
-    }
+    const guarded = await guardRequest(c);
+    if (guarded) return guarded;
     try {
       const request = ExecutorTerminalRequestSchema.parse(await parseRunnerJson(c));
       const marker = await liveTerminal(executionPaths(request.requestId).workspace);

@@ -225,6 +225,25 @@ services:
       timeout: 3s
       retries: 20
 
+  # Loads deploy/apparmor/wf-runner-executor into the host kernel at every
+  # deploy and after host reboots, so no operator step is needed. Privileged
+  # only because policy loading requires CAP_MAC_ADMIN plus securityfs; the
+  # image contains nothing but apparmor_parser, the profile and load.sh, and it
+  # idles after loading. No-op on hosts without AppArmor (Docker Desktop).
+  agent-runner-apparmor:
+    image: websites-factory/agent-runner-apparmor:local
+    build:
+      context: .
+      dockerfile: deploy/apparmor/Dockerfile
+    restart: unless-stopped
+    privileged: true
+    healthcheck:
+      test: ["CMD", "load-runner-apparmor", "check"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
   # Provider/runtime executor. It sees only per-invocation scratch and provider
   # auth volumes — never sitesdata, Postgres, MinIO or factory settings.
   agent-runner-executor:
@@ -235,6 +254,8 @@ services:
       target: executor
     restart: unless-stopped
     depends_on:
+      agent-runner-apparmor:
+        condition: service_healthy
       agent-egress-proxy:
         condition: service_healthy
       agent-egress-dns:
@@ -304,11 +325,21 @@ services:
       - /home/node/runtime-home:size=512m,uid=1000,gid=1000,mode=700
       - /home/node/.local/state:size=256m,uid=1000,gid=1000,mode=700
     cap_drop: ["ALL"]
-    # Nested bubblewrap needs clone/unshare syscalls. No capabilities are added;
-    # the tool sandbox itself applies filesystem/network/seccomp restrictions.
+    # Nested bubblewrap needs clone/unshare syscalls and mount propagation inside
+    # its own user namespace. Docker's default seccomp profile blocks the
+    # syscalls and docker-default AppArmor denies mount(). `apparmor=unconfined`
+    # is not an option: Ubuntu 24.04 moves unconfined userns creators into the
+    # capability-less `unprivileged_userns` profile (bwrap then fails with
+    # "setting up uid map: Permission denied"). The executor is therefore pinned
+    # to its own profile, deploy/apparmor/wf-runner-executor (docker-default plus
+    # userns/mount/pivot_root), which agent-runner-apparmor above loads into the
+    # host kernel automatically; Docker Desktop ignores it.
+    # No capabilities are added, and the tool sandbox still applies filesystem
+    # and network restrictions.
     security_opt:
       - no-new-privileges:true
       - seccomp=unconfined
+      - apparmor=wf-runner-executor
     pids_limit: 512
     mem_limit: ${RUNNER_MEMORY_LIMIT:-6g}
     init: true

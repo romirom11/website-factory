@@ -97,6 +97,17 @@ open http://<host>:3000/settings   # решта конфігурації — т�
 Міграції застосовуються **автоматично** при старті контейнерів (`db:migrate` у
 CMD обох factory-сервісів, ідемпотентно).
 
+`agent-runner-executor` працює під власним AppArmor-профілем `wf-runner-executor`
+(`deploy/apparmor/`), бо стандартний `docker-default` забороняє `mount`, а
+`unconfined` на Ubuntu 24.04 позбавляє bubblewrap capabilities. Профіль у ядро
+хоста завантажує сервіс `agent-runner-apparmor` з того ж compose (privileged
+one-shot, як apparmor-loader у Kubernetes): при кожному deploy і після
+перезавантаження хоста, без жодних дій на сервері. На хості без AppArmor він
+просто стає healthy зі «skip». На Dokploy одноразово **вимкни Isolated
+Deployment** (Compose → Advanced; деталі: `docs/PRODUCTION-ROLLOUT.md`), інакше
+платформа підключає executor до зовнішньої bridge-мережі, і він навмисно
+лишається unhealthy, бо має прямий default route в інтернет.
+
 Після першого запуску конфігурація живе в БД, тому подальші зміни (новий токен,
 інший ліміт, dry_run↔live) **не потребують ані редагування файлів на сервері,
 ані `docker compose up`** — тільки сторінку `/settings`.
@@ -546,6 +557,20 @@ remote executor; непройдена live-сесія не може бути rel
 `pnpm-workspace.yaml` (`allowBuilds: { esbuild: true }`). pnpm 11 видалив
 `onlyBuiltDependencies`; старе поле лише мовчки залишало нативний setup
 заблокованим. Workspace-файл **обовʼязково** копіюється в образ.
+
+**`agent-runner-executor` у Restarting, у логах `Codex exact-root sandbox probe
+failed: bwrap: Failed to make / slave: Permission denied` (або `setting up uid
+map: Permission denied`).** Executor стартував без профілю `wf-runner-executor`
+(наприклад, хтось прибрав `depends_on` на `agent-runner-apparmor` або запустив
+executor окремо). Перевір `docker compose logs agent-runner-apparmor`: має бути
+`ok: AppArmor profile wf-runner-executor loaded`. `apparmor=unconfined` не
+допоможе — див. `docs/PRODUCTION-ROLLOUT.md`.
+
+**`agent-runner-executor` unhealthy, `/health` → 503, у логах `executor has a
+default network route`.** Deployment-платформа (Dokploy «Isolated Deployment»)
+підключила executor до зовнішньої мережі. Вимкни цей режим у Compose → Advanced
+і перевір у Converted Compose, що executor має лише `runner-control` і
+`runner-egress-v2`.
 
 **Агентні джоби падають з `--dangerously-skip-permissions cannot be used with
 root`.** Claude Code відмовляється працювати під root. Образ тому запускається

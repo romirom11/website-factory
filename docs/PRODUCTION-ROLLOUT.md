@@ -37,6 +37,51 @@ factory або послаблення runner sandbox. Якщо canary не пр�
 
 ## Безпечна послідовність deploy
 
+### AppArmor-профіль executor-а: завантажується автоматично
+
+`agent-runner-executor` закріплений у compose за профілем `wf-runner-executor`
+(`deploy/apparmor/wf-runner-executor`: docker-default із дозволом
+`userns`/`mount`/`pivot_root` — тільки те, що потрібно вкладеному bubblewrap).
+Під `docker-default` або `unconfined` readiness падає на `bwrap: Failed to make /
+slave: Permission denied` / `setting up uid map: Permission denied`, бо Ubuntu
+24.04 переводить unconfined-процес при створенні userns у профіль
+`unprivileged_userns` без capabilities.
+
+Профіль у ядро хоста завантажує сервіс `agent-runner-apparmor` (privileged,
+образ = `apparmor_parser` + профіль + `load.sh`, після завантаження лише idle і
+перевіряє профіль раз на хвилину). Executor має `depends_on ... service_healthy`
+на нього, тому стартує тільки з уже завантаженим профілем — при кожному deploy і
+після перезавантаження хоста, без дій оператора. На хості без AppArmor loader
+стає healthy зі «skip». `kernel.apparmor_restrict_unprivileged_userns` чіпати
+не треба. Перевірка: `docker compose logs agent-runner-apparmor` →
+`ok: AppArmor profile wf-runner-executor loaded into the host kernel`.
+
+### Dokploy: вимкнути Isolated Deployment (одноразово)
+
+У Compose → Advanced вимкни deprecated **Isolated Deployment**. У цьому режимі
+Dokploy створює звичайну bridge-мережу `<appName>` (з gateway, тобто з прямим
+виходом в інтернет) і додає її до **кожного** сервісу, навіть якщо вихідний
+compose явно залишив executor лише у двох internal-мережах. Без цього режиму
+Dokploy додає `dokploy-network` лише сервісам, на які налаштовано домени (ui,
+factory, factory-build), і саме так Traefik до них дістається; executor
+залишається рівно з тими мережами, що в compose. Назви volume-ів не змінюються
+(`<appName>_pgdata` тощо — це стандартний префікс проєкту, а не Isolated
+Deployment), тож дані не втрачаються.
+
+Після наступного deploy відкрий Converted Compose та перевір, що executor має рівно:
+
+```yaml
+networks:
+  - runner-control
+  - runner-egress-v2
+```
+
+`dokploy-network`, `<app-name>-<suffix>`, `default` або інша external network у
+цьому списку є помилкою конфігурації. Executor тепер також перевіряє kernel route
+table на startup, в `/health` і перед кожним authenticated control request; за
+наявності default route він навмисно лишається unhealthy та не приймає нову
+агентну роботу з прямим виходом у мережу.
+
 ### 1. Поставити jobs на maintenance pause
 
 Не змінюй статуси jobs вручну й не видаляй pg-boss rows. Зупини обидва процеси,

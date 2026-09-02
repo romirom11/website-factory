@@ -76,11 +76,18 @@ Code, тому робота тарифікується підпискою. `ANTH
 
 **Ліміти підписки як частина дизайну:** у Pro/Max є 5-годинні вікна і тижневі стелі. Тому: (а) конкурентність агентних jobs обмежена (1-2 одночасно, конфіг); (б) вичерпане вікно = job переходить у `retry_wait` до відновлення ліміту, НЕ у failed; черга продовжує сама; (в) у UI видно, що пайплайн стоїть через ліміт підписки, а не через помилку.
 
-**Альтернативні runtimes:** Codex CLI (підписка ChatGPT) та OpenCode provider
-login реалізують той самий adapter interface. Runtime обирається глобально в
-UI для всіх agent stages. OpenCode tool-free structured path дозволений;
-tool-enabled builder у production fail-closed заборонений через відсутність
-enforceable OS sandbox у CLI.
+**Альтернативні runtimes:** Codex CLI (підписка ChatGPT) та OpenCode (підписка
+будь-якого провайдера з каталогу models.dev: GLM Coding Plan, Kimi, Zen…)
+реалізують той самий adapter interface. Runtime обирається глобально в UI для
+всіх agent stages. OpenCode не має власної OS-пісочниці, тому в production
+весь його процес запускається всередині Codex exact-root sandbox (той самий
+bubblewrap-профіль, що для tool-процесів Codex; executor має
+`systempaths=unconfined`, щоб у ньому монтувався приватний `/proc`, потрібний
+Bun), а ключ провайдера ніколи не потрапляє в пісочницю: executor тримає loopback credential broker, який
+підставляє ключ з `auth.json` і форвардить запит через egress-проксі. Ключі
+підключаються в UI (форма provider + key у «Акаунтах»); які провайдери
+пропускає egress, задає `OPENCODE_PROVIDERS` у compose (2026-09-02, замінює
+попереднє правило «OpenCode лише для tool-free structured»).
 
 ### 2.4 Дизайн і моушн: проти ШІ-слоупу
 
@@ -238,9 +245,12 @@ build success, QA-ітерації, wall time per demo, reply rate і win rate.
 8. **Пріоритет каналів outreach**: живі месенджери перед поштою. WhatsApp (авто через WAHA) → Instagram (ручна відправка з UI) → Viber (ручна відправка з UI) → email як fallback, коли месенджерів у бізнеса немає. Approval показує, який канал обраний і чому; канал можна змінити перед Approve.
 9. **Керування через веб-UI (Next.js), не через Telegram.** Telegram лишається тільки каналом сповіщень з лінками в UI. Approval-черга, редагування повідомлень, зміна каналу, ручні дії з бізнесами і кампаніями - все у веб-застосунку.
 10. **Агенти працюють по підписці, не по API.** Claude Code (Pro/Max), Codex
-CLI (ChatGPT) або tool-free OpenCode provider login живуть в ізольованому
-runner. Жодного pay-per-token білінгу; вичерпані ліміти підписки ставлять
-agent jobs на паузу, а не валять їх.
+CLI (ChatGPT) або OpenCode з ключем провайдера по підписці (GLM Coding Plan,
+Kimi тощо) живуть в ізольованому runner; OpenCode у production працює в тій
+самій пісочниці, що Codex, через credential broker executor-а (§2.3). Жодного
+pay-per-token білінгу; вичерпані ліміти підписки ставлять agent jobs на паузу,
+а не валять їх; відхилений ключ (401/403) — це NEEDS_HUMAN «перепідключи», не
+пауза.
 11. **Дизайн-стек:** готові компоненти (Aceternity + Magic UI в шаблоні) + офіційні GSAP skills + куровані референси на нішу. Кастомні дизайн-skills не пишемо. (Розділ 2.4.)
 12. **Відео: авто Ken Burns + ручний wow-кліп** (змінено 2026-08-22; було: FlowKit/Chrome-міст — видалено, бо кожен міст до Flow потребує живого Chrome поза датацентром, а на маку Роман нічого не тримає). Базово — ffmpeg Ken Burns з реального фото; wow — відео-бриф на картці бізнесу, Роман генерує і завантажує mp4, наступна збірка підхоплює. Без pay-per-use відео-API. (Розділ 2.5.)
 13. **Зображення через gen-image skill Романа** (Codex CLI, gpt-image-2, підписка ChatGPT): декор/фони/патерни/og-images з позначкою `ai_generated`; ніколи не замінюють реальні фото бізнесу. (Розділ 2.5.)

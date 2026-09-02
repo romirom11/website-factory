@@ -2,9 +2,9 @@
  * OpenCode runtime adapter — subscription harness #3.
  *
  * Auth lives in OpenCode's isolated XDG data volume (`$XDG_DATA_HOME/opencode/auth.json`,
- * managed by `opencode auth login`), so like Codex this adapter injects
- * NO credentials into agent processes (`authEnv()` is empty). Nothing
- * pay-per-token: whatever provider Roman logged in to bills its own
+ * written by the accounts UI or `opencode auth login`), so like Codex this
+ * adapter injects NO credentials into agent processes (`authEnv()` is empty).
+ * Nothing pay-per-token: whatever provider the operator connected bills its own
  * subscription; no API key is ever read or passed by the factory.
  *
  * Transport is `opencode run --format json`: NDJSON events on stdout
@@ -20,14 +20,22 @@
  *   - an "ask" WITHOUT --auto is AUTO-REJECTED (fail-closed, never hangs) and a
  *     human-readable line lands in stdout between the JSON events;
  *   - with --auto, asks are approved but explicit "deny" rules still hold.
- * So codeAgent() runs --auto under a generated deny-config in local development,
- * while structured() runs without --auto behind a config that denies every
- * tool outright — the equivalent of Claude's allowedTools: []. Production
- * rejects OpenCode codeAgent() before launch because those rules are not an OS
- * sandbox; tool-free structured calls remain enabled.
+ * So codeAgent() runs --auto under a generated deny-config, while structured()
+ * runs without --auto behind a config that denies every tool outright — the
+ * equivalent of Claude's allowedTools: [].
+ *
+ * Production confinement (RUNNER_REQUIRE_ISOLATION): OpenCode has no OS sandbox
+ * of its own, so the whole process runs inside the Codex exact-root sandbox
+ * (`confinedCommand`; the executor's `systempaths=unconfined` lets it mount the
+ * private procfs the Bun runtime needs), which hides the runner root and
+ * therefore the real auth.json. The generated config then routes every connected provider to the
+ * executor's loopback credential broker (`src/runner/providerBroker.ts`): the
+ * model gets its answers, the sandbox never sees a key. Measured against
+ * OpenCode 1.18.23: with an empty data dir and `provider.<id>.options.{baseURL,
+ * apiKey}` the CLI sends the placeholder credential to the broker URL.
  */
 import { spawn } from 'node:child_process';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { ZodType } from 'zod';
@@ -40,8 +48,11 @@ import { withStructuredRetries } from './retry.js';
 import { looksRateLimited, rateLimitedFromText } from './ratelimit.js';
 import { effectiveModel } from './modelPolicy.js';
 import { readAndValidateResult } from './result.js';
+import { confinedCommand, openCodeSandboxEnv, runnerConfinementRequired } from './confinement.js';
+import { sandboxProviderConfig } from '../runner/providerBroker.js';
 import { appendBuildLog, clip, type BuildLogEvent } from '../build/buildLog.js';
 import {
+  AgentAuthError,
   RateLimitedError,
   RUNTIME_LABELS,
   type AgentRuntime,
@@ -50,13 +61,20 @@ import {
   type CodeAgentOptions,
   type StructuredOptions,
   type TerminalLaunchSpec,
+  type TerminalPrepareOptions,
 } from './types.js';
 
 const DEFAULT_STRUCTURED_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_CODE_TIMEOUT_MS = 60 * 60_000;
 
+/** Where the per-run config lands: inside the workspace's scratch dir, which is
+ * the one tree a sandboxed run can read and which never ships with the site. */
+const GUARD_FILE = path.join('.factory-tmp', 'opencode-guard.json');
+
 /** Subscription/credit walls seen in the wild, beyond the shared text signatures. */
-const OPENCODE_LIMIT_STATUS = new Set([401, 402, 429]);
+const OPENCODE_LIMIT_STATUS = new Set([402, 429]);
+/** A rejected credential: reconnecting is the only fix, retrying is not. */
+const OPENCODE_AUTH_STATUS = new Set([401, 403]);
 const OPENCODE_LIMIT_TEXT = [/payment required/i, /membership benefits/i, /insufficient credits?/i];
 
 function opencodeLooksLimited(text: string): boolean {
@@ -119,17 +137,23 @@ export function usageFromEvents(events: OpencodeEvent[]): Pick<AgentUsage, 'numT
 /**
  * Classify a finished run's events. Returns RateLimitedError when the
  * subscription window / membership is exhausted (job pauses, SPEC §2.3б),
- * a plain Error for any other terminal error event, null when clean.
+ * AgentAuthError when the provider rejected the credential (NEEDS_HUMAN:
+ * reconnect in «Акаунти»), a plain Error for any other terminal error event,
+ * null when clean.
  */
 export function errorFromEvents(events: OpencodeEvent[]): Error | null {
   const err = events.find((e) => e.type === 'error')?.error;
   if (!err) return null;
   const message = String(err.data?.message ?? err.name ?? 'unknown error');
+  const status = err.data?.statusCode;
   const blob = `${message} ${JSON.stringify(err.data ?? {})}`;
-  if (
-    (err.data?.statusCode !== undefined && OPENCODE_LIMIT_STATUS.has(err.data.statusCode)) ||
-    opencodeLooksLimited(blob)
-  ) {
+  if (status !== undefined && OPENCODE_AUTH_STATUS.has(status)) {
+    return new AgentAuthError(
+      `OpenCode provider rejected the credential (${status}): ${clip(message, 200)}. ` +
+      'Reconnect the provider in Налаштування → Акаунти → OpenCode.',
+    );
+  }
+  if ((status !== undefined && OPENCODE_LIMIT_STATUS.has(status)) || opencodeLooksLimited(blob)) {
     return rateLimitedFromText('opencode', blob.slice(-300));
   }
   return new Error(`opencode run failed: ${clip(message, 300)}`);
@@ -204,7 +228,7 @@ function shortPath(p: string): string {
 /**
  * Deny-rules that hold even under `--auto` (explicit denies always win).
  * Mirrors the intent of the Claude PreToolUse guard's most important lines;
- * the real boundary stays the container, this is the second belt.
+ * the real boundary is the sandbox, this is the second belt.
  *
  * Rules are pattern-based, LAST match wins — so the `.env.example` allow must
  * come after the `.env` deny. webfetch is denied outright for the same measured
@@ -215,6 +239,7 @@ export function openCodeGuardConfig(): Record<string, unknown> {
   const sensitiveReads = [
     '**/.ssh/**', '**/.aws/**', '**/.gnupg/**', '**/.kube/**', '**/.docker/**',
     '**/.claude/**', '**/.codex/**', '**/.config/opencode/**', '**/provider-auth/opencode/**',
+    '**/.factory-tmp/opencode-guard.json',
     '**/.netrc', '**/.npmrc', '**/.pgpass',
   ];
   return {
@@ -257,6 +282,35 @@ function structuredLockConfig(): Record<string, unknown> {
   };
 }
 
+/**
+ * The config a run receives: the permission set plus, under confinement, the
+ * broker routes for every connected provider. Outside production OpenCode
+ * reads its own auth.json and no `provider` block is needed.
+ */
+async function runConfig(base: Record<string, unknown>): Promise<Record<string, unknown>> {
+  if (!runnerConfinementRequired()) return base;
+  return { ...base, provider: await sandboxProviderConfig() };
+}
+
+/** Write the run config into the workspace scratch dir; returns its path. */
+async function writeGuard(cwd: string, base: Record<string, unknown>): Promise<string> {
+  const file = path.join(path.resolve(cwd), GUARD_FILE);
+  await mkdir(path.dirname(file), { recursive: true });
+  await writeFile(file, JSON.stringify(await runConfig(base), null, 2), { encoding: 'utf8', mode: 0o600 });
+  return file;
+}
+
+/** Env every OpenCode launch gets on top of the sandbox allowlist. */
+function launchEnv(cwd: string, guardPath: string): Record<string, string> {
+  return {
+    OPENCODE_CONFIG: guardPath,
+    // Not in the allowlist by name; without it a sandboxed run would try
+    // opencode.ai on start and wait for the egress proxy to refuse it.
+    OPENCODE_DISABLE_AUTOUPDATE: '1',
+    ...(runnerConfinementRequired() ? openCodeSandboxEnv(cwd) : {}),
+  };
+}
+
 // ─── Process plumbing ─────────────────────────────────────────────────────────
 
 interface ExecResult { code: number | null; stdout: string; stderr: string; timedOut: boolean }
@@ -268,11 +322,13 @@ function runOpencode(
   extraEnv: Record<string, string>,
 ): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
-    // Same allowlist as the other adapters; OpenCode reads its credentials from
-    // its own HOME, which the allowlist already carries.
-    const env = { ...codeAgentEnv(), ...extraEnv };
+    // Same allowlist as the other adapters. Under confinement the XDG
+    // overrides in extraEnv point OpenCode at workspace scratch, never at
+    // the runner's real data root.
+    const env = { ...codeAgentEnv(undefined, cwd), ...extraEnv };
+    const launch = confinedCommand(config.agents.openCodeBin, args, cwd);
 
-    const child = spawn(config.agents.openCodeBin, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(launch.command, launch.args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     let timedOut = false;
@@ -297,16 +353,9 @@ async function runAndCollect(
   guardConfig: Record<string, unknown>,
   trace?: { logPath?: string; agent?: string },
 ): Promise<RunOutcome> {
-  const scratch = await mkdtemp(path.join(tmpdir(), 'factory-opencode-'));
-  const configPath = path.join(scratch, 'guard.json');
-  await writeFile(configPath, JSON.stringify(guardConfig, null, 2), 'utf8');
+  const configPath = await writeGuard(cwd, guardConfig);
   try {
-    const res = await runOpencode(args, cwd, timeoutMs, {
-      // Per-run permissions, injected OUTSIDE the workspace: the workspace is a
-      // copy of site-template that gets deployed, so factory-internal files
-      // have no business living there.
-      OPENCODE_CONFIG: configPath,
-    });
+    const res = await runOpencode(args, cwd, timeoutMs, launchEnv(cwd, configPath));
     const events = parseOpencodeEvents(res.stdout);
     if (trace?.logPath) {
       for (const e of events) {
@@ -316,14 +365,14 @@ async function runAndCollect(
     }
     return { events, res };
   } finally {
-    await rm(scratch, { recursive: true, force: true }).catch(() => {});
+    await rm(configPath, { force: true }).catch(() => {});
   }
 }
 
 /** Throw RateLimitedError when the stream/output says the window is exhausted. */
 function assertNotRateLimited(outcome: RunOutcome, rawTail: string, label: string): void {
   const limited = errorFromEvents(outcome.events);
-  if (limited instanceof RateLimitedError) throw limited;
+  if (limited instanceof RateLimitedError || limited instanceof AgentAuthError) throw limited;
   if (outcome.res.timedOut) {
     throw new Error(`opencode call "${label}" timed out`);
   }
@@ -347,19 +396,25 @@ export const opencodeRuntime: AgentRuntime = {
     return {};
   },
 
+  /** The attachable TUI needs the same guard/broker config as a headless run. */
+  async prepareTerminal(opts: TerminalPrepareOptions): Promise<void> {
+    await writeGuard(opts.cwd, openCodeGuardConfig());
+  },
+
   terminalLaunch(opts: CodeAgentOptions, _context: { settingsPath: string }): TerminalLaunchSpec {
-    const args = [];
+    const args = ['--pure'];
     const model = opts.model ?? effectiveModel(this.id, opts.heavy, config.agents.modelInputs());
     if (model) args.push('--model', model);
-    args.unshift('--pure');
+    const launch = confinedCommand(config.agents.openCodeBin, args, opts.cwd);
     return {
-      command: config.agents.openCodeBin,
-      args,
+      command: launch.command,
+      args: launch.args,
       needsKickoff: true,
       interactive: true,
       // The TUI's footer paints "tab agents  ctrl+p commands" once the input
       // box accepts keys (captured live, CLI 1.18.x).
       kickoffReadyPattern: 'tab agents|ctrl\\+p commands',
+      env: launchEnv(opts.cwd, path.join(path.resolve(opts.cwd), GUARD_FILE)),
     };
   },
 

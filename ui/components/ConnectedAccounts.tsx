@@ -37,9 +37,9 @@ import { WahaQr } from '@/components/WahaQr';
 import { refreshCheck, runCheck, type CheckOutcome } from '@/lib/settingsActions';
 import { toastError, toastResult } from '@/lib/toast';
 import {
-  cancelAccount, disconnectAccount, findTelegramChats, pollAccount,
-  saveGmail, saveTelegramToken, startAccount, submitAccountCode, useTelegramChat,
-  type AccountSession, type TelegramChat,
+  cancelAccount, connectOpenCode, disconnectAccount, findTelegramChats, opencodeProviders as loadOpencodeProviders,
+  pollAccount, saveGmail, saveTelegramToken, startAccount, submitAccountCode, useTelegramChat,
+  type AccountSession, type OpenCodeProviderStatus, type TelegramChat,
 } from '@/lib/accountsActions';
 import { gmailVerdict, verdictOf, wahaQrAvailable, type Verdict } from '@/lib/accountVerdict';
 import type { AccountsSnapshot, AccountStatus } from '@/lib/accounts';
@@ -611,6 +611,120 @@ function TelegramFlow({ status, chatId, onCheck }: {
   );
 }
 
+// ─── OpenCode ────────────────────────────────────────────────────────────────
+
+/**
+ * Provider key form. The provider list is fetched when the row opens — it is
+ * the runner's answer (OPENCODE_PROVIDERS ∩ catalog, plus which already hold a
+ * key), not something the UI could know from the database.
+ */
+function OpenCodeFlow({ onCheck, onProviders }: {
+  onCheck: (o: CheckOutcome) => void;
+  onProviders: (p: OpenCodeProviderStatus[]) => void;
+}) {
+  const [providers, setProviders] = useState<OpenCodeProviderStatus[] | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [providerId, setProviderId] = useState('');
+  const [key, setKey] = useState('');
+  const [busy, setBusy] = useState<string | null>(null);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+
+  const load = useCallback(async () => {
+    const r = await loadOpencodeProviders();
+    setProviders(r.providers);
+    setNotice(r.message ?? null);
+    onProviders(r.providers);
+    setProviderId((cur) => cur || r.providers.find((p) => !p.connected)?.id || r.providers[0]?.id || '');
+  }, [onProviders]);
+
+  useEffect(() => { void load(); }, [load]);
+
+  async function connect() {
+    setBusy('connect');
+    onCheck({ ok: false, message: '', pending: true });
+    const s = await connectOpenCode(providerId, key);
+    const ok = s.phase === 'done';
+    setMsg({ ok, text: s.message });
+    toastResult({ ok, message: s.message }, 'Провайдера підключено');
+    if (ok) setKey('');
+    onCheck(s.check ?? { ok, message: s.message });
+    await load();
+    setBusy(null);
+  }
+
+  async function disconnect(id: string) {
+    setBusy(id);
+    const r = await disconnectAccount('opencode', id);
+    setMsg({ ok: r.ok, text: r.message });
+    toastResult(r, r.ok ? 'Ключ видалено' : 'Відключити не вдалося');
+    if (r.ok) onCheck({ ok: false, message: 'Ключ видалено — перевір, чи лишились інші провайдери.' });
+    await load();
+    setBusy(null);
+  }
+
+  const connected = providers?.filter((p) => p.connected) ?? [];
+
+  return (
+    <div className="space-y-3">
+      {notice && (
+        <div className="rounded-lg border border-dot-wait/30 bg-dot-wait/8 px-3 py-2 text-sm text-dot-wait">{notice}</div>
+      )}
+
+      {connected.length > 0 && (
+        <div className="space-y-1">
+          {connected.map((p) => (
+            <div key={p.id} className="flex items-center justify-between gap-2 rounded-lg border border-line px-3 py-2 text-sm">
+              <span className="text-ink">{p.name} <span className="text-ink-mute">· {p.id}</span></span>
+              <button
+                type="button" className="btn-quiet btn-sm text-dot-stop"
+                disabled={busy !== null} onClick={() => void disconnect(p.id)}
+              >
+                {busy === p.id ? 'Видаляю…' : 'Відключити'}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-end gap-2">
+        <label className="block">
+          <span className="label">Провайдер</span>
+          <select
+            value={providerId} onChange={(e) => setProviderId(e.target.value)}
+            disabled={!providers || providers.length === 0} className="min-w-[14rem] text-sm"
+          >
+            {(providers ?? []).map((p) => (
+              <option key={p.id} value={p.id}>{p.name}{p.connected ? ' (підключено)' : ''}</option>
+            ))}
+          </select>
+        </label>
+        <label className="block flex-1 min-w-[16rem]">
+          <span className="label">API-ключ провайдера</span>
+          <input
+            type="password" value={key} onChange={(e) => setKey(e.target.value)}
+            placeholder="ключ з кабінету провайдера" autoComplete="new-password" className="w-full font-mono text-sm"
+          />
+        </label>
+        <button
+          type="button" className={connected.length ? 'btn-outline btn-sm' : 'btn-primary btn-sm'}
+          disabled={busy !== null || !providerId || !key.trim()} onClick={() => void connect()}
+        >
+          {busy === 'connect' ? 'Перевіряю…' : 'Підключити'}
+        </button>
+      </div>
+
+      {msg && (
+        <div className={`rounded-lg border px-3 py-2 text-sm ${
+          msg.ok ? 'border-dot-go/30 bg-dot-go/8 text-dot-go' : 'border-dot-wait/30 bg-dot-wait/8 text-dot-wait'
+        }`}
+        >
+          {msg.text}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Gmail ───────────────────────────────────────────────────────────────────
 
 /** «Оновити» for Gmail: both protocols, one click, because it is one account. */
@@ -765,6 +879,13 @@ export function ConnectedAccounts({ accounts, checks, checksError }: {
     : checks.codex?.detail?.accountEmail;
   const codexEmail = typeof codexEmailValue === 'string' ? codexEmailValue : null;
 
+  // Connected OpenCode providers, shown in the collapsed row like Codex's
+  // email: the flow reports them once it has asked the runner.
+  const [opencodeProviders, setOpencodeProviders] = useState<OpenCodeProviderStatus[] | null>(null);
+  const opencodeProvidersLabel = opencodeProviders
+    ? opencodeProviders.filter((p) => p.connected).map((p) => p.name).join(', ') || null
+    : (typeof checks.opencode?.detail?.providers === 'string' ? checks.opencode.detail.providers : null);
+
   // WAHA drives the QR: the check reports `needsQr` when the session is
   // unpaired, and the QR appears right there instead of on another port.
   const wahaNeedsQr = Boolean(live.waha?.needsQr ?? checks.waha?.needsQr);
@@ -837,28 +958,41 @@ export function ConnectedAccounts({ accounts, checks, checksError }: {
         />
 
         {/*
-          OpenCode has NO browser-driven login flow here on purpose: its
-          `auth login` is an interactive TUI with per-provider steps we
-          cannot drive honestly from a button. The row is status + refresh;
-          the check's error message names the exact command when a login is
-          what is missing. If AGENT_RUNTIME=opencode, this card is the one to
-          watch — the ping goes through the same runtime the workers use.
+          OpenCode connects by provider KEY, not by a CLI login: `opencode auth
+          login` is an interactive TUI, but all it writes is one JSON object per
+          provider in auth.json, which the runtime owner writes directly from
+          this form. The provider list comes from the runner (OPENCODE_PROVIDERS
+          ∩ catalog), so a key for a provider the egress would block cannot be
+          entered here by mistake. If AGENT_RUNTIME=opencode, this card is the
+          one to watch — the check goes through the same sandboxed path the
+          workers use.
         */}
         <AccountRow
           {...row('opencode')}
           title="OpenCode"
-          blurb="Агентні етапи через провайдерів, залогінених в opencode. Модель — у Налаштуваннях → Агенти, формат provider/model."
+          identity={opencodeProvidersLabel}
+          blurb="Агентні етапи через провайдера по підписці (GLM Coding Plan, Kimi, Zen…). Модель — у Налаштуваннях → Агенти, формат provider/model."
           verdict={v('opencode', accounts.opencode)}
           checkedAt={at('opencode')}
           actions={<RefreshButton kind="opencode" onResult={set('opencode')} />}
           how={(
-            <p>
-              Підключення вручну, один раз: <code>docker compose exec agent-runner-executor opencode auth login</code> —
-              вибери провайдера і заверши вхід. Список підключень: <code>docker compose exec agent-runner-executor opencode auth list</code>.
-              Перевірка тут робить справжній виклик тією моделлю, що записана в налаштуваннях.
-            </p>
+            <>
+              <p>
+                Вибери провайдера, встав його API-ключ і натисни «Підключити»: ключ лягає в auth.json OpenCode
+                у runner volume (ніколи не в базу і не в браузер) і одразу перевіряється справжнім викликом.
+              </p>
+              <p>
+                Список провайдерів задає <code>OPENCODE_PROVIDERS</code> у <code>.env</code> compose: саме
+                для них відкриваються проксі і DNS runner-а. У збірках OpenCode працює всередині тієї ж
+                пісочниці, що Codex, а ключ до моделі доходить через broker executor-а — агент його не бачить.
+              </p>
+            </>
           )}
-        />
+        >
+          {row('opencode').open && (
+            <OpenCodeFlow onCheck={set('opencode')} onProviders={setOpencodeProviders} />
+          )}
+        </AccountRow>
 
         {/* ── Telegram ── */}
         <AccountRow

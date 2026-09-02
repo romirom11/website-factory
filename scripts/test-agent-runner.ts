@@ -83,10 +83,7 @@ const {
 const { config } = await import('../src/config.js');
 const { isRunnerUnavailableError } = await import('../src/agents/types.js');
 const { terminalPassword } = await import('../src/agents/terminalServer.js');
-const {
-  assertCodeRuntimeConfined,
-  RuntimeConfinementError,
-} = await import('../src/agents/confinement.js');
+const { confinedCommand, openCodeSandboxEnv } = await import('../src/agents/confinement.js');
 const { assertNoSecretLeaks, RunnerSecurityError } = await import('../src/runner/secretScan.js');
 const {
   redactSensitiveText,
@@ -184,14 +181,18 @@ fakeExecutor.post('/v1/checks', async (c) => {
     data: { ok: true, message: `${request.provider} checked`, detail: { model: request.model ?? null } },
   });
 });
+const accountRequests: Array<{ provider: string; operation: string; providerId?: string; secret?: string }> = [];
 fakeExecutor.post('/v1/accounts', async (c) => {
-  const request = await c.req.json() as { provider: string; operation: string };
+  const request = await c.req.json() as { provider: string; operation: string; providerId?: string; secret?: string };
+  accountRequests.push(request);
   return c.json({
     version: RUNNER_PROTOCOL_VERSION,
     ok: true,
     data: request.operation === 'disconnect'
       ? { ok: true, message: `${request.provider} disconnected` }
-      : {
+      : request.operation === 'status' && request.provider === 'opencode'
+        ? { ok: true, session: null, providers: [{ id: 'zai-coding-plan', name: 'Z.AI Coding Plan', connected: false }] }
+        : {
         ok: true,
         session: {
           provider: request.provider,
@@ -274,22 +275,23 @@ try {
     assert.equal(await readFile(destination, 'utf8'), 'first\nsecond\n');
   });
 
-  await check('production runtime gate disables unconfinable OpenCode tools', () => {
+  await check('production wraps OpenCode in the Codex exact-root sandbox with workspace-local XDG', () => {
     const previous = process.env.RUNNER_REQUIRE_ISOLATION;
     process.env.RUNNER_REQUIRE_ISOLATION = 'true';
     try {
-      assert.doesNotThrow(() => assertCodeRuntimeConfined('claude-code'));
-      assert.doesNotThrow(() => assertCodeRuntimeConfined('codex'));
-      assert.throws(
-        () => assertCodeRuntimeConfined('opencode'),
-        (error: unknown) => error instanceof RuntimeConfinementError
-          && error.code === 'NEEDS_HUMAN'
-          && /no enforceable OS sandbox/.test(error.message),
-      );
+      const launch = confinedCommand('opencode', ['run', '--pure'], '/work/ws');
+      assert.equal(launch.command, process.env.CODEX_BIN ?? 'codex');
+      assert.deepEqual(launch.args, ['sandbox', '-P', 'factory-tools', '-C', '/work/ws', '--', 'opencode', 'run', '--pure']);
+      const env = openCodeSandboxEnv('/work/ws');
+      for (const name of ['HOME', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME']) {
+        assert.ok(env[name]?.startsWith('/work/ws/.factory-tmp/opencode-xdg/'), `${name} must live in the workspace`);
+      }
     } finally {
       if (previous === undefined) delete process.env.RUNNER_REQUIRE_ISOLATION;
       else process.env.RUNNER_REQUIRE_ISOLATION = previous;
     }
+    const direct = confinedCommand('opencode', ['run'], '/work/ws');
+    assert.deepEqual(direct, { command: 'opencode', args: ['run'] });
   });
 
   await check('runner redacts nested secret values without logging them', () => {
@@ -358,7 +360,15 @@ try {
     const requestId = randomUUID();
     await mkdir(executionPaths(requestId).workspace, { recursive: true });
     try {
-      const response = await createExecutorApp().request('/v1/executions', {
+      // In-process app: stand in for the startup probe that startExecutor()
+      // runs, otherwise the readiness guard (correctly) answers 503.
+      const response = await createExecutorApp({
+        isolationReport: {
+          required: false,
+          ready: true,
+          codeRuntimes: { 'claude-code': true, codex: true, opencode: true },
+        },
+      }).request('/v1/executions', {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
@@ -636,6 +646,11 @@ try {
 
     const account = await remoteAgentTransport.account('status', 'codex');
     assert.equal(account.ok, true);
+    const opencodeStatus = await remoteAgentTransport.account('status', 'opencode');
+    assert.deepEqual(opencodeStatus.providers, [{ id: 'zai-coding-plan', name: 'Z.AI Coding Plan', connected: false }]);
+    await remoteAgentTransport.account('connect', 'opencode', undefined, { providerId: 'zai-coding-plan', secret: 'glm-test-key' });
+    const connect = accountRequests.find((r) => r.operation === 'connect');
+    assert.deepEqual(connect, { version: RUNNER_PROTOCOL_VERSION, operation: 'connect', provider: 'opencode', providerId: 'zai-coding-plan', secret: 'glm-test-key' });
     const providerCheck = await remoteAgentTransport.check('opencode');
     assert.equal(providerCheck.ok, true);
     assert.match(providerCheck.message, /opencode checked/);

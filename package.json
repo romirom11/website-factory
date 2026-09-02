@@ -44,6 +44,8 @@
     "test:tmux-agent": "tsx scripts/test-tmux-agent.ts",
     "test:agent-result-lifecycle": "tsx scripts/test-agent-result-lifecycle.ts",
     "test:agent-runner": "tsx scripts/test-agent-runner.ts",
+    "test:provider-broker": "tsx scripts/test-provider-broker.ts",
+    "egress:catalog": "tsx scripts/refresh-opencode-catalog.ts",
     "test:runner-isolation": "tsx scripts/test-runner-isolation.ts",
     "test:fixture-safety": "tsx scripts/test-fixture-safety.ts",
     "test:outreach-mode": "tsx scripts/test-outreach-mode.ts",

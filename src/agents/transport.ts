@@ -31,7 +31,13 @@ export interface AccountControlOutcome {
   ok: boolean;
   session?: unknown;
   message?: string;
+  /** OpenCode status: catalog providers enabled by OPENCODE_PROVIDERS and whether each holds a key. */
+  providers?: Array<{ id: string; name: string; connected: boolean }>;
 }
+
+export type AccountOperation = 'start' | 'status' | 'submit-code' | 'cancel' | 'connect' | 'disconnect';
+/** OpenCode-only payload: which catalog provider and (for connect) its key. */
+export interface AccountProviderInput { providerId?: string; secret?: string }
 
 export interface RemoteTerminalInfo {
   session: string;
@@ -61,9 +67,10 @@ export interface AgentExecutionTransport {
   ): Promise<T>;
   check(provider: AgentCheckProvider): Promise<AgentCheckOutcome>;
   account(
-    operation: 'start' | 'status' | 'submit-code' | 'cancel' | 'disconnect',
+    operation: AccountOperation,
     provider: AgentAccountProvider,
     code?: string,
+    input?: AccountProviderInput,
   ): Promise<AccountControlOutcome>;
   terminal(
     operation: 'status' | 'cancel',

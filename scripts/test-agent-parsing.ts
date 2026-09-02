@@ -9,8 +9,10 @@ import { looksRateLimited } from '../src/agents/ratelimit.js';
 import { effectiveModel, effectiveModels } from '../src/agents/modelPolicy.js';
 import { withAgentSlot, agentSlotStats } from '../src/agents/semaphore.js';
 import {
-  RateLimitedError, isRateLimitedError, RUNTIME_LABELS,
+  AgentAuthError, RateLimitedError, isRateLimitedError, RUNTIME_LABELS,
 } from '../src/agents/types.js';
+import { enabledOpenCodeProviderIds, openCodeCatalog, runtimeDomains } from '../src/runner/egressRegistry.js';
+import { brokerProviderConfig, OPENCODE_BROKER_PLACEHOLDER } from '../src/runner/providerBroker.js';
 // OpenCode NDJSON fixtures captured live on 2026-08-24 (CLI 1.18.x).
 import {
   parseOpencodeEvents, lastTextEvent, allText, usageFromEvents, errorFromEvents,
@@ -107,6 +109,20 @@ for (const id of ['claude-code', 'codex', 'opencode'] as const) {
     ordinary instanceof Error && !(ordinary instanceof RateLimitedError));
 
   check('opencode: clean stream yields no error', errorFromEvents(parseOpencodeEvents(pongStream)) === null);
+
+  // A rejected key is a human's problem (reconnect), never a subscription window.
+  for (const statusCode of [401, 403]) {
+    const rejected = errorFromEvents(parseOpencodeEvents(JSON.stringify({
+      type: 'error', error: { name: 'APIError', data: { message: 'Invalid Authentication', statusCode } },
+    })));
+    check(`opencode: ${statusCode} becomes NEEDS_HUMAN, not a pause`,
+      rejected instanceof AgentAuthError && rejected.code === 'NEEDS_HUMAN' && !isRateLimitedError(rejected)
+        && /Акаунти/.test(rejected.message));
+  }
+  const throttled = errorFromEvents(parseOpencodeEvents(JSON.stringify({
+    type: 'error', error: { name: 'APIError', data: { message: 'Too Many Requests', statusCode: 429 } },
+  })));
+  check('opencode: 429 still pauses the job', throttled instanceof RateLimitedError);
   check('opencode: capability detects "payment required" in free text',
     getRuntimeById('opencode').rateLimitFromText('Payment Required: quota') !== null);
 }
@@ -199,6 +215,23 @@ check('isRateLimitedError true', isRateLimitedError(rl));
 check('isRateLimitedError false for plain', !isRateLimitedError(new Error('boom')));
 check('retryAfterMs preserved', rl.retryAfterMs === 900_000);
 check('rate-limit runtime preserved', rl.runtime === 'codex');
+
+// ── egress registry + broker config (one source for proxy, DNS, sandbox, UI) ─
+{
+  const catalog = openCodeCatalog();
+  check('registry: GLM coding plan is routable', catalog.get('zai-coding-plan')?.api === 'https://api.z.ai/api/coding/paas/v4');
+  check('registry: SDK-default providers carry their base URL', catalog.get('anthropic')?.api === 'https://api.anthropic.com/v1');
+  check('registry: package domains come from runtime-domains.txt', eq(runtimeDomains('package'), ['npmjs.org', 'yarnpkg.com']));
+  check('registry: OPENCODE_PROVIDERS is parsed and validated',
+    eq(enabledOpenCodeProviderIds({ OPENCODE_PROVIDERS: 'zai-coding-plan, kimi-for-coding,zai-coding-plan' }), ['zai-coding-plan', 'kimi-for-coding']));
+  let rejected = false;
+  try { enabledOpenCodeProviderIds({ OPENCODE_PROVIDERS: 'not-a-provider' }); } catch { rejected = true; }
+  check('registry: an unknown provider id is rejected loudly', rejected);
+  const fragment = brokerProviderConfig(8792, [catalog.get('zai-coding-plan')!]);
+  check('broker config routes the provider to loopback with a placeholder key',
+    eq(fragment, { 'zai-coding-plan': { options: { baseURL: 'http://127.0.0.1:8792/zai-coding-plan', apiKey: OPENCODE_BROKER_PLACEHOLDER } } }),
+    fragment);
+}
 
 // ── semaphore (AGENT_CONCURRENCY defaults to 1) ─────────────────────────────
 const order: string[] = [];

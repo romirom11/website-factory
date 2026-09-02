@@ -1,35 +1,32 @@
 /** Production confinement shared by runtime adapters and the runner executor. */
 import { spawn } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import type { SandboxSettings } from '@anthropic-ai/claude-agent-sdk';
-import type { AgentRuntimeId } from './types.js';
 import { codeAgentEnv } from './sandbox.js';
+import { runtimeDomains } from '../runner/egressRegistry.js';
 
 export const CODEX_TOOL_PROFILE = 'factory-tools';
 export const CODEX_READ_ONLY_PROFILE = 'factory-read-only';
 export const CODEX_PACKAGE_PROFILE = 'factory-package-install';
 
-const APPROVED_TOOL_DOMAINS = [
-  'registry.npmjs.org',
-  '*.npmjs.org',
-  'registry.yarnpkg.com',
-  '*.yarnpkg.com',
-  'localhost',
-  '127.0.0.1',
-];
+/**
+ * Claude's native tool sandbox gets the package registries from the shared
+ * egress registry (the same file Squid/CoreDNS render from) plus loopback for
+ * the local preview server. Provider APIs are deliberately absent: tools talk
+ * to registries, the coordinator talks to the model.
+ */
+function approvedToolDomains(): string[] {
+  return [
+    ...runtimeDomains('package').flatMap((domain) => [domain, `*.${domain}`]),
+    'localhost',
+    '127.0.0.1',
+  ];
+}
 
 export function runnerConfinementRequired(): boolean {
   return process.env.RUNNER_REQUIRE_ISOLATION === 'true';
-}
-
-export class RuntimeConfinementError extends Error {
-  readonly code = 'NEEDS_HUMAN';
-
-  constructor(message: string) {
-    super(message);
-    this.name = 'RuntimeConfinementError';
-  }
 }
 
 function runnerWorkRoot(): string {
@@ -46,17 +43,63 @@ function codexHome(): string {
   return path.resolve(process.env.CODEX_HOME ?? path.join(runnerWorkRoot(), '.private', 'codex'));
 }
 
-function openCodeDataRoot(): string {
-  return path.resolve(process.env.XDG_DATA_HOME ?? path.join(runnerWorkRoot(), '.private', 'provider'));
+/**
+ * OpenCode's XDG data root: `<root>/opencode/auth.json` holds provider keys.
+ * The executor image pins XDG_DATA_HOME; a runner without it uses its private
+ * tree; a developer host uses the CLI's own default so the accounts flow and
+ * `opencode auth login` agree on one file.
+ */
+export function openCodeDataRoot(): string {
+  if (process.env.XDG_DATA_HOME) return path.resolve(process.env.XDG_DATA_HOME);
+  if (process.env.RUNNER_WORK_ROOT || runnerConfinementRequired()) {
+    return path.join(runnerWorkRoot(), '.private', 'provider');
+  }
+  return path.join(homedir(), '.local', 'share');
 }
 
-/** OpenCode 1.18 has permissions but no OS sandbox/run-as boundary for tools. */
-export function assertCodeRuntimeConfined(runtime: AgentRuntimeId): void {
-  if (!runnerConfinementRequired() || runtime !== 'opencode') return;
-  throw new RuntimeConfinementError(
-    'OpenCode tool-enabled execution is disabled: the pinned runtime has no enforceable OS sandbox. ' +
-    'Use Claude Code or Codex; tool-free OpenCode structured calls remain available.',
-  );
+/**
+ * OpenCode 1.18 has permission rules but no OS sandbox of its own, so in
+ * production the whole `opencode` process runs inside the Codex exact-root
+ * sandbox (`codex sandbox`): the same bubblewrap profile Codex applies to its
+ * tools and the startup probe exercises. One profile, two runtimes, no second
+ * sandbox implementation.
+ *
+ * One host prerequisite makes this possible: the Bun runtime behind `opencode`
+ * aborts without /proc/self, and a nested procfs mount is refused by the
+ * kernel while Docker's masked /proc entries are in place. The executor's
+ * compose entry therefore carries `systempaths=unconfined`; with it, the Codex
+ * sandbox mounts a private procfs (own PID namespace, no executor process
+ * visible), which the startup probe verifies. Outside production the command
+ * runs as given.
+ */
+export function confinedCommand(
+  command: string,
+  args: string[],
+  workspace: string,
+): { command: string; args: string[] } {
+  if (!runnerConfinementRequired()) return { command, args };
+  return {
+    command: process.env.CODEX_BIN ?? 'codex',
+    args: ['sandbox', '-P', CODEX_TOOL_PROFILE, '-C', path.resolve(workspace), '--', command, ...args],
+  };
+}
+
+/**
+ * Environment that keeps a sandboxed OpenCode inside its workspace: the
+ * profile hides the runner root (and with it the real auth.json), so every
+ * XDG dir points at a scratch tree under the workspace and the credential
+ * reaches the model only through the executor's broker.
+ */
+export function openCodeSandboxEnv(workspace: string): Record<string, string> {
+  const xdg = path.join(path.resolve(workspace), '.factory-tmp', 'opencode-xdg');
+  return {
+    // The sandbox root has no /home; Bun wants a writable HOME on start.
+    HOME: path.join(xdg, 'home'),
+    XDG_DATA_HOME: path.join(xdg, 'data'),
+    XDG_CONFIG_HOME: path.join(xdg, 'config'),
+    XDG_CACHE_HOME: path.join(xdg, 'cache'),
+    XDG_STATE_HOME: path.join(xdg, 'state'),
+  };
 }
 
 /** Native Claude sandbox: tools see one workspace, no auth, no parent /proc. */
@@ -71,7 +114,7 @@ export function claudeToolSandbox(workspace: string): SandboxSettings | undefine
     allowUnsandboxedCommands: false,
     enableWeakerNestedSandbox: false,
     network: {
-      allowedDomains: APPROVED_TOOL_DOMAINS,
+      allowedDomains: approvedToolDomains(),
       strictAllowlist: true,
       allowAllUnixSockets: false,
       allowLocalBinding: true,

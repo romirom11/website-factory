@@ -358,7 +358,15 @@ try {
     const requestId = randomUUID();
     await mkdir(executionPaths(requestId).workspace, { recursive: true });
     try {
-      const response = await createExecutorApp().request('/v1/executions', {
+      // In-process app: stand in for the startup probe that startExecutor()
+      // runs, otherwise the readiness guard (correctly) answers 503.
+      const response = await createExecutorApp({
+        isolationReport: {
+          required: false,
+          ready: true,
+          codeRuntimes: { 'claude-code': true, codex: true, opencode: true },
+        },
+      }).request('/v1/executions', {
         method: 'POST',
         headers: {
           'content-type': 'application/json',

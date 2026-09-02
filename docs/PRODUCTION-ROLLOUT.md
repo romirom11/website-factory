@@ -37,38 +37,38 @@ factory або послаблення runner sandbox. Якщо canary не пр�
 
 ## Безпечна послідовність deploy
 
-### Хост: AppArmor-профіль executor-а (одноразово, на кожному Linux-хості)
+### AppArmor-профіль executor-а: завантажується автоматично
 
-`agent-runner-executor` закріплений у compose за профілем `wf-runner-executor`.
-Без нього на хості з AppArmor контейнер не стартує взагалі (runc: profile not
-found), а під `docker-default` або `unconfined` стартує, але readiness падає на
-`bwrap: Failed to make / slave: Permission denied` / `setting up uid map:
-Permission denied`. Тому перед першим deploy (і після кожної зміни файлу в
-`deploy/apparmor/`) на хості:
+`agent-runner-executor` закріплений у compose за профілем `wf-runner-executor`
+(`deploy/apparmor/wf-runner-executor`: docker-default із дозволом
+`userns`/`mount`/`pivot_root` — тільки те, що потрібно вкладеному bubblewrap).
+Під `docker-default` або `unconfined` readiness падає на `bwrap: Failed to make /
+slave: Permission denied` / `setting up uid map: Permission denied`, бо Ubuntu
+24.04 переводить unconfined-процес при створенні userns у профіль
+`unprivileged_userns` без capabilities.
 
-```bash
-cd /etc/dokploy/compose/<app>/code      # або будь-який checkout репо
-sudo scripts/install-runner-apparmor.sh # idempotent; друкує "ok: ... loaded"
-```
+Профіль у ядро хоста завантажує сервіс `agent-runner-apparmor` (privileged,
+образ = `apparmor_parser` + профіль + `load.sh`, після завантаження лише idle і
+перевіряє профіль раз на хвилину). Executor має `depends_on ... service_healthy`
+на нього, тому стартує тільки з уже завантаженим профілем — при кожному deploy і
+після перезавантаження хоста, без дій оператора. На хості без AppArmor loader
+стає healthy зі «skip». `kernel.apparmor_restrict_unprivileged_userns` чіпати
+не треба. Перевірка: `docker compose logs agent-runner-apparmor` →
+`ok: AppArmor profile wf-runner-executor loaded into the host kernel`.
 
-Скрипт ставить `deploy/apparmor/wf-runner-executor` у `/etc/apparmor.d/`,
-завантажує його `apparmor_parser -r` і перевіряє, що профіль видно в
-`/sys/kernel/security/apparmor/profiles`. Це docker-default із дозволом
-`userns`/`mount`/`pivot_root` — тільки те, що потрібно вкладеному bubblewrap.
-`kernel.apparmor_restrict_unprivileged_userns` чіпати не треба.
+### Dokploy: вимкнути Isolated Deployment (одноразово)
 
-### Dokploy: не дозволяти платформі розширювати executor network
+У Compose → Advanced вимкни deprecated **Isolated Deployment**. У цьому режимі
+Dokploy створює звичайну bridge-мережу `<appName>` (з gateway, тобто з прямим
+виходом в інтернет) і додає її до **кожного** сервісу, навіть якщо вихідний
+compose явно залишив executor лише у двох internal-мережах. Без цього режиму
+Dokploy додає `dokploy-network` лише сервісам, на які налаштовано домени (ui,
+factory, factory-build), і саме так Traefik до них дістається; executor
+залишається рівно з тими мережами, що в compose. Назви volume-ів не змінюються
+(`<appName>_pgdata` тощо — це стандартний префікс проєкту, а не Isolated
+Deployment), тож дані не втрачаються.
 
-У Compose → Advanced вимкни deprecated **Isolated Deployment**. Цей режим
-Dokploy додає свою зовнішню мережу до **кожного** сервісу, навіть якщо вихідний
-compose явно залишив executor лише у двох internal-мережах.
-
-Після цього у Compose → Networks для `agent-runner-executor` увімкни
-**Detach dokploy-network** і redeploy. Gateway лишається на звичайній мережі для
-зв'язку з factory, а proxy/DNS — для контрольованого public egress. Від
-зовнішньої/default мережі від'єднується тільки executor.
-
-Перед запуском jobs відкрий Converted Compose та перевір, що executor має рівно:
+Після наступного deploy відкрий Converted Compose та перевір, що executor має рівно:
 
 ```yaml
 networks:

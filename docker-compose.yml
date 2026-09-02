@@ -225,6 +225,25 @@ services:
       timeout: 3s
       retries: 20
 
+  # Loads deploy/apparmor/wf-runner-executor into the host kernel at every
+  # deploy and after host reboots, so no operator step is needed. Privileged
+  # only because policy loading requires CAP_MAC_ADMIN plus securityfs; the
+  # image contains nothing but apparmor_parser, the profile and load.sh, and it
+  # idles after loading. No-op on hosts without AppArmor (Docker Desktop).
+  agent-runner-apparmor:
+    image: websites-factory/agent-runner-apparmor:local
+    build:
+      context: .
+      dockerfile: deploy/apparmor/Dockerfile
+    restart: unless-stopped
+    privileged: true
+    healthcheck:
+      test: ["CMD", "load-runner-apparmor", "check"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
   # Provider/runtime executor. It sees only per-invocation scratch and provider
   # auth volumes — never sitesdata, Postgres, MinIO or factory settings.
   agent-runner-executor:
@@ -235,6 +254,8 @@ services:
       target: executor
     restart: unless-stopped
     depends_on:
+      agent-runner-apparmor:
+        condition: service_healthy
       agent-egress-proxy:
         condition: service_healthy
       agent-egress-dns:
@@ -311,8 +332,8 @@ services:
     # capability-less `unprivileged_userns` profile (bwrap then fails with
     # "setting up uid map: Permission denied"). The executor is therefore pinned
     # to its own profile, deploy/apparmor/wf-runner-executor (docker-default plus
-    # userns/mount/pivot_root). Install it once per Linux host with
-    # `sudo scripts/install-runner-apparmor.sh`; Docker Desktop ignores it.
+    # userns/mount/pivot_root), which agent-runner-apparmor above loads into the
+    # host kernel automatically; Docker Desktop ignores it.
     # No capabilities are added, and the tool sandbox still applies filesystem
     # and network restrictions.
     security_opt:

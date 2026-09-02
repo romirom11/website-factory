@@ -31,6 +31,7 @@ interface ContainerInspect {
   NetworkSettings: {
     Networks: Record<string, { Gateway: string; NetworkID: string }>;
   };
+  State: { Health?: { Status: string } };
 }
 
 const project = `wf-runner-isolation-${process.pid}`;
@@ -40,6 +41,7 @@ const injectedPublicNetwork = `${project}-dokploy-injection`;
 const services = [
   'agent-egress-dns',
   'agent-egress-proxy',
+  'agent-runner-apparmor',
   'agent-runner-executor',
   'agent-runner-gateway',
 ];
@@ -255,6 +257,17 @@ try {
 
     docker(['network', 'disconnect', injectedPublicNetwork, executor]);
     await waitHealthy(executor);
+  });
+
+  await check('compose loader owns the executor AppArmor profile on AppArmor hosts', () => {
+    const loader = compose(['ps', '-q', 'agent-runner-apparmor']).stdout.trim();
+    assert.notEqual(loader, '', 'agent-runner-apparmor must be part of the runner stack');
+    assert.equal(inspect(loader).State.Health?.Status, 'healthy');
+    const status = docker([
+      'exec', loader, 'sh', '-c',
+      'if [ -d /sys/kernel/security/apparmor ]; then grep -q "^wf-runner-executor " /sys/kernel/security/apparmor/profiles && echo loaded; else echo no-apparmor; fi',
+    ]).stdout.trim();
+    assert.ok(status === 'loaded' || status === 'no-apparmor', `unexpected loader state: ${status}`);
   });
 
   await check('executor is read-only, capability-free and resource-bounded', () => {

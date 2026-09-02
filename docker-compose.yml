@@ -305,13 +305,20 @@ services:
       - /home/node/.local/state:size=256m,uid=1000,gid=1000,mode=700
     cap_drop: ["ALL"]
     # Nested bubblewrap needs clone/unshare syscalls and mount propagation inside
-    # its own user namespace. Docker's default seccomp and AppArmor profiles block
-    # those operations. Scope both overrides to the executor only; no capabilities
-    # are added, and the tool sandbox still applies filesystem/network restrictions.
+    # its own user namespace. Docker's default seccomp profile blocks the
+    # syscalls and docker-default AppArmor denies mount(). `apparmor=unconfined`
+    # is not an option: Ubuntu 24.04 moves unconfined userns creators into the
+    # capability-less `unprivileged_userns` profile (bwrap then fails with
+    # "setting up uid map: Permission denied"). The executor is therefore pinned
+    # to its own profile, deploy/apparmor/wf-runner-executor (docker-default plus
+    # userns/mount/pivot_root). Install it once per Linux host with
+    # `sudo scripts/install-runner-apparmor.sh`; Docker Desktop ignores it.
+    # No capabilities are added, and the tool sandbox still applies filesystem
+    # and network restrictions.
     security_opt:
       - no-new-privileges:true
       - seccomp=unconfined
-      - apparmor=unconfined
+      - apparmor=wf-runner-executor
     pids_limit: 512
     mem_limit: ${RUNNER_MEMORY_LIMIT:-6g}
     init: true

@@ -88,6 +88,7 @@ pnpm tsx scripts/phaseE-e2e.ts    # весь цикл send → лист → repl
 ```bash
 git clone <repo> && cd websites-factory
 cp .env.example .env        # ТІЛЬКИ інфраструктура — див. крок 0 чекліста (г)
+sudo scripts/install-runner-apparmor.sh   # одноразово на Linux-хості: AppArmor-профіль executor-а
 docker compose up -d        # greenmail не підніметься: він за профілем dev-mail
 docker compose logs -f factory
 
@@ -96,6 +97,15 @@ open http://<host>:3000/settings   # решта конфігурації — т�
 
 Міграції застосовуються **автоматично** при старті контейнерів (`db:migrate` у
 CMD обох factory-сервісів, ідемпотентно).
+
+`agent-runner-executor` працює під власним AppArmor-профілем `wf-runner-executor`
+(`deploy/apparmor/`), бо стандартний `docker-default` забороняє `mount`, а
+`unconfined` на Ubuntu 24.04 позбавляє bubblewrap capabilities. Скрипт вище
+ставить профіль ідемпотентно; на хості без AppArmor він просто виходить з
+«skip». Повторити після кожної зміни файлу профілю в репо. На Dokploy додатково
+**вимкни Isolated Deployment** і від'єднай `dokploy-network` від executor-а
+(деталі: `docs/PRODUCTION-ROLLOUT.md`), інакше executor навмисно лишається
+unhealthy, бо має прямий default route в інтернет.
 
 Після першого запуску конфігурація живе в БД, тому подальші зміни (новий токен,
 інший ліміт, dry_run↔live) **не потребують ані редагування файлів на сервері,
@@ -546,6 +556,18 @@ remote executor; непройдена live-сесія не може бути rel
 `pnpm-workspace.yaml` (`allowBuilds: { esbuild: true }`). pnpm 11 видалив
 `onlyBuiltDependencies`; старе поле лише мовчки залишало нативний setup
 заблокованим. Workspace-файл **обовʼязково** копіюється в образ.
+
+**`agent-runner-executor` у Restarting, у логах `Codex exact-root sandbox probe
+failed: bwrap: Failed to make / slave: Permission denied` (або `setting up uid
+map: Permission denied`).** На хості не завантажено AppArmor-профіль
+`wf-runner-executor`: `sudo scripts/install-runner-apparmor.sh`, потім redeploy.
+`apparmor=unconfined` не допоможе — див. `docs/PRODUCTION-ROLLOUT.md`.
+
+**`agent-runner-executor` unhealthy, `/health` → 503, у логах `executor has a
+default network route`.** Deployment-платформа (Dokploy «Isolated Deployment»)
+підключила executor до зовнішньої мережі. Від'єднай її (Compose → Networks →
+Detach dokploy-network) і перевір у Converted Compose, що executor має лише
+`runner-control` і `runner-egress-v2`.
 
 **Агентні джоби падають з `--dangerously-skip-permissions cannot be used with
 root`.** Claude Code відмовляється працювати під root. Образ тому запускається

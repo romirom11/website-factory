@@ -37,6 +37,26 @@ factory або послаблення runner sandbox. Якщо canary не пр�
 
 ## Безпечна послідовність deploy
 
+### Хост: AppArmor-профіль executor-а (одноразово, на кожному Linux-хості)
+
+`agent-runner-executor` закріплений у compose за профілем `wf-runner-executor`.
+Без нього на хості з AppArmor контейнер не стартує взагалі (runc: profile not
+found), а під `docker-default` або `unconfined` стартує, але readiness падає на
+`bwrap: Failed to make / slave: Permission denied` / `setting up uid map:
+Permission denied`. Тому перед першим deploy (і після кожної зміни файлу в
+`deploy/apparmor/`) на хості:
+
+```bash
+cd /etc/dokploy/compose/<app>/code      # або будь-який checkout репо
+sudo scripts/install-runner-apparmor.sh # idempotent; друкує "ok: ... loaded"
+```
+
+Скрипт ставить `deploy/apparmor/wf-runner-executor` у `/etc/apparmor.d/`,
+завантажує його `apparmor_parser -r` і перевіряє, що профіль видно в
+`/sys/kernel/security/apparmor/profiles`. Це docker-default із дозволом
+`userns`/`mount`/`pivot_root` — тільки те, що потрібно вкладеному bubblewrap.
+`kernel.apparmor_restrict_unprivileged_userns` чіпати не треба.
+
 ### Dokploy: не дозволяти платформі розширювати executor network
 
 У Compose → Advanced вимкни deprecated **Isolated Deployment**. Цей режим

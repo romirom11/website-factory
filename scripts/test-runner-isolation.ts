@@ -160,7 +160,7 @@ try {
     const executorConfig = config.services['agent-runner-executor'];
     assert.deepEqual(config.networks['runner-egress-v2']?.ipam, {});
     assert.deepEqual(executorConfig?.dns, ['127.0.0.53']);
-    assert.ok(executorConfig?.security_opt?.includes('apparmor=unconfined'));
+    assert.ok(executorConfig?.security_opt?.includes('apparmor=wf-runner-executor'));
     assert.equal(executorConfig?.sysctls?.['net.ipv4.ip_unprivileged_port_start'], '0');
     assert.deepEqual(config.services['agent-egress-dns']?.command, ['-conf', '/Corefile.true']);
 
@@ -264,7 +264,7 @@ try {
     assert.ok(host.CapDrop?.includes('ALL'));
     assert.ok(host.SecurityOpt?.includes('no-new-privileges:true'));
     assert.ok(host.SecurityOpt?.includes('seccomp=unconfined'));
-    assert.ok(host.SecurityOpt?.includes('apparmor=unconfined'));
+    assert.ok(host.SecurityOpt?.includes('apparmor=wf-runner-executor'));
     assert.equal(host.PidsLimit, 512);
     assert.ok(host.Memory > 0);
     assert.equal(host.Sysctls?.['net.ipv4.ip_unprivileged_port_start'], '0');

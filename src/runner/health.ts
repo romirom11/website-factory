@@ -11,7 +11,7 @@ import {
   runnerConfinementRequired,
 } from '../agents/confinement.js';
 import { codeAgentEnv } from '../agents/sandbox.js';
-import { confinedCommand, openCodeSandboxEnv } from '../agents/confinement.js';
+import { confinedCommand, sandboxScratchEnv } from '../agents/confinement.js';
 import { redactSensitiveText } from '../lib/redaction.js';
 import { enabledOpenCodeProviderIds } from './egressRegistry.js';
 import { providerBrokerPort } from './providerBroker.js';
@@ -215,7 +215,7 @@ export async function initializeRunnerIsolation(): Promise<RunnerIsolationReport
     // must start, the credential broker must be reachable over shared
     // loopback, and neither the key file nor any executor process environment
     // may be visible from inside.
-    const opencodeEnv = Object.entries(openCodeSandboxEnv(workspace))
+    const opencodeEnv = Object.entries(sandboxScratchEnv(workspace))
       .map(([name, value]) => `${name}=${JSON.stringify(value)}`)
       .join(' ');
     const opencodeLaunch = confinedCommand('sh', [

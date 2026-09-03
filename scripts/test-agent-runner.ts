@@ -83,7 +83,7 @@ const {
 const { config } = await import('../src/config.js');
 const { isRunnerUnavailableError } = await import('../src/agents/types.js');
 const { terminalPassword } = await import('../src/agents/terminalServer.js');
-const { confinedCommand, openCodeSandboxEnv } = await import('../src/agents/confinement.js');
+const { confinedCommand, sandboxScratchEnv } = await import('../src/agents/confinement.js');
 const { assertNoSecretLeaks, RunnerSecurityError } = await import('../src/runner/secretScan.js');
 const {
   redactSensitiveText,
@@ -282,9 +282,9 @@ try {
       const launch = confinedCommand('opencode', ['run', '--pure'], '/work/ws');
       assert.equal(launch.command, process.env.CODEX_BIN ?? 'codex');
       assert.deepEqual(launch.args, ['sandbox', '-P', 'factory-tools', '-C', '/work/ws', '--', 'opencode', 'run', '--pure']);
-      const env = openCodeSandboxEnv('/work/ws');
+      const env = sandboxScratchEnv('/work/ws');
       for (const name of ['HOME', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME']) {
-        assert.ok(env[name]?.startsWith('/work/ws/.factory-tmp/opencode-xdg/'), `${name} must live in the workspace`);
+        assert.ok(env[name]?.startsWith('/work/ws/.factory-tmp/sandbox-home/'), `${name} must live in the workspace`);
       }
     } finally {
       if (previous === undefined) delete process.env.RUNNER_REQUIRE_ISOLATION;

@@ -48,7 +48,7 @@ import { withStructuredRetries } from './retry.js';
 import { looksRateLimited, rateLimitedFromText } from './ratelimit.js';
 import { effectiveModel } from './modelPolicy.js';
 import { readAndValidateResult } from './result.js';
-import { confinedCommand, openCodeSandboxEnv, runnerConfinementRequired } from './confinement.js';
+import { confinedCommand, sandboxScratchEnv, runnerConfinementRequired } from './confinement.js';
 import { sandboxProviderConfig } from '../runner/providerBroker.js';
 import { appendBuildLog, clip, type BuildLogEvent } from '../build/buildLog.js';
 import {
@@ -307,7 +307,7 @@ function launchEnv(cwd: string, guardPath: string): Record<string, string> {
     // Not in the allowlist by name; without it a sandboxed run would try
     // opencode.ai on start and wait for the egress proxy to refuse it.
     OPENCODE_DISABLE_AUTOUPDATE: '1',
-    ...(runnerConfinementRequired() ? openCodeSandboxEnv(cwd) : {}),
+    ...(runnerConfinementRequired() ? sandboxScratchEnv(cwd) : {}),
   };
 }
 

@@ -10,8 +10,16 @@
 # package  = registries the staged website workspace installs from.
 provider anthropic.com
 provider claude.ai
+# Claude Code 2.1.x exchanges the OAuth code from `claude setup-token` at
+# platform.claude.com; without it the accounts flow fails with
+# "OAuth error: proxy refused the connection" (Squid TCP_DENIED, 2026-09-03).
+provider claude.com
 provider openai.com
 provider chatgpt.com
 provider oaiusercontent.com
 package npmjs.org
 package yarnpkg.com
+# OpenCode refreshes its model catalog from here on start; it falls back to
+# the bundled snapshot when refused, but the refusal costs a proxy round trip
+# on every run and shows up as noise in the egress log.
+provider models.opencode.ai

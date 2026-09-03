@@ -22,7 +22,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { isInterruptedBuild } from '@/lib/buildPolicy';
-import { humanJobStatus } from '@/lib/humanStatus';
+import { humanProjectState, humanJobStatus } from '@/lib/humanStatus';
 
 export interface BuildLogLine {
   t: string;
@@ -428,7 +428,7 @@ export function LiveBuildPanel({ businessId, projectState }: {
           {terminal?.writable
             ? 'Цей список — тільки перегляд. Термінал вище відкритий на запис.'
             : 'Тільки перегляд — звідси нічого не запускається і не зупиняється.'}
-          {projectState && ` Стан проєкту: ${projectState}.`}
+          {projectState && ` Стан збірки: ${humanProjectState(projectState).text.toLowerCase()}.`}
         </p>
       )}
     </section>

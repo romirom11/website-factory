@@ -5,10 +5,14 @@ import {
 } from './e2e/fixtures.js';
 import { pool } from '../src/db/client.js';
 import { randomUUID } from 'node:crypto';
-import { sql, sqlOne } from './e2e/harness.js';
+import { FIXTURE_PREFIX, sql, sqlOne } from './e2e/harness.js';
 import { loadInbox } from '../ui/lib/inbox.js';
 import { retryFailedJob } from '../ui/lib/buildFailureDecision.js';
 import { stopFailedBuild } from '../src/orchestrator/buildFailureDecision.js';
+import { db } from '../src/db/client.js';
+import { getBoss } from '../src/orchestrator/queue.js';
+import { WorkflowRunStore } from '../src/orchestrator/workflowRunStore.js';
+import { OperatorBusinessCommandService } from '../src/orchestrator/operatorBusinessCommandService.js';
 
 let failures = 0;
 function check(label: string, condition: boolean, detail?: unknown): void {
@@ -120,6 +124,75 @@ try {
   const untouchedOther = await sqlOne<{ state: string }>(
     `select state from site_projects where id = $1`, [otherProject.projectId]);
   check('Stop never mutates another business project', untouchedOther?.state === 'building');
+  // ── «Побудувати заново»: a fresh start from whatever a dead build left ────
+  const operator = new OperatorBusinessCommandService(new WorkflowRunStore(pool, await getBoss()), db);
+
+  // Design gate parked the business in site_in_progress with no project at all
+  // — the branch that used to have no working button.
+  const gateBiz = await createBusiness({
+    id: 'e2e-rebuild-gate', name: 'E2E Rebuild Gate', status: 'site_in_progress',
+  });
+  const gateJobId = await createFailedJob(gateBiz, 'content-and-design');
+  await sql(`update workflow_jobs set status = 'needs_human' where id = $1`, [gateJobId]);
+  const gateStart = await operator.startBuild(gateBiz.id, { fresh: true });
+  check('fresh rebuild starts from a design-gate park', gateStart.kind === 'started', gateStart);
+  const gateBusiness = await sqlOne<{ status: string }>(`select status from businesses where id = $1`, [gateBiz.id]);
+  const gateJob = await sqlOne<{ status: string; error_detail: string }>(
+    `select status, error_detail from workflow_jobs where id = $1`, [gateJobId]);
+  const gateQueued = await sqlOne<{ n: string }>(
+    `select count(*) as n from workflow_jobs where business_id = $1 and job_type = 'content-and-design' and status = 'queued'`,
+    [gateBiz.id]);
+  check('fresh rebuild recovers the business to ready-to-build', gateBusiness?.status === 'production_ready', gateBusiness?.status);
+  check('fresh rebuild closes the parked step', gateJob?.status === 'cancelled', gateJob);
+  check('fresh rebuild queues a new design step', Number(gateQueued?.n) === 1, gateQueued);
+  const gateInbox = await loadInbox();
+  check('parked step leaves the Inbox after a fresh rebuild', !gateInbox.jobs.some((j) => j.jobId === gateJobId));
+
+  // A failed project next to a failed build step: both are closed together.
+  const deadBiz = await createBusiness({
+    id: 'e2e-rebuild-dead', name: 'E2E Rebuild Dead', status: 'production_ready',
+  });
+  const deadProject = await createSiteProject(deadBiz, 'failed');
+  const deadJobId = await createFailedJob(deadBiz, 'build-site');
+  await sql(`update workflow_jobs set payload = $1::jsonb where id = $2`, [
+    JSON.stringify({ businessId: deadBiz.id, projectId: deadProject.projectId, iteration: 2 }), deadJobId,
+  ]);
+  const deadStart = await operator.startBuild(deadBiz.id, { fresh: true });
+  check('fresh rebuild starts next to a failed project', deadStart.kind === 'started', deadStart);
+  const deadJob = await sqlOne<{ status: string }>(`select status from workflow_jobs where id = $1`, [deadJobId]);
+  check('fresh rebuild closes the failed step', deadJob?.status === 'cancelled', deadJob?.status);
+
+  // A build that is genuinely running is never torn down from here.
+  const liveBiz = await createBusiness({
+    id: 'e2e-rebuild-live', name: 'E2E Rebuild Live', status: 'site_in_progress',
+  });
+  const liveProject = await createSiteProject(liveBiz, 'building');
+  await sql(
+    `insert into workflow_job_runs
+       (id, job_type, business_id, campaign_id, idempotency_key, status, current_attempt_sequence, created_at, updated_at)
+     values ($1, 'build-site', $2, $3, $4, 'running', 1, now(), now())`,
+    [randomUUID(), liveBiz.id, FIXTURE_CAMPAIGN, `${FIXTURE_PREFIX}live:${liveBiz.id}`],
+  );
+  const liveStart = await operator.startBuild(liveBiz.id, { fresh: true });
+  check('fresh rebuild refuses while a build is still running', liveStart.kind === 'state_conflict', liveStart);
+  const liveSite = await sqlOne<{ state: string }>(`select state from site_projects where id = $1`, [liveProject.projectId]);
+  check('a refused rebuild leaves the live project alone', liveSite?.state === 'building', liveSite?.state);
+
+  // ── «Не будувати» on a failed publish: the built project is closed too ────
+  const pubBiz = await createBusiness({
+    id: 'e2e-stop-publish', name: 'E2E Stop Publish', status: 'site_in_progress',
+  });
+  const pubProject = await createSiteProject(pubBiz, 'ready');
+  const pubJobId = await createFailedJob(pubBiz, 'deploy-demo');
+  await sql(`update workflow_jobs set payload = $1::jsonb where id = $2`, [
+    JSON.stringify({ businessId: pubBiz.id, projectId: pubProject.projectId }), pubJobId,
+  ]);
+  const pubStop = await stopFailedBuild(pubJobId);
+  check('stop accepts a failed publish', pubStop.ok, pubStop.message);
+  const pubSite = await sqlOne<{ state: string }>(`select state from site_projects where id = $1`, [pubProject.projectId]);
+  const pubBusiness = await sqlOne<{ status: string }>(`select status from businesses where id = $1`, [pubBiz.id]);
+  check('stopped publish closes the ready project', pubSite?.state === 'cancelled', pubSite?.state);
+  check('stopped publish returns the business to ready-to-build', pubBusiness?.status === 'production_ready', pubBusiness?.status);
 } finally {
   await destroyFixtures();
   await pool.end();

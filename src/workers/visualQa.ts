@@ -29,6 +29,7 @@ import { config } from '../config.js';
 import { runAgent } from '../agents/agent.js';
 import { createAgentInputWorkspace } from '../agents/transport.js';
 import { parkBuildForHumanReview } from '../orchestrator/buildReviewDecision.js';
+import { JobSkippedError } from '../orchestrator/jobSkipped.js';
 import { commitWorkflow, NeedsHumanError, type JobPayload } from '../orchestrator/queue.js';
 import { buildSnapshot, realPhotos, type BuildSnapshot } from '../build/snapshot.js';
 import { VisualCritiqueSchema, type QaIssue } from '../build/schemas.js';
@@ -1255,6 +1256,7 @@ export async function visualQaHandler(payload: JobPayload): Promise<void> {
     });
     if (!handedOff) {
       log.info('stale visual QA pass ignored: project already advanced', { businessId, projectId });
+      throw new JobSkippedError(`Проєкт ${projectId} уже перейшов далі — вердикт перевірки не застосовано.`);
     }
     return;
   }
@@ -1281,7 +1283,7 @@ export async function visualQaHandler(payload: JobPayload): Promise<void> {
         businessId,
         projectId,
       });
-      return;
+      throw new JobSkippedError(`Проєкт ${projectId} або бізнес уже перейшли далі — вердикт перевірки не застосовано.`);
     }
     // Decision #9: every Telegram push links into the control UI; Telegram has
     // no controls of its own.
@@ -1334,6 +1336,9 @@ export async function visualQaHandler(payload: JobPayload): Promise<void> {
     handedOff ? 'QA issues fed back to builder' : 'stale visual QA result ignored',
     { businessId, iteration: iteration + 1, issues: blocking.length },
   );
+  if (!handedOff) {
+    throw new JobSkippedError(`Проєкт ${projectId} уже змінив стан — зауваження перевірки не передані агенту.`);
+  }
 }
 
 /** Public alias for tooling; the loop above uses the local name. */

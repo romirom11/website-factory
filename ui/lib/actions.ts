@@ -432,9 +432,15 @@ export async function funnelCounts(): Promise<Array<{ campaignId: string; status
  * The state machine is untouched: `production_ready → site_in_progress` is
  * still done by the content-and-design worker, never here.
  */
-export async function startDemoBuild(businessId: string): Promise<ActionResult> {
+export async function startDemoBuild(
+  businessId: string,
+  options: { fresh?: boolean } = {},
+): Promise<ActionResult> {
+  // `fresh` = «Побудувати заново»: the factory closes the dead project and its
+  // failed/parked steps in the same transaction that starts the new build.
   const response = await factoryFetch(`/internal/businesses/${businessId}/builds`, {
     method: 'POST',
+    body: { fresh: Boolean(options.fresh) },
   });
   if (!response.ok) {
     return { ok: false, message: response.message || 'Фабрика не запустила збірку.' };

@@ -172,7 +172,7 @@ export function cardActionBar(input: CardActionInput): CardActionBar {
       waiting: null,
       actions: [{
         run: 'build',
-        label: 'Спробувати ще раз',
+        label: 'Побудувати заново',
         kind: 'primary',
         hint: build.hint,
         disabledReason: build.enabled ? undefined : build.hint,

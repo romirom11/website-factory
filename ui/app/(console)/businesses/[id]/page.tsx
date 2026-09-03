@@ -8,7 +8,7 @@ import { CardActionBar } from '@/components/CardActionBar';
 import { OtherActionsDialog } from '@/components/OtherActionsDialog';
 import { BuildReviewCard } from '@/components/BuildReviewCard';
 import { DealStageForm } from '@/components/DealStageForm';
-import { BUSINESS_STATUSES, fmtDate, truncate, safeHttpUrl, linkLabel } from '@/lib/format';
+import { BUSINESS_STATUSES, fmtDate, fmtTime, truncate, safeHttpUrl, linkLabel } from '@/lib/format';
 import {
   humanBusinessStatus, humanStatus, humanProjectState, humanReasonForHeader, humanVerdict,
   humanActor, humanReason, gapName,
@@ -19,6 +19,7 @@ import { parseAuditNotes } from '@/lib/auditNotes';
 import { FactValue } from '@/components/FactValue';
 import { factLabel, groupFacts } from '@/lib/factLabels';
 import { buildButtonState } from '@/lib/buildPolicy';
+import { demoState } from '@/lib/demoState';
 import { cardActionBar, isFactCheckAttention } from '@/lib/cardActions';
 import { FindSocialsButton } from '@/components/FindSocialsButton';
 import { HeroVideoPanel } from '@/components/HeroVideoPanel';
@@ -112,7 +113,7 @@ export default async function BusinessPage({ params }: { params: Promise<{ id: s
   const [buildJob] = await db.select().from(schema.workflowJobs)
     .where(and(
       eq(schema.workflowJobs.businessId, id),
-      inArray(schema.workflowJobs.jobType, ['content-and-design', 'build-site']),
+      inArray(schema.workflowJobs.jobType, ['content-and-design', 'build-site', 'visual-qa', 'deploy-demo']),
     ))
     .orderBy(desc(schema.workflowJobs.createdAt)).limit(1);
 
@@ -206,6 +207,33 @@ export default async function BusinessPage({ params }: { params: Promise<{ id: s
       isNull(schema.approvals.decision),
     ))
     .limit(1);
+
+  // The one sentence about the demo — the five-word vocabulary every surface
+  // shares (ui/lib/demoState.ts). Rendered in the header above the action band.
+  const demo = demoState({
+    status: biz.status,
+    project: project
+      ? {
+        state: project.state,
+        deployUrl: project.deployUrl,
+        qaIterations: project.qaIterations,
+        openIssues: (project.openIssues as string[] | null) ?? null,
+      }
+      : null,
+    job: buildJob
+      ? {
+        jobType: buildJob.jobType,
+        status: buildJob.status,
+        errorDetail: buildJob.errorDetail,
+        runningForSec: buildJob.status === 'running' && buildJob.startedAt
+          ? Math.max(0, Math.round((Date.now() - buildJob.startedAt.getTime()) / 1000))
+          : null,
+        resumesAt: buildJob.status === 'retry_wait' && buildJob.nextAttemptAt
+          ? fmtTime(buildJob.nextAttemptAt)
+          : null,
+      }
+      : null,
+  });
 
   // The one place that decides what can be done with this business right now.
   const actionBar = cardActionBar({
@@ -313,6 +341,12 @@ export default async function BusinessPage({ params }: { params: Promise<{ id: s
           <Status tone={humanProjectState(project.state).tone} title={project.state}>
             {humanProjectState(project.state).text}
           </Status>
+          {project.state === 'deployed' && biz.status === 'site_ready' && (
+            <p className="text-sm text-ink-soft mt-2">
+              Далі — підтвердити відправку: лист і канал чекають у{' '}
+              <Link href={`/inbox?business=${encodeURIComponent(biz.id)}`} className="link">Вхідних</Link>.
+            </p>
+          )}
           {project.state === 'deployed' && project.deployUrl && (
             <div className="mt-4 rounded-xl border border-line overflow-hidden bg-white">
               <iframe
@@ -387,6 +421,9 @@ export default async function BusinessPage({ params }: { params: Promise<{ id: s
       {project && (project.qaReportKey || (project.qaReportKeys as string[] | null)?.length) && (
         <Panel title="Звіти перевірки">
           <div className="flex gap-4 flex-wrap text-sm">
+            <Link href={`/settings/system?business=${encodeURIComponent(biz.id)}`} className="link">
+              Усі кроки збірки
+            </Link>
             {((project.qaReportKeys as string[] | null) ?? []).map((k, i, arr) => (
               <Link key={k} href={`/businesses/${biz.id}/qa/${i + 1}`} className="link">
                 {i === arr.length - 1 ? `Останній звіт (спроба ${i + 1})` : `Спроба ${i + 1}`}
@@ -838,6 +875,20 @@ export default async function BusinessPage({ params }: { params: Promise<{ id: s
           <Status tone={verdict.tone} title={audit?.verdict}>{verdict.text}</Status>
           {biz.score !== null && <span className="text-sm text-ink-soft">бал {biz.score}</span>}
         </div>
+
+        {/* «Демо: …» — the answer to the question this card is opened for,
+            in the shared five-word vocabulary; the band below is what to do
+            about it. A skipped or cancelled attempt never shows as progress. */}
+        <p className="mt-2 text-sm flex items-center gap-x-2 flex-wrap">
+          <span className="text-ink-mute">Демо:</span>
+          <Status tone={demo.tone} title={project?.state ?? undefined}>{demo.text}</Status>
+          {demo.detail && <span className="text-ink-soft">· {demo.detail}</span>}
+          {demo.key === 'ready' && project?.deployUrl && (
+            <a href={safeHttpUrl(project.deployUrl)} target="_blank" rel="noreferrer" className="link">
+              Відкрити демо ↗
+            </a>
+          )}
+        </p>
 
         <p className="text-sm text-ink-mute mt-1.5">
           {[biz.category, biz.address].filter(Boolean).join(' · ') || '—'}

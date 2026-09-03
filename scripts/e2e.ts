@@ -1005,7 +1005,7 @@ async function checkJobsUx(browser: import('playwright').Browser): Promise<void>
     await page.goto(`${BASE}/settings/system`, { waitUntil: 'networkidle' });
     const row = page.locator('li, tr', { hasText: jobBiz.name }).last();
     if (!(await row.count())) throw new Error(`no row for fixture "${jobBiz.name}" on Система`);
-    const btn = row.getByRole('button', { name: /Спробувати ще раз|Повторити|Ще раз/ }).first();
+    const btn = row.getByRole('button', { name: /Побудувати заново|Спробувати ще раз|Повторити|Ще раз/ }).first();
     if (!(await btn.count())) throw new Error('fixture row offers no retry control');
     await btn.click();
 
@@ -1059,10 +1059,12 @@ async function checkJobsUx(browser: import('playwright').Browser): Promise<void>
   });
   const failedBuildProject = await createSiteProject(failedBuildBiz, 'building');
   const failedBuildJob = await createFailedJob(failedBuildBiz, 'build-site');
-  await checking('failed build offers continue or stop', async () => {
+  await checking('failed build offers rebuild or stop', async () => {
     await page.goto(`${BASE}/inbox?business=${failedBuildBiz.id}`, { waitUntil: 'networkidle' });
     await assertOnlyFixture(page, failedBuildBiz.name);
-    for (const label of ['Продовжити збірку', 'Зупинити збірку']) {
+    // «Продовжити збірку» is gone on purpose: a dead attempt is rebuilt from
+    // scratch, never re-queued (plan PR A, 2026-09-03).
+    for (const label of ['Побудувати заново', 'Не будувати']) {
       if (await page.getByRole('button', { name: label }).count() !== 1) {
         throw new Error(`expected one «${label}» button`);
       }
@@ -1070,11 +1072,11 @@ async function checkJobsUx(browser: import('playwright').Browser): Promise<void>
     return 'both decisions are reachable';
   });
 
-  await checking('«Зупинити збірку» retires the failure without rejected', async () => {
+  await checking('«Не будувати» retires the failure without rejected', async () => {
     await page.goto(`${BASE}/inbox?business=${failedBuildBiz.id}`, { waitUntil: 'networkidle' });
     await assertOnlyFixture(page, failedBuildBiz.name);
     page.once('dialog', (d) => { void d.accept(); });
-    await page.getByRole('button', { name: 'Зупинити збірку' }).click();
+    await page.getByRole('button', { name: 'Не будувати' }).click();
 
     const stopped = await waitFor(async () => sqlOne<{
       business_status: string;

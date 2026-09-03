@@ -6,6 +6,7 @@ import { Status } from './Status';
 import { retryJobAction, startDemoBuild, stopFailedBuildAction } from '@/lib/actions';
 import { runWithToast } from '@/lib/toast';
 import { stageName } from '@/lib/stageNames';
+import { humanStatus } from '@/lib/humanStatus';
 import type {
   BusinessReviewItem, InterruptedBuildItem, JobProblemItem, ReplyItem,
 } from '@/lib/inbox';
@@ -38,7 +39,7 @@ import { CardActionButtons } from './CardActionBar';
 export function BusinessReviewCard({ item }: { item: BusinessReviewItem }) {
   return (
     <article className="card p-5 sm:p-6">
-      <Status tone="wait" title={item.status}>
+      <Status tone="wait" title={humanStatus(item.status).text}>
         {item.ask === 'fact_check' ? 'Факти не пройшли перевірку' : 'Фабрика чекає твого вердикту'}
       </Status>
 
@@ -170,7 +171,9 @@ export function JobProblemCard({ item }: { item: JobProblemItem }) {
           that will sit here forever looked identical to one that happened to
           be recent. */}
       <Status tone={item.status === 'failed' ? 'stop' : 'wait'} title={item.status}>
-        {item.status === 'failed' ? 'Крок упав' : 'Крок зупинився і чекає рішення'}
+        {isBuildStep
+          ? (item.status === 'failed' ? 'Демо: впало' : 'Демо: крок чекає твого рішення')
+          : (item.status === 'failed' ? 'Крок упав' : 'Крок чекає твого рішення')}
       </Status>
       {item.actionable && (
         <p className="text-sm text-dot-wait mt-1">

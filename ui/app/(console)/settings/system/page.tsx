@@ -48,11 +48,17 @@ const FILTERS = [
  */
 export default async function SystemPage({
   searchParams,
-}: { searchParams: Promise<{ status?: string; type?: string }> }) {
-  const { status, type } = await searchParams;
+}: { searchParams: Promise<{ status?: string; type?: string; business?: string }> }) {
+  const { status, type, business } = await searchParams;
 
   const runWhere: SQL[] = [];
   const legacyWhere: SQL[] = [isNull(schema.workflowJobs.runId)];
+  // One business's steps only — the link the business card offers so a
+  // build's history is one click away instead of a scroll through everyone's.
+  if (business) {
+    runWhere.push(eq(schema.workflowJobRuns.businessId, business));
+    legacyWhere.push(eq(schema.workflowJobs.businessId, business));
+  }
   if (status) {
     runWhere.push(eq(schema.workflowJobRuns.status, status));
     legacyWhere.push(eq(schema.workflowJobs.status, status));

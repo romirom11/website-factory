@@ -285,7 +285,7 @@ function RowAction({ row, pending, onBuild }: {
       title={row.build.hint}
       onClick={onBuild}
     >
-      Будувати демо
+      Побудувати демо
     </button>
   );
 }

@@ -159,7 +159,7 @@ export function BuildReviewCard({ item, showName = true, showDecision = true }: 
           {mode === 'idle' && (
             <div className="flex flex-wrap gap-2 items-center">
               <button type="button" className="btn-primary" onClick={shipIt} disabled={pending}>
-                Задеплоїти як є
+                Опублікувати як є
               </button>
               <button
                 type="button"
@@ -167,7 +167,7 @@ export function BuildReviewCard({ item, showName = true, showDecision = true }: 
                 onClick={() => setMode('iterate')}
                 disabled={pending}
               >
-                Ще ітерація
+                Ще спроба
               </button>
               <button
                 type="button"
@@ -204,7 +204,7 @@ export function BuildReviewCard({ item, showName = true, showDecision = true }: 
                   onClick={iterate}
                   disabled={pending || !note.trim()}
                 >
-                  {pending ? 'Ставлю в чергу…' : 'Запустити ітерацію'}
+                  {pending ? 'Ставлю в чергу…' : 'Запустити спробу'}
                 </button>
                 <button type="button" className="btn-quiet" onClick={() => setMode('idle')}>
                   Скасувати

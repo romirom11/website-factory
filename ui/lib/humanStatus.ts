@@ -253,7 +253,9 @@ const JOB: Record<string, HumanStatus> = {
   running: { text: 'Виконується', tone: 'go', needsRoman: false },
   succeeded: { text: 'Готово', tone: 'go', needsRoman: false },
   failed: { text: 'Помилка', tone: 'stop', needsRoman: true },
-  needs_human: { text: 'Потрібна твоя увага', tone: 'wait', needsRoman: true },
+  // Not the business word «Потрібна твоя увага»: a business asks, a step
+  // waits, and the two were indistinguishable by label on the system page.
+  needs_human: { text: 'Чекає твого рішення', tone: 'wait', needsRoman: true },
   cancelled: { text: 'Скасовано', tone: 'idle', needsRoman: false },
   // Written by the job reconciler (fix-funnel's P0-3 work): a job that was
   // `queued`/`running` when a worker died and can never finish, closed out so

@@ -28,6 +28,7 @@
     "test:toast": "tsx scripts/test-toast.ts",
     "test:inbox-policy": "tsx --tsconfig scripts/e2e/tsconfig.json scripts/test-inbox-policy.ts",
     "test:build-failure-decision": "tsx --tsconfig scripts/e2e/tsconfig.json scripts/test-build-failure-decision.ts",
+    "test:demo-state": "tsx --tsconfig scripts/e2e/tsconfig.json scripts/test-demo-state.ts",
     "test:status-transitions": "tsx scripts/test-status-transitions.ts",
     "test:discovery-resilience": "tsx scripts/test-discovery-resilience.ts",
     "test:business-transition-api": "tsx scripts/test-business-transition-command-api.ts",

@@ -478,6 +478,25 @@ try {
     assert.equal(denied.status, 0);
   });
 
+  await check('package install runs inside the package profile with workspace-local scratch dirs', () => {
+    // The real executor path (runConstrainedPackageCommand): pnpm must create
+    // its store controller and caches under the workspace, never under the
+    // hidden runner root or a missing /home.
+    const script = `
+      const fs=require('node:fs');
+      const ws=fs.mkdtempSync('/app/runner-work/pkg-install-');
+      fs.writeFileSync(ws+'/package.json', JSON.stringify({name:'pkg-probe',private:true}));
+      import('/app/dist/agents/confinement.js').then(async ({runConstrainedPackageCommand})=>{
+        const r=await runConstrainedPackageCommand(ws,['pnpm','install','--ignore-scripts'],120000);
+        const scratch=fs.existsSync(ws+'/.factory-tmp/sandbox-home');
+        fs.rmSync(ws,{recursive:true,force:true});
+        if(r.code!==0||r.timedOut){console.error(r.output.slice(-800));process.exit(101);}
+        if(!scratch){console.error('no scratch dir');process.exit(102);}
+      }).catch(e=>{console.error(String(e));process.exit(103);});
+    `;
+    docker(['exec', executor, 'node', '-e', script]);
+  });
+
   await check('sandboxed OpenCode cannot read auth.json but reaches the credential broker', () => {
     const command = String.raw`
       set -eu

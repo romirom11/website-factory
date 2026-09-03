@@ -76,22 +76,26 @@ export function confinedCommand(
   command: string,
   args: string[],
   workspace: string,
+  profile: typeof CODEX_TOOL_PROFILE | typeof CODEX_PACKAGE_PROFILE = CODEX_TOOL_PROFILE,
 ): { command: string; args: string[] } {
   if (!runnerConfinementRequired()) return { command, args };
   return {
     command: process.env.CODEX_BIN ?? 'codex',
-    args: ['sandbox', '-P', CODEX_TOOL_PROFILE, '-C', path.resolve(workspace), '--', command, ...args],
+    args: ['sandbox', '-P', profile, '-C', path.resolve(workspace), '--', command, ...args],
   };
 }
 
 /**
- * Environment that keeps a sandboxed OpenCode inside its workspace: the
- * profile hides the runner root (and with it the real auth.json), so every
- * XDG dir points at a scratch tree under the workspace and the credential
- * reaches the model only through the executor's broker.
+ * Environment that keeps any sandboxed process inside its workspace. The
+ * exact-root profile hides the runner root (the executor's XDG_DATA_HOME lives
+ * there) and has no /home at all, so HOME and every XDG dir point at a scratch
+ * tree under the workspace: pnpm's store controller, OpenCode's session DB and
+ * caches all land there, and the real credential roots are never even looked
+ * for. Measured 2026-09-03: without this, `pnpm install` inside the package
+ * profile dies with ENOENT mkdir '/app/runner-work/.private'.
  */
-export function openCodeSandboxEnv(workspace: string): Record<string, string> {
-  const xdg = path.join(path.resolve(workspace), '.factory-tmp', 'opencode-xdg');
+export function sandboxScratchEnv(workspace: string): Record<string, string> {
+  const xdg = path.join(path.resolve(workspace), '.factory-tmp', 'sandbox-home');
   return {
     // The sandbox root has no /home; Bun wants a writable HOME on start.
     HOME: path.join(xdg, 'home'),
@@ -241,16 +245,17 @@ export async function runConstrainedPackageCommand(
   allowNetwork = true,
 ): Promise<CommandResult> {
   await mkdir(path.join(cwd, '.factory-tmp'), { recursive: true });
-  const command = runnerConfinementRequired()
-    ? ['codex', [
-      'sandbox', '-P', allowNetwork ? CODEX_PACKAGE_PROFILE : CODEX_TOOL_PROFILE,
-      '-C', cwd, ...args,
-    ]] as const
-    : [args[0], args.slice(1)] as const;
+  const launch = confinedCommand(
+    args[0]!, args.slice(1), cwd, allowNetwork ? CODEX_PACKAGE_PROFILE : CODEX_TOOL_PROFILE,
+  );
+  const env = {
+    ...codeAgentEnv(undefined, cwd),
+    ...(runnerConfinementRequired() ? sandboxScratchEnv(cwd) : {}),
+  };
   return new Promise((resolve, reject) => {
-    const child = spawn(command[0], command[1], {
+    const child = spawn(launch.command, launch.args, {
       cwd,
-      env: codeAgentEnv(undefined, cwd),
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let output = '';

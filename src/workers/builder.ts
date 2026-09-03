@@ -29,6 +29,7 @@ import {
 } from '../agents/result.js';
 import { config } from '../config.js';
 import { commitWorkflow, type JobPayload } from '../orchestrator/queue.js';
+import { JobSkippedError } from '../orchestrator/jobSkipped.js';
 import { buildSnapshot } from '../build/snapshot.js';
 import { BuildResultSchema, DESIGN_CONTRACT_VERSION, type ArtDirection, type BuildResult, type ContentBrief } from '../build/schemas.js';
 import type { RubricVerdict } from '../build/rubric.js';
@@ -112,7 +113,9 @@ export async function buildSiteHandler(payload: JobPayload): Promise<void> {
       businessId,
       projectId,
     });
-    return;
+    throw new JobSkippedError(
+      `Проєкт ${projectId} уже не в збірці (скасований, впав або перейшов далі) — цю доставку пропущено. Нова збірка починається кнопкою «Побудувати заново».`,
+    );
   }
 
   let prompt: string;
@@ -178,6 +181,7 @@ last action, even if you think you are finished — the pipeline reads it as you
         'Дизайн-контракт застарілого формату — фабрика генерує дизайн заново (нова схема)',
         'site-builder',
       );
+      let regenerationQueued = false;
       await commitWorkflow(async (tx) => {
         const [closed] = await tx.update(schema.siteProjects)
           .set({ state: 'failed' })
@@ -187,6 +191,7 @@ last action, even if you think you are finished — the pipeline reads it as you
           ))
           .returning({ id: schema.siteProjects.id });
         if (!closed) return [];
+        regenerationQueued = true;
         return [{
           name: 'content-and-design',
           payload: {
@@ -196,6 +201,11 @@ last action, even if you think you are finished — the pipeline reads it as you
           },
         }];
       });
+      if (!regenerationQueued) {
+        throw new JobSkippedError(
+          `Проєкт ${projectId} змінив стан, поки закривався застарілий дизайн-контракт — регенерацію не поставлено.`,
+        );
+      }
       return;
     }
     if (project.snapshotKey) {
@@ -418,7 +428,9 @@ action. Everything else can be perfect and the run still reports badly without i
       businessId,
       projectId,
     });
-    return;
+    throw new JobSkippedError(
+      `Збірку зупинили, поки агент працював — результат проєкту ${projectId} не переданий на перевірку.`,
+    );
   }
 
   log.info('stage 10 complete', {

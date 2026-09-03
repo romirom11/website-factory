@@ -22,6 +22,7 @@ import {
   requireBusinessStatus,
 } from '../orchestrator/statuses.js';
 import { commitWorkflow, type JobPayload } from '../orchestrator/queue.js';
+import { JobSkippedError } from '../orchestrator/jobSkipped.js';
 import { collectWorkspaceGarbage, outputDir } from '../build/workspace.js';
 import { buildLogPath, logStage } from '../build/buildLog.js';
 import { ensureDemoServer } from '../lib/serveDir.js';
@@ -145,7 +146,7 @@ export async function deployHandler(payload: JobPayload): Promise<void> {
       businessId,
       status: expectedStatus,
     });
-    return;
+    throw new JobSkippedError(`Бізнес у стані «${expectedStatus}», не в збірці — публікацію демо пропущено.`);
   }
 
   const source = outputDir(project.dir);
@@ -232,7 +233,7 @@ export async function deployHandler(payload: JobPayload): Promise<void> {
   });
   if (!completed) {
     log.info('deploy result discarded: project or business already advanced', { businessId, projectId });
-    return;
+    throw new JobSkippedError(`Проєкт ${projectId} або бізнес уже перейшли далі — опубліковане демо не зафіксовано.`);
   }
 
   log.info('demo deployed', { businessId, projectId, deployUrl, health: health.detail, filesRewritten: rewritten });

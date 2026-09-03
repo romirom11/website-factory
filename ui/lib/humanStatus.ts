@@ -262,6 +262,10 @@ const JOB: Record<string, HumanStatus> = {
   // Without this entry the console printed the raw English `stale` for the 88
   // rows the reconciler closed.
   stale: { text: 'Втрачена (перезапуск)', tone: 'idle', needsRoman: false },
+  // A delivery that found its project or business already moved on (stopped,
+  // rebuilt, advanced by a sibling). Neither success nor failure: nothing
+  // happened, on purpose, and the reason column says why.
+  skipped: { text: 'Пропущено: стан змінився', tone: 'idle', needsRoman: false },
   // Not an error: the subscription window is exhausted and the queue resumes
   // by itself (SPEC §2.3b). Saying "failed" here would send Roman debugging
   // something that is working as designed.

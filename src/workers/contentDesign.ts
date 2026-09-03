@@ -53,6 +53,7 @@ import {
 } from '../lib/landingGallery.js';
 import { config } from '../config.js';
 import { log } from '../lib/logger.js';
+import { JobSkippedError } from '../orchestrator/jobSkipped.js';
 
 /**
  * Reference pack + component catalogue, in full.
@@ -811,7 +812,11 @@ export async function contentDesignHandler(payload: JobPayload): Promise<void> {
     to: 'site_in_progress',
     actor: 'content-design-worker',
   });
-  if (!canContinueAfterTransition(transitioned, { businessId, actor: 'content-design-worker' })) return;
+  if (!canContinueAfterTransition(transitioned, { businessId, actor: 'content-design-worker' })) {
+    throw new JobSkippedError(
+      `Бізнес уже не в стані «${expectedStatus}» — підготовку дизайну пропущено. Нова збірка починається кнопкою «Побудувати заново».`,
+    );
+  }
 
   const snapshot = await buildSnapshot(businessId);
   const designAttempt = (payload.designAttempt as number | undefined) ?? 1;

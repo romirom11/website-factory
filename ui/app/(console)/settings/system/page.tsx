@@ -19,6 +19,10 @@ const FILTERS = [
   // 88 rows carry this — the second-largest bucket. Without a chip the only
   // way to see what the reconciler closed was to read the whole list.
   { key: 'stale', label: 'Втрачені' },
+  // A stopped build and a skipped delivery used to vanish from every filter:
+  // the only proof they existed was a gap in the attempt numbers.
+  { key: 'cancelled', label: 'Скасовані' },
+  { key: 'skipped', label: 'Пропущені' },
 ];
 
 /**

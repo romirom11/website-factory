@@ -36,7 +36,7 @@ export async function stopFailedBuild(
   }).from(schema.workflowJobs)
     .where(eq(schema.workflowJobs.id, jobId));
   if (!job) return { ok: false, message: 'Цей крок уже не знайти.' };
-  if (!['content-and-design', 'build-site'].includes(job.jobType) || !job.businessId) {
+  if (!['content-and-design', 'build-site', 'deploy-demo'].includes(job.jobType) || !job.businessId) {
     return { ok: false, message: 'Зупинити звідси можна лише збірку демосайту.' };
   }
   if (!['failed', 'needs_human'].includes(job.status)) {
@@ -51,13 +51,15 @@ export async function stopFailedBuild(
       name: schema.businesses.name,
       status: schema.businesses.status,
     }).from(schema.businesses).where(eq(schema.businesses.id, job.businessId)),
-    hasPayloadProject || job.jobType !== 'build-site'
+    hasPayloadProject || job.jobType === 'content-and-design'
       ? Promise.resolve([] as Array<{ id: number }>)
       : database.select({ id: schema.siteProjects.id })
         .from(schema.siteProjects)
         .where(and(
           eq(schema.siteProjects.businessId, job.businessId),
-          inArray(schema.siteProjects.state, ['pending', 'brief', 'building', 'qa']),
+          // `ready` covers a deploy that failed its health check and left the
+          // built project waiting for a publish that will not come.
+          inArray(schema.siteProjects.state, ['pending', 'brief', 'building', 'qa', 'ready']),
         ))
         .orderBy(desc(schema.siteProjects.createdAt))
         .limit(1),
@@ -101,7 +103,7 @@ export async function stopFailedBuild(
         .where(and(
           eq(schema.siteProjects.id, projectId),
           eq(schema.siteProjects.businessId, business.id),
-          inArray(schema.siteProjects.state, ['pending', 'brief', 'building', 'qa', 'failed', 'cancelled']),
+          inArray(schema.siteProjects.state, ['pending', 'brief', 'building', 'qa', 'ready', 'failed', 'cancelled']),
         ));
     }
 

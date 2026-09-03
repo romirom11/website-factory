@@ -10,11 +10,27 @@ import {
 } from './statuses.js';
 import type { EnqueueResult, WorkflowRunStore } from './workflowRunStore.js';
 import { normalizeDoNotContactValue } from '../outreach/doNotContact.js';
+import { transitionCurrentRun } from './workflowLedger.js';
 
 const ACTIVE_PROJECT_STATES = [
   'pending', 'brief', 'building', 'qa', 'ready', 'needs_human_review',
 ] as const;
 const ACTIVE_RUN_STATUSES = ['queued', 'running', 'retry_wait'] as const;
+const BUILD_JOB_TYPES = ['content-and-design', 'build-site', 'visual-qa', 'deploy-demo'] as const;
+/** Business statuses a FRESH rebuild may start from: the build flow itself is
+ * included because that is where a dead build leaves its business parked. */
+const REBUILD_STATUSES = ['production_ready', 'needs_review', 'site_in_progress'] as const;
+
+export interface StartBuildOptions {
+  /**
+   * «Побудувати заново»: close whatever is left of the previous build (a
+   * project that is failed/cancelled/stuck, the failed or parked jobs that
+   * describe it, a business parked in site_in_progress) and start a new
+   * project from scratch. Without it, `startBuild` refuses while any of that
+   * exists — the behaviour «Побудувати демо» has always had.
+   */
+  fresh?: boolean;
+}
 export const DEAL_STATES = ['contacted', 'replied', 'meeting', 'proposal', 'won', 'lost'] as const;
 export type DealState = typeof DEAL_STATES[number];
 
@@ -143,7 +159,8 @@ export class OperatorBusinessCommandService {
     return result;
   }
 
-  async startBuild(businessId: string): Promise<StartBuildResult> {
+  async startBuild(businessId: string, options: StartBuildOptions = {}): Promise<StartBuildResult> {
+    const fresh = Boolean(options.fresh);
     let result: StartBuildResult = { kind: 'not_found', entity: 'business' };
     const jobs = await this.runStore.enqueueTransaction(async (tx) => {
       const [business] = await tx.select().from(schema.businesses)
@@ -151,8 +168,9 @@ export class OperatorBusinessCommandService {
         .limit(1)
         .for('update');
       if (!business) return [];
-      const status = requireBusinessStatus(business.status, `business ${businessId}`);
-      if (status !== 'production_ready' && status !== 'needs_review') {
+      let status = requireBusinessStatus(business.status, `business ${businessId}`);
+      const allowedStatuses: readonly string[] = fresh ? REBUILD_STATUSES : ['production_ready', 'needs_review'];
+      if (!allowedStatuses.includes(status)) {
         result = {
           kind: 'state_conflict',
           message: `business status ${status} cannot start a build`,
@@ -160,28 +178,13 @@ export class OperatorBusinessCommandService {
         return [];
       }
 
-      const [activeProject] = await tx.select({ state: schema.siteProjects.state })
-        .from(schema.siteProjects)
-        .where(and(
-          eq(schema.siteProjects.businessId, businessId),
-          inArray(schema.siteProjects.state, ACTIVE_PROJECT_STATES),
-        ))
-        .orderBy(desc(schema.siteProjects.createdAt))
-        .limit(1);
-      if (activeProject) {
-        result = {
-          kind: 'state_conflict',
-          message: `site project is already ${activeProject.state}`,
-        };
-        return [];
-      }
+      // A build that is genuinely running is never torn down from here: a
+      // fresh start is for dead builds, and a live one has «Зупинити».
       const [activeRun] = await tx.select({ jobType: schema.workflowJobRuns.jobType })
         .from(schema.workflowJobRuns)
         .where(and(
           eq(schema.workflowJobRuns.businessId, businessId),
-          inArray(schema.workflowJobRuns.jobType, [
-            'content-and-design', 'build-site', 'visual-qa', 'deploy-demo',
-          ]),
+          inArray(schema.workflowJobRuns.jobType, BUILD_JOB_TYPES),
           inArray(schema.workflowJobRuns.status, ACTIVE_RUN_STATUSES),
         ))
         .limit(1);
@@ -191,6 +194,63 @@ export class OperatorBusinessCommandService {
           message: `build workflow ${activeRun.jobType} is already active`,
         };
         return [];
+      }
+
+      const [activeProject] = await tx.select({ id: schema.siteProjects.id, state: schema.siteProjects.state })
+        .from(schema.siteProjects)
+        .where(and(
+          eq(schema.siteProjects.businessId, businessId),
+          inArray(schema.siteProjects.state, ACTIVE_PROJECT_STATES),
+        ))
+        .orderBy(desc(schema.siteProjects.createdAt))
+        .limit(1);
+      if (activeProject && !fresh) {
+        result = {
+          kind: 'state_conflict',
+          message: `site project is already ${activeProject.state}`,
+        };
+        return [];
+      }
+
+      if (fresh) {
+        const finishedAt = new Date();
+        const reason = 'Роман запустив збірку заново';
+        // Whatever the previous build left behind is closed in the same
+        // transaction that starts the successor, so the Inbox never shows the
+        // old failure next to the new run.
+        await tx.update(schema.siteProjects)
+          .set({ state: 'cancelled' })
+          .where(and(
+            eq(schema.siteProjects.businessId, businessId),
+            inArray(schema.siteProjects.state, ACTIVE_PROJECT_STATES),
+          ));
+        const closedAttempts = await tx.update(schema.workflowJobs)
+          .set({ status: 'cancelled', errorCode: null, errorDetail: reason, finishedAt })
+          .where(and(
+            eq(schema.workflowJobs.businessId, businessId),
+            inArray(schema.workflowJobs.jobType, BUILD_JOB_TYPES),
+            inArray(schema.workflowJobs.status, ['failed', 'needs_human']),
+          ))
+          .returning({
+            runId: schema.workflowJobs.runId,
+            attemptSequence: schema.workflowJobs.attemptSequence,
+          });
+        for (const attempt of closedAttempts) {
+          await transitionCurrentRun(tx, attempt, ['failed', 'needs_human'], 'cancelled', finishedAt);
+        }
+        if (status === 'site_in_progress') {
+          const recovered = await this.transitions.recoverInTransaction(tx, {
+            businessId,
+            expectedStatus: 'site_in_progress',
+            to: 'production_ready',
+            reason,
+            actor: 'roman',
+          });
+          if (recovered.kind !== 'moved') {
+            throw new Error(`fresh build lost its locked recovery for ${businessId}`);
+          }
+          status = 'production_ready';
+        }
       }
 
       if (status === 'needs_review') {
@@ -231,7 +291,11 @@ export class OperatorBusinessCommandService {
         payload: {
           businessId,
           campaignId: business.campaignId,
-          idempotencyKey: `content-and-design:${businessId}`,
+          // A fresh start is a new logical run by definition; the plain start
+          // keeps its stable key so a double click cannot queue twice.
+          idempotencyKey: fresh
+            ? `content-and-design:${businessId}:rebuild:${Date.now()}`
+            : `content-and-design:${businessId}`,
         },
         options: {
           priority: buildJobPriority({ latestVerdict: audit?.verdict, score: business.score }),

@@ -5,6 +5,7 @@ import { db, pool, schema } from '../db/client.js';
 import { log } from '../lib/logger.js';
 import { notifyJobProblem, notifySubscriptionPause } from '../telegram/notify.js';
 import { isRateLimitedError } from '../agents/types.js';
+import { isJobSkippedError } from './jobSkipped.js';
 import { withAgentWorkerGroup } from '../agents/semaphore.js';
 import {
   LOGICAL_JOB_FIELD,
@@ -206,6 +207,43 @@ export async function processJob(
     if (!committed) log.warn('stale job success ignored', { name, bossJobId: job.id });
   } catch (err: any) {
     const detail = String(err?.stack ?? err).slice(0, 4000);
+
+    // Nothing left to do: the project or business moved on while this attempt
+    // was in flight. Recorded as its own outcome so the console never shows a
+    // green «Готово» for work that did not happen, and never retried — the
+    // state that made it pointless is not going to come back.
+    if (isJobSkippedError(err)) {
+      const reason = String(err.message).slice(0, 1_000);
+      const skippedCommitted = await db.transaction(async (tx) => {
+        const [currentAttempt] = await tx.select({
+          status: schema.workflowJobs.status,
+          runId: schema.workflowJobs.runId,
+          attemptSequence: schema.workflowJobs.attemptSequence,
+        })
+          .from(schema.workflowJobs)
+          .where(eq(schema.workflowJobs.id, jobRow.id))
+          .limit(1)
+          .for('update');
+        if (currentAttempt?.status !== 'running') return false;
+        const finishedAt = new Date();
+        await tx.update(schema.workflowJobs)
+          .set({ status: 'skipped', errorCode: 'SKIPPED', errorDetail: reason, finishedAt })
+          .where(eq(schema.workflowJobs.id, jobRow.id));
+        if (currentAttempt.runId) {
+          await tx.update(schema.workflowJobRuns)
+            .set({ status: 'skipped', updatedAt: finishedAt, finishedAt })
+            .where(and(
+              eq(schema.workflowJobRuns.id, currentAttempt.runId),
+              eq(schema.workflowJobRuns.currentAttemptSequence, currentAttempt.attemptSequence ?? -1),
+            ));
+        }
+        return true;
+      });
+      log.info(skippedCommitted ? 'job skipped: state moved on' : 'stale job skip ignored', {
+        name, bossJobId: job.id, reason,
+      });
+      return;
+    }
 
     if (isRateLimitedError(err)) {
       const waitMs = err.retryAfterMs;

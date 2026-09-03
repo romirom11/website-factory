@@ -54,7 +54,8 @@ export function registerOperatorBusinessCommandRoutes(
   app.post('/internal/businesses/:businessId/builds', internalAuth, async (context) => {
     const businessId = context.req.param('businessId').trim();
     if (!businessId) return context.json({ ok: false, message: 'businessId is required' }, 400);
-    const result = await execute.startBuild(businessId);
+    const body = await context.req.json().catch(() => null) as { fresh?: unknown } | null;
+    const result = await execute.startBuild(businessId, { fresh: body?.fresh === true });
     if (result.kind !== 'started') {
       return context.json({ ok: false, message: result.kind === 'not_found' ? 'business not found' : result.message, result }, conflictStatus(result.kind));
     }

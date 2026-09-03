@@ -24,6 +24,7 @@ export function jobTone(status: string): 'ok' | 'warn' | 'bad' | 'info' | 'idle'
   if (status === 'needs_human') return 'warn';
   // A reconciler-closed ghost job is over and done with, not an error to chase.
   if (status === 'stale') return 'idle';
+  if (status === 'skipped') return 'idle';
   // retry_wait is a subscription pause, NOT an error (SPEC §2.3б).
   if (status === 'retry_wait') return 'info';
   if (status === 'running') return 'info';

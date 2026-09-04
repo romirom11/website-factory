@@ -77,6 +77,33 @@ export async function resolveRunnerPath(
   return candidate;
 }
 
+const REQUEST_ID = /^[0-9a-f-]{36}$/i;
+/** Old full-UUID directories (before 2026-09-04) still get pruned. */
+const REQUEST_DIR = /^(?:[0-9a-f]{16}|[0-9a-f-]{36})$/i;
+
+/**
+ * Directory name for one request under the work root — 16 hex digits of the
+ * request id, not the whole UUID.
+ *
+ * The code agent's TMPDIR is `<work>/<dir>/workspace/.factory-tmp`, and the
+ * Claude CLI's shell sandbox binds unix sockets there
+ * (`claude-socks-<16 hex>.sock`). Linux caps a unix socket path at 108 bytes:
+ * with the 36-character UUID the path came to 110–111, socat could not bind,
+ * and every Bash call in the session died with «Sandbox is required but
+ * failed to initialize» (BEAUTIFY Laser, 2026-09-04: four sessions, two of
+ * them a full retry budget). Sixteen digits keep the path at 91 bytes. The
+ * mapping is deterministic, so an idempotent retry still finds its directory.
+ */
+export function requestDirName(requestId: string): string {
+  if (!REQUEST_ID.test(requestId)) throw new Error('invalid runner request id');
+  return requestId.toLowerCase().replace(/-/g, '').slice(0, 16);
+}
+
+/** Longest unix socket the code agent's sandbox creates under a workspace. */
+export const SANDBOX_SOCKET_SAMPLE = path.join('.factory-tmp', 'claude-socks-0123456789abcdef.sock');
+/** `sizeof(sun_path)` is 108 on Linux, and one byte is the terminator. */
+export const UNIX_SOCKET_PATH_MAX = 107;
+
 export function executionPaths(requestId: string, roots = runnerRoots()): {
   root: string;
   workspace: string;
@@ -84,8 +111,7 @@ export function executionPaths(requestId: string, roots = runnerRoots()): {
   buildLog: string;
   manifest: string;
 } {
-  if (!/^[0-9a-f-]{36}$/i.test(requestId)) throw new Error('invalid runner request id');
-  const root = path.join(roots.work, requestId);
+  const root = path.join(roots.work, requestDirName(requestId));
   return {
     root,
     workspace: path.join(root, 'workspace'),
@@ -231,9 +257,14 @@ export async function pruneRunnerWork(
   await mkdir(roots.work, { recursive: true });
   const now = Date.now();
   let removed = 0;
+  const protectedNames = new Set<string>();
+  for (const id of protectedRequestIds) {
+    protectedNames.add(id);
+    if (REQUEST_ID.test(id)) protectedNames.add(requestDirName(id));
+  }
   for (const entry of await readdir(roots.work, { withFileTypes: true })) {
-    if (!entry.isDirectory() || !/^[0-9a-f-]{36}$/i.test(entry.name)) continue;
-    if (protectedRequestIds.has(entry.name)) continue;
+    if (!entry.isDirectory() || !REQUEST_DIR.test(entry.name)) continue;
+    if (protectedNames.has(entry.name)) continue;
     const target = path.join(roots.work, entry.name);
     const metadata = await stat(target).catch(() => null);
     if (!metadata || now - metadata.mtimeMs <= maxAgeMs) continue;

@@ -257,6 +257,22 @@ try {
     await assert.rejects(stageWorkspace(source, path.join(tmp, 'symlink-stage')), /rejects symlink/);
   });
 
+  await check('request directories keep the CLI sandbox socket path under the unix limit', async () => {
+    const { requestDirName, SANDBOX_SOCKET_SAMPLE, UNIX_SOCKET_PATH_MAX } = await import('../src/runner/workspace.js');
+    const id = randomUUID();
+    const prod = { work: '/app/runner-work', sites: '/app/sites', inputs: '/app/inputs' };
+    const paths = executionPaths(id, prod);
+    assert.equal(path.basename(paths.root), requestDirName(id));
+    assert.match(path.basename(paths.root), /^[0-9a-f]{16}$/);
+    assert.equal(executionPaths(id, prod).root, paths.root, 'deterministic: an idempotent retry finds its directory');
+    const socket = path.join(paths.workspace, SANDBOX_SOCKET_SAMPLE);
+    assert.ok(Buffer.byteLength(socket) <= UNIX_SOCKET_PATH_MAX, `${socket} is ${Buffer.byteLength(socket)} bytes`);
+    // The full UUID was the bug: 110 bytes, over the 108-byte sun_path.
+    const old = path.join(prod.work, id, 'workspace', SANDBOX_SOCKET_SAMPLE);
+    assert.ok(Buffer.byteLength(old) > UNIX_SOCKET_PATH_MAX);
+    assert.throws(() => requestDirName('../escape'), /invalid runner request id/);
+  });
+
   await check('runner scratch cleanup is age-based and bounded', async () => {
     const oldId = randomUUID();
     const oldRoot = executionPaths(oldId).root;
@@ -267,6 +283,12 @@ try {
     assert.equal(existsSync(oldRoot), true);
     assert.equal(await pruneRunnerWork(undefined, 1_000), 1);
     assert.equal(existsSync(oldRoot), false);
+    // Directories from before the short names (full UUID) are still pruned.
+    const legacyRoot = path.join(path.dirname(oldRoot), randomUUID());
+    await mkdir(legacyRoot);
+    await utimes(legacyRoot, old, old);
+    assert.equal(await pruneRunnerWork(undefined, 1_000), 1);
+    assert.equal(existsSync(legacyRoot), false);
   });
 
   await check('build-log pump appends only bytes after its durable offset', async () => {

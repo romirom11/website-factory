@@ -701,6 +701,19 @@ async function html(body: string, opts: { noindex?: boolean } = {}): Promise<str
 }
 
 {
+  // Gallery numbering is not a phone; a bare mobile-shaped run still is.
+  const dir = await html(`<a href="tel:+302610123456">2610 123456</a>
+    <figure>01</figure> <figure>02</figure> <figure>03</figure> <figure>04</figure> <figure>05</figure>`);
+  const rep = await checkProvenance(dir, snapshot);
+  check('ordinal numbering «01 02 03 04 05» is not a foreign phone', !rep.findings.some((f) => f.kind === 'foreign-phone'),
+    rep.findings.map((f) => f.detail.slice(0, 80)).join(' | '));
+  const dir2 = await html(`<a href="tel:+302610123456">2610 123456</a> <p>Καλέστε 698 000 1122</p>`);
+  const rep2 = await checkProvenance(dir2, snapshot);
+  check('a bare invented mobile number is still caught', rep2.findings.some((f) => f.kind === 'foreign-phone'),
+    rep2.findings.map((f) => f.detail.slice(0, 80)).join(' | '));
+}
+
+{
   const dir = await html(`<a href="tel:+302610123456">2610 123456</a><p>info@fake-salon.gr</p>`);
   const rep = await checkProvenance(dir, snapshot);
   check('invented email is caught', rep.findings.some((f) => f.kind === 'foreign-email'));

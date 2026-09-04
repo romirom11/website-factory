@@ -53,9 +53,11 @@ function phoneMatches(candidate: string, known: string[]): boolean {
   return known.some((k) => {
     const kd = digits(k);
     if (kd.length < 8) return false;
-    const shorter = c.length < kd.length ? c : kd;
-    const longer = c.length < kd.length ? kd : c;
-    return longer.endsWith(shorter.slice(-9)) || shorter.endsWith(longer.slice(-9));
+    // The greedy run regex can swallow neighbouring digits together with the
+    // number (a year, a gallery ordinal: «2610 123456 01 02»); a candidate that
+    // CONTAINS the known number's last nine digits is that number plus noise,
+    // not a fabricated one — so containment, not an exact suffix.
+    return c.includes(kd.slice(-9)) || kd.includes(c.slice(-9));
   });
 }
 
@@ -139,11 +141,15 @@ export async function checkProvenance(outDir: string, snapshot: BuildSnapshot): 
       }
     }
     // Visible phone-shaped runs. Greek numbers: +30 followed by 10 digits, or a
-    // bare 10-digit number starting 2 or 6, optionally spaced in groups.
+    // bare 10-digit number starting 2 (landline) or 6 (mobile), optionally spaced
+    // in groups. A bare run that starts with anything else is not a number a
+    // reader could dial here — the gallery numbering «01 02 03 04 05» was flagged
+    // as a fabricated phone in three QA rounds (BEAUTIFY Laser, 2026-09-04).
     for (const m of text.matchAll(/(?:\+\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?){2,4}\d{2,4}/g)) {
       const candidate = m[0]!;
       const d = digits(candidate);
       if (d.length < 9 || d.length > 15) continue; // prices, years, dates
+      if (!candidate.trim().startsWith('+') && !/^[26]/.test(d)) continue; // ordinals, ids, not a Greek phone
       if (phoneMatches(candidate, knownPhones)) {
         contactsPresent.add(candidate.trim());
       } else {

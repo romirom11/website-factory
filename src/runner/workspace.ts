@@ -17,10 +17,22 @@ import {
 import path from 'node:path';
 import type { RunnerAttachment, RunnerPathRef } from './protocol.js';
 
-/** Runtime/build caches never cross the trust boundary or sync back. */
-const PRESERVED_TOP_LEVEL = new Set([
-  'node_modules', '.next', '.git', '.factory-agent-settings.json',
+/**
+ * Workspace entries that never cross the trust boundary or sync back.
+ *
+ * Runtime/build caches, plus `.factory-tmp`: the agent's TMPDIR, HOME and
+ * XDG_* inside the workspace (sandbox.ts, confinement.ts). Claude Code's
+ * sandbox runtime keeps its `srt-mux-*.sock` unix sockets there and leaves
+ * them behind when a background dev server outlives the session. A socket is
+ * a "special file" to both the sync and the credential-leak gate, so a
+ * finished 30-minute build was thrown away as SECURITY_VIOLATION (BEAUTIFY
+ * Laser, 2026-09-04). The leak gate (secretScan.ts) skips exactly this list,
+ * so the two can never disagree about what is output.
+ */
+export const RUNNER_PRESERVED_TOP_LEVEL: ReadonlySet<string> = new Set([
+  'node_modules', '.next', '.git', '.factory-tmp', '.factory-agent-settings.json',
 ]);
+const PRESERVED_TOP_LEVEL = RUNNER_PRESERVED_TOP_LEVEL;
 
 export interface RunnerRoots {
   sites: string;

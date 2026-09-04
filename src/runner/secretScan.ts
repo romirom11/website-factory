@@ -2,15 +2,15 @@
 import { createReadStream } from 'node:fs';
 import { lstat, readdir } from 'node:fs/promises';
 import path from 'node:path';
+import { RUNNER_PRESERVED_TOP_LEVEL } from './workspace.js';
 
-// These exact workspace caches never synchronize back to factory storage.
-// Match the full relative path: skipping every nested directory with one of
-// these names would let an agent hide a leak under output/.next/ and sync it.
-const SKIPPED_RELATIVE_DIRECTORIES = new Set([
-  path.join('workspace', 'node_modules'),
-  path.join('workspace', '.next'),
-  path.join('workspace', '.git'),
-]);
+// Exactly the workspace entries the sync never mirrors back — one list, so the
+// gate and the sync cannot disagree. Match the full relative path: skipping
+// every nested directory with one of these names would let an agent hide a
+// leak under output/.next/ and sync it.
+const SKIPPED_RELATIVE_DIRECTORIES = new Set(
+  [...RUNNER_PRESERVED_TOP_LEVEL].map((name) => path.join('workspace', name)),
+);
 
 export class RunnerSecurityError extends Error {
   readonly code = 'SECURITY_VIOLATION';

@@ -294,6 +294,27 @@ try {
     assert.deepEqual(direct, { command: 'opencode', args: ['run'] });
   });
 
+  await check('runner hops enforce the caller deadline, not undici\'s 5-minute headers timeout', async () => {
+    const { postJson } = await import('../src/lib/httpJson.js');
+    const slow = new Hono();
+    slow.post('/slow', async (c) => { await new Promise((r) => setTimeout(r, 700)); return c.json({ ok: true }); });
+    slow.post('/fast', (c) => c.json({ echo: c.req.header('x-probe') ?? null }));
+    const { server, url } = await listen(slow);
+    try {
+      const fast = await postJson(`${url}/fast`, { body: '{}', headers: { 'x-probe': 'yes' }, timeoutMs: 5_000 });
+      assert.equal(fast.status, 200);
+      assert.deepEqual(JSON.parse(fast.text), { echo: 'yes' });
+      await assert.rejects(
+        postJson(`${url}/slow`, { body: '{}', timeoutMs: 300 }),
+        (error: unknown) => error instanceof Error && /timed out after 0s/.test(error.message),
+      );
+      const patient = await postJson(`${url}/slow`, { body: '{}', timeoutMs: 5_000 });
+      assert.equal(patient.status, 200);
+    } finally {
+      await close(server);
+    }
+  });
+
   await check('runner redacts nested secret values without logging them', () => {
     const secret = 'runner-redaction-secret-value';
     setSensitiveValues([secret]);

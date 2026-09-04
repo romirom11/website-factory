@@ -39,6 +39,7 @@ import {
   type RemoteTerminalInfo,
   type AccountProviderInput,
 } from './transport.js';
+import { postJson } from '../lib/httpJson.js';
 
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 
@@ -90,20 +91,20 @@ async function post(
     throw new Error(`runner request exceeds ${RUNNER_MAX_REQUEST_BYTES} bytes`);
   }
 
-  let response: Response;
+  let response: { status: number; text: string };
   try {
     const requestId = typeof body === 'object' && body !== null && 'requestId' in body
       ? String((body as { requestId?: unknown }).requestId ?? '')
       : '';
-    response = await fetch(`${config.agents.runnerGatewayUrl}${endpoint}`, {
-      method: 'POST',
+    // postJson, not fetch: this request stays open for the whole agent call
+    // (up to an hour for a build); fetch would drop it at five minutes.
+    response = await postJson(`${config.agents.runnerGatewayUrl}${endpoint}`, {
       headers: {
-        'content-type': 'application/json',
         'x-runner-key': apiKey,
         ...(requestId ? { 'x-request-id': requestId } : {}),
       },
       body: encoded,
-      signal: AbortSignal.timeout(timeoutMs),
+      timeoutMs,
     });
   } catch (error) {
     throw new RunnerUnavailableError(
@@ -111,7 +112,7 @@ async function post(
     );
   }
 
-  const text = await response.text();
+  const text = response.text;
   if (Buffer.byteLength(text) > MAX_RESPONSE_BYTES) {
     throw new RunnerUnavailableError('agent runner response exceeded the safety limit');
   }

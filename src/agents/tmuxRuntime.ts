@@ -247,6 +247,20 @@ const PERMISSION_DIALOG = /❯ 1\. Yes|Esc to cancel · Tab to amend/;
 export function isPermissionPrompt(pane: string): boolean {
   return PERMISSION_DIALOG.test(pane);
 }
+
+/**
+ * The CLI's shell sandbox failed to come up and every later Bash call in this
+ * session returns the same cached error («Restart to retry»). The sandbox
+ * bridges are two socat listeners the CLI waits only ~1 s for; a session that
+ * starts while the previous step is still tearing down can lose that race
+ * (BEAUTIFY Laser, 2026-09-04 14:18: the builder retried Bash for 27 minutes
+ * against the same dead sandbox). Nothing in the session can fix it — only a
+ * fresh session can — so the attempt ends the moment the line appears.
+ */
+const SANDBOX_DEAD = /Sandbox is required but failed to initialize/;
+export function isSandboxDead(pane: string): boolean {
+  return SANDBOX_DEAD.test(pane);
+}
 /** Grace after `result.json` appears, so a partially-written file is not read. */
 const RESULT_SETTLE_MS = 1_500;
 
@@ -352,8 +366,8 @@ export function kickoffLine(promptFile: string): string {
 }
 
 export interface TmuxRunOutcome {
-  /** `result` — result.json appeared. `idle`/`timeout`/`gone`/`prompt` — it did not. */
-  reason: 'result' | 'idle' | 'timeout' | 'gone' | 'prompt';
+  /** `result` — result.json appeared. `idle`/`timeout`/`gone`/`prompt`/`sandbox` — it did not. */
+  reason: 'result' | 'idle' | 'timeout' | 'gone' | 'prompt' | 'sandbox';
   scrollback: string;
   elapsedMs: number;
 }
@@ -374,6 +388,13 @@ export function terminalFailureError(
   const tail = clip(outcome.scrollback.split('\n').slice(-25).join(' '), 400);
   const limited = runtime.rateLimitFromText(outcome.scrollback);
   if (limited) return limited;
+  if (outcome.reason === 'sandbox') {
+    return new Error(
+      `tmux code agent "${agentName}": пісочниця CLI не піднялась (bridge sockets) після ` +
+      `${Math.round(outcome.elapsedMs / 1000)}s — жоден Bash у цій сесії не працює; ` +
+      `наступна спроба стартує нову сесію. На екрані: ${tail}`,
+    );
+  }
   if (outcome.reason === 'prompt') {
     return new Error(
       `tmux code agent "${agentName}": CLI чекає відповіді на діалог дозволу ` +
@@ -433,6 +454,9 @@ async function waitForResult(
       lastChangeAt = Date.now();
     }
 
+    if (isSandboxDead(visible)) {
+      return { reason: 'sandbox', scrollback: await capturePane(session), elapsedMs: Date.now() - startedAt };
+    }
     const stillFor = Date.now() - lastChangeAt;
     if (stillFor > PROMPT_GIVEUP_MS && isPermissionPrompt(visible)) {
       return { reason: 'prompt', scrollback: await capturePane(session), elapsedMs: Date.now() - startedAt };

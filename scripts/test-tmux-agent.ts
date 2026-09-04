@@ -35,6 +35,7 @@ import {
   kickoffLine, liveTerminal, runCodeAgentTmux,
   sessionName, terminalFailureError, tmuxAvailable,
   isPermissionPrompt,
+  isSandboxDead,
 } from '../src/agents/tmuxRuntime.js';
 import { shouldUseAttachableTerminal, getRuntimeById } from '../src/agents/runtime.js';
 import { prepareCodeAgentInvocation } from '../src/agents/result.js';
@@ -110,6 +111,13 @@ console.log('\nRuntime parity');
     reason: 'prompt', scrollback: 'Do you want to overwrite layout.tsx?', elapsedMs: 95_000,
   }, 'terminal-parity');
   check('a dialog failure names the fix', /TERMINAL_ALLOWED_TOOLS/.test(stuck.message), stuck.message);
+  check('a dead CLI sandbox is recognised on screen',
+    isSandboxDead("  ⎿  Sandbox is required but failed to initialize: Failed to create bridge sockets after 5 attempts. Restart to retry.")
+    && !isSandboxDead('● Running pnpm build in the sandbox…'));
+  const dead = terminalFailureError(getRuntimeById('claude-code'), {
+    reason: 'sandbox', scrollback: 'Sandbox is required but failed to initialize', elapsedMs: 40_000,
+  }, 'terminal-parity');
+  check('a dead-sandbox failure says a new session is the fix', /нову сесію/.test(dead.message), dead.message);
   check('guard hook path shares this module\'s extension (.ts under tsx, .js in dist)',
     guardHookPath().endsWith(`guardHook${path.extname(fileURLToPath(import.meta.url))}`) && existsSync(guardHookPath()),
     guardHookPath());

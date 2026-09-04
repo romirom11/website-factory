@@ -332,6 +332,24 @@ try {
     }
   });
 
+  await check('sensitive values are credential material, not credential locations', async () => {
+    const { runnerSensitiveValues, isSensitiveEnvName } = await import('../src/runner/credentials.js');
+    assert.equal(isSensitiveEnvName('EXECUTOR_API_KEY'), true);
+    assert.equal(isSensitiveEnvName('SETTINGS_MASTER_KEY'), true);
+    assert.equal(isSensitiveEnvName('RUNNER_CREDENTIAL_ROOT'), false);
+    assert.equal(isSensitiveEnvName('CLAUDE_CODE_OAUTH_TOKEN_FILE'), false);
+    process.env.FACTORY_TEST_CREDENTIAL_ROOT = '/private/credentials/test-root';
+    process.env.FACTORY_TEST_API_KEY = 'factory-test-api-key-value';
+    try {
+      const values = await runnerSensitiveValues();
+      assert.ok(values.includes('factory-test-api-key-value'));
+      assert.ok(!values.includes('/private/credentials/test-root'));
+    } finally {
+      delete process.env.FACTORY_TEST_CREDENTIAL_ROOT;
+      delete process.env.FACTORY_TEST_API_KEY;
+    }
+  });
+
   await check('runner output scan rejects literal credentials before sync', async () => {
     const root = path.join(tmp, 'secret-scan');
     const secret = 'literal-runner-secret-value';

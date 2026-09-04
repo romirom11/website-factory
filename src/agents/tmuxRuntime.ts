@@ -88,7 +88,7 @@ async function sendKickoffVerified(
   env: Record<string, string>,
   readyPattern?: string,
 ): Promise<void> {
-  const ready = new RegExp(readyPattern ?? 'bypass permissions|shift\\+tab to cycle', 'i');
+  const ready = new RegExp(readyPattern ?? 'bypass permissions|manual mode|shift\\+tab to cycle|\\? for shortcuts', 'i');
   const pane = async (): Promise<string> =>
     (await exec('tmux', ['capture-pane', '-p', '-t', session], { env })).stdout;
 
@@ -233,6 +233,20 @@ const POLL_MS = 3_000;
  * `pnpm install` and `pnpm build` legitimately print nothing for minutes.
  */
 const IDLE_GIVEUP_MS = 15 * 60_000;
+/**
+ * A permission dialog is a special idle: the pane will never change again,
+ * and the reason is always ours (a tool missing from TERMINAL_ALLOWED_TOOLS).
+ * Waiting the full idle budget on it cost 25 minutes per attempt, three
+ * attempts in a row (BEAUTIFY Laser, 2026-09-04). Ninety seconds of the same
+ * dialog chrome on screen is proof enough.
+ */
+const PROMPT_GIVEUP_MS = 90_000;
+const PERMISSION_DIALOG = /❯ 1\. Yes|Esc to cancel · Tab to amend/;
+
+/** The CLI is showing a numbered permission dialog (Write/Edit/Bash «Do you want to …?»). */
+export function isPermissionPrompt(pane: string): boolean {
+  return PERMISSION_DIALOG.test(pane);
+}
 /** Grace after `result.json` appears, so a partially-written file is not read. */
 const RESULT_SETTLE_MS = 1_500;
 
@@ -338,8 +352,8 @@ export function kickoffLine(promptFile: string): string {
 }
 
 export interface TmuxRunOutcome {
-  /** `result` — result.json appeared. `idle`/`timeout`/`gone` — it did not. */
-  reason: 'result' | 'idle' | 'timeout' | 'gone';
+  /** `result` — result.json appeared. `idle`/`timeout`/`gone`/`prompt` — it did not. */
+  reason: 'result' | 'idle' | 'timeout' | 'gone' | 'prompt';
   scrollback: string;
   elapsedMs: number;
 }
@@ -360,6 +374,13 @@ export function terminalFailureError(
   const tail = clip(outcome.scrollback.split('\n').slice(-25).join(' '), 400);
   const limited = runtime.rateLimitFromText(outcome.scrollback);
   if (limited) return limited;
+  if (outcome.reason === 'prompt') {
+    return new Error(
+      `tmux code agent "${agentName}": CLI чекає відповіді на діалог дозволу ` +
+      `(${Math.round(outcome.elapsedMs / 1000)}s) — headless-сесія відповісти не може; ` +
+      `інструмент має бути в TERMINAL_ALLOWED_TOOLS (claudeCodeRuntime.ts). На екрані: ${tail}`,
+    );
+  }
   return new Error(
     `tmux code agent "${agentName}" produced no result.json (${outcome.reason} after ` +
     `${Math.round(outcome.elapsedMs / 1000)}s). Pane tail: ${tail}`,
@@ -412,7 +433,11 @@ async function waitForResult(
       lastChangeAt = Date.now();
     }
 
-    if (Date.now() - lastChangeAt > IDLE_GIVEUP_MS) {
+    const stillFor = Date.now() - lastChangeAt;
+    if (stillFor > PROMPT_GIVEUP_MS && isPermissionPrompt(visible)) {
+      return { reason: 'prompt', scrollback: await capturePane(session), elapsedMs: Date.now() - startedAt };
+    }
+    if (stillFor > IDLE_GIVEUP_MS) {
       return { reason: 'idle', scrollback: await capturePane(session), elapsedMs: Date.now() - startedAt };
     }
     if (Date.now() - startedAt > timeoutMs) {

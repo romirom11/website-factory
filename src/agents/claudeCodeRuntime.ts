@@ -53,8 +53,46 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_STRUCTURED_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_CODE_TIMEOUT_MS = 60 * 60_000;
 
-/** The guard hook, run by the CLI as a child process on every tool call. */
-const GUARD_HOOK = path.join(HERE, 'guardHook.ts');
+/**
+ * The guard hook, run by the CLI as a child process on every tool call.
+ *
+ * Same extension as THIS module: `.ts` under tsx (factory, tests), `.js` in
+ * the compiled executor image. A hard-coded `.ts` pointed the production
+ * executor at a file that does not exist in dist/: the CLI logged
+ * «PreToolUse hook error … non-blocking» on every call and the tmux path ran
+ * with NO guard at all (seen 2026-09-04). The executor's startup probe now
+ * refuses to come up when this file is missing.
+ */
+const GUARD_HOOK = path.join(HERE, `guardHook${path.extname(fileURLToPath(import.meta.url))}`);
+export function guardHookPath(): string { return GUARD_HOOK; }
+
+/**
+ * Tools the interactive build session may call without a dialog, by their
+ * permission-rule names — and the interactive-only ones it may not call at all.
+ *
+ * Why an explicit list next to `--dangerously-skip-permissions`: CLI 2.1.239
+ * forces the permission mode back to `default` whenever
+ * CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is set («allowed_non_write_users
+ * hardening», anthropics/claude-code#51258), and the executor sets that on
+ * purpose (health.ts insists on it). In default mode every Write/Edit asks
+ * «Do you want to overwrite …?», nobody answers, and the build idles to death:
+ * three BEAUTIFY Laser attempts on 2026-09-04 sat 25 minutes each on that
+ * dialog. The CLI's own warning names the way out — declare allowedTools —
+ * and the -p (structured) path always did, which is why the design step kept
+ * working while the build step never could. Verified in the executor: with
+ * this list a Write over an existing file goes through without a dialog.
+ */
+export const TERMINAL_ALLOWED_TOOLS: readonly string[] = [
+  'Bash', 'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Glob', 'Grep',
+  'ToolSearch', 'Skill', 'Agent', 'TodoWrite',
+  'TaskCreate', 'TaskGet', 'TaskUpdate', 'TaskList', 'TaskOutput', 'TaskStop',
+  'BashOutput', 'KillShell', 'Monitor', 'WebFetch', 'WebSearch',
+];
+export const TERMINAL_DISALLOWED_TOOLS: readonly string[] = [
+  'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode', 'EnterWorktree', 'ExitWorktree',
+  'Artifact', 'PushNotification', 'SendFeedback', 'ScheduleWakeup',
+  'CronCreate', 'CronDelete', 'CronList', 'RemoteTrigger', 'Workflow',
+];
 
 interface CollectedRun {
   resultText: string;
@@ -315,15 +353,19 @@ export const claudeCodeRuntime: AgentRuntime = {
       '--settings', settingsPath,
       '--setting-sources', 'project',
       '--name', opts.name,
+      // Both lists last: the CLI reads a variadic list up to the next flag.
+      '--allowedTools', ...(opts.allowedTools?.length ? opts.allowedTools : TERMINAL_ALLOWED_TOOLS),
+      '--disallowedTools', ...TERMINAL_DISALLOWED_TOOLS,
     ];
-    if (opts.allowedTools?.length) args.push('--allowedTools', ...opts.allowedTools);
     return {
       command: 'claude',
       args,
       needsKickoff: true,
       interactive: true,
-      // The permissions footer is what first paint of a ready input box shows.
-      kickoffReadyPattern: 'bypass permissions|shift\\+tab to cycle',
+      // The permissions footer is what first paint of a ready input box shows:
+      // «bypass permissions on» when the CLI honours the flag, «manual mode on»
+      // when the env-scrub hardening forces default mode (see the tool lists).
+      kickoffReadyPattern: 'bypass permissions|manual mode|shift\\+tab to cycle|\\? for shortcuts',
     };
   },
 

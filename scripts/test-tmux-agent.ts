@@ -34,10 +34,11 @@ import {
   PROMPT_FILE, STALE_MARKER_MS, TERMINAL_LOG, TERMINAL_MARKER,
   kickoffLine, liveTerminal, runCodeAgentTmux,
   sessionName, terminalFailureError, tmuxAvailable,
+  isPermissionPrompt,
 } from '../src/agents/tmuxRuntime.js';
 import { shouldUseAttachableTerminal, getRuntimeById } from '../src/agents/runtime.js';
 import { prepareCodeAgentInvocation } from '../src/agents/result.js';
-import { preTrustWorkspace, guardSettings } from '../src/agents/claudeCodeRuntime.js';
+import { preTrustWorkspace, guardSettings, guardHookPath } from '../src/agents/claudeCodeRuntime.js';
 import { TERMINAL_USER, terminalPassword, ttydArgs } from '../src/agents/terminalServer.js';
 import { RateLimitedError } from '../src/agents/types.js';
 
@@ -88,6 +89,30 @@ console.log('\nRuntime parity');
   check('Claude terminal still launches its interactive TUI',
     claude.command === 'claude' && claude.needsKickoff && claude.interactive,
     `${claude.command} ${claude.args.join(' ')}`);
+  // CLI 2.1.239 forces default mode under CLAUDE_CODE_SUBPROCESS_ENV_SCRUB;
+  // the tools must be declared or every Write asks a question nobody answers.
+  const allowedAt = claude.args.indexOf('--allowedTools');
+  const disallowedAt = claude.args.indexOf('--disallowedTools');
+  const allowed = claude.args.slice(allowedAt + 1, disallowedAt);
+  check('Claude terminal declares its tools explicitly',
+    allowedAt > 0 && ['Bash', 'Read', 'Write', 'Edit', 'Skill', 'Agent'].every((t) => allowed.includes(t)),
+    claude.args.join(' '));
+  check('interactive-only tools are disallowed outright',
+    disallowedAt > allowedAt && claude.args.slice(disallowedAt + 1).includes('AskUserQuestion'));
+  check('kickoff recognises the default-mode footer as ready',
+    new RegExp(claude.kickoffReadyPattern!, 'i').test('⏸ manual mode on · ? for shortcuts · ← for agents')
+    && new RegExp(claude.kickoffReadyPattern!, 'i').test('⏵⏵ bypass permissions on (shift+tab to cycle)'));
+  check('a permission dialog on screen is recognised',
+    isPermissionPrompt(' Do you want to overwrite layout.tsx?\n ❯ 1. Yes\n   2. Yes, and switch to accept edits\n   3. No\n Esc to cancel · Tab to amend'));
+  check('a working pane is not a dialog',
+    !isPermissionPrompt('✶ Bloviating… (23s · ↓ 1.0k tokens)\n❯ \n⏸ manual mode on · esc to interrupt'));
+  const stuck = terminalFailureError(getRuntimeById('claude-code'), {
+    reason: 'prompt', scrollback: 'Do you want to overwrite layout.tsx?', elapsedMs: 95_000,
+  }, 'terminal-parity');
+  check('a dialog failure names the fix', /TERMINAL_ALLOWED_TOOLS/.test(stuck.message), stuck.message);
+  check('guard hook path shares this module\'s extension (.ts under tsx, .js in dist)',
+    guardHookPath().endsWith(`guardHook${path.extname(fileURLToPath(import.meta.url))}`) && existsSync(guardHookPath()),
+    guardHookPath());
 
   const limited = terminalFailureError(getRuntimeById('codex'), {
     reason: 'gone', scrollback: "You've hit your usage limit. Try again later.", elapsedMs: 1_000,

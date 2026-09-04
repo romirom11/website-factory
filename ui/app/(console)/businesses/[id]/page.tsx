@@ -288,10 +288,17 @@ export default async function BusinessPage({ params }: { params: Promise<{ id: s
   // follows the run from «Дизайн-етап почався» to deploy without switching.
   const buildChainActive = buildJob
     && ['queued', 'running', 'retry_wait'].includes(buildJob.status);
+  // «Побудувати заново» starts with the design step, and the new project row
+  // only appears when that step hands off to the builder. Until then the
+  // newest project is the DEAD one, and showing its «Збірка впала» under a
+  // live log reads as a contradiction (BEAUTIFY Laser, 2026-09-04). While a
+  // step is alive, a failed/cancelled project is history, not the state.
+  const staleProject = Boolean(project && buildChainActive
+    && ['failed', 'cancelled'].includes(project.state));
   const demoTab = (
     <div className="space-y-4">
       {(buildChainActive || (project && IN_FLIGHT_STATES.has(project.state))) && (
-        <LiveBuildPanel businessId={biz.id} projectState={project?.state ?? null} />
+        <LiveBuildPanel businessId={biz.id} projectState={staleProject ? null : project?.state ?? null} />
       )}
 
       {/* A build the critic rejected gets the full decision card right here —
@@ -334,7 +341,7 @@ export default async function BusinessPage({ params }: { params: Promise<{ id: s
         </Panel>
       )}
 
-      {project && project.state !== 'needs_human_review' && (
+      {project && project.state !== 'needs_human_review' && !staleProject && (
         <Panel>
           {/* No «Відкрити демо» link here: it is in the header band. This panel
               shows the demo itself, which is what the tab is for. */}

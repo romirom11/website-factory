@@ -164,7 +164,10 @@ export function cardActionBar(input: CardActionInput): CardActionBar {
     // recovery look like Roman's unresolved task.
     if (build.availability === 'busy') {
       return {
-        waiting: `${build.hint}. Фабрика продовжить сама; нічого натискати не треба.`,
+        // The hint says «вже стоїть у черзі» even once the step is running;
+        // the header's «Демо: будується · крок K з 4» carries the specifics.
+        waiting: 'Фабрика будує демосайт заново — попередню спробу закрито. '
+          + 'Це займає 10–30 хвилин; сторінку можна закрити.',
         actions: [],
       };
     }

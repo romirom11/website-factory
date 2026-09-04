@@ -1,5 +1,6 @@
 /** Startup/readiness checks for the real executor security boundary. */
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { lookup } from 'node:dns/promises';
 import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { connect } from 'node:net';
@@ -11,6 +12,7 @@ import {
   runnerConfinementRequired,
 } from '../agents/confinement.js';
 import { codeAgentEnv } from '../agents/sandbox.js';
+import { guardHookPath } from '../agents/claudeCodeRuntime.js';
 import { confinedCommand, sandboxScratchEnv } from '../agents/confinement.js';
 import { redactSensitiveText } from '../lib/redaction.js';
 import { enabledOpenCodeProviderIds } from './egressRegistry.js';
@@ -132,6 +134,11 @@ function assertExecutorEnvironment(): void {
   }
   if (process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB !== '1') {
     throw new Error('CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 is required');
+  }
+  // The tmux guard hook is a child process the CLI spawns by path. A missing
+  // file is a «non-blocking hook error» to the CLI — and no guard at all.
+  if (!existsSync(guardHookPath())) {
+    throw new Error(`code-agent guard hook is missing from this image: ${guardHookPath()}`);
   }
   const workRoot = path.resolve(process.env.RUNNER_WORK_ROOT ?? '/app/runner-work');
   const privateRoot = path.join(workRoot, '.private');

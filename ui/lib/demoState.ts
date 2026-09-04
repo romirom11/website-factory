@@ -46,6 +46,8 @@ export interface DemoStateInput {
   job: {
     jobType: string;
     status: string;
+    /** `RATE_LIMITED` vs `RUNNER_UNAVAILABLE` tells the two pauses apart. */
+    errorCode?: string | null;
     errorDetail: string | null;
     /** Seconds since the running attempt started; null when unknown. */
     runningForSec: number | null;
@@ -105,7 +107,7 @@ export function demoState(input: DemoStateInput): DemoState {
     if (buildJob.status === 'retry_wait') {
       return {
         key: 'building',
-        text: 'на паузі: ліміт підписки',
+        text: buildJob.errorCode === 'RUNNER_UNAVAILABLE' ? 'на паузі: runner недоступний' : 'на паузі: ліміт підписки',
         detail: buildJob.resumesAt ? `відновиться о ${buildJob.resumesAt}` : 'відновиться сама',
         tone: 'wait',
       };

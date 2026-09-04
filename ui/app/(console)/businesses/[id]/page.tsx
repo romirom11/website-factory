@@ -224,6 +224,7 @@ export default async function BusinessPage({ params }: { params: Promise<{ id: s
       ? {
         jobType: buildJob.jobType,
         status: buildJob.status,
+        errorCode: buildJob.errorCode,
         errorDetail: buildJob.errorDetail,
         runningForSec: buildJob.status === 'running' && buildJob.startedAt
           ? Math.max(0, Math.round((Date.now() - buildJob.startedAt.getTime()) / 1000))

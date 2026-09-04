@@ -41,6 +41,8 @@ const project = (state: string, extra: Partial<NonNullable<DemoStateInput['proje
   check('queued design step → будується · у черзі', q.key === 'building' && q.detail === 'крок 1 з 4: дизайн · у черзі', q);
   const p = demoState({ status: 'site_in_progress', project: project('qa'), job: job('visual-qa', 'retry_wait', { resumesAt: '14:30' }) });
   check('subscription pause → на паузі, with the resume time', p.key === 'building' && p.text === 'на паузі: ліміт підписки' && p.detail === 'відновиться о 14:30', p);
+  const r = demoState({ status: 'site_in_progress', project: null, job: job('content-and-design', 'retry_wait', { errorCode: 'RUNNER_UNAVAILABLE', resumesAt: '09:12' }) });
+  check('runner pause → на паузі: runner недоступний', r.key === 'building' && r.text === 'на паузі: runner недоступний' && r.detail === 'відновиться о 09:12', r);
 }
 
 // the critic asks

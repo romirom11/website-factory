@@ -196,7 +196,7 @@ export default async function SystemPage({
           <div className="px-5 py-4 border-b border-line">
             <h2 className="h-section">Кроки фабрики</h2>
             <p className="text-sm text-ink-mute mt-1 max-w-[62ch]">
-              «На паузі» — це не помилка: вичерпався ліміт підписки, черга продовжить сама.
+              «На паузі» — це не помилка: вичерпався ліміт підписки або runner тимчасово недоступний (наприклад, після деплою); черга продовжить сама.
             </p>
           </div>
 

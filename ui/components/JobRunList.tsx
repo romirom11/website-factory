@@ -36,7 +36,7 @@ export interface JobRunView {
 }
 
 function Attempt({ attempt, current }: { attempt: JobAttemptView; current: boolean }) {
-  const human = humanJobStatus(attempt.status);
+  const human = humanJobStatus(attempt.status, attempt.errorCode);
   return (
     <li className="border-t border-line py-2 first:border-t-0">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -45,7 +45,7 @@ function Attempt({ attempt, current }: { attempt: JobAttemptView; current: boole
           {current && ' · поточна'}
         </span>
         <Status tone={human.tone} title={attempt.status}>
-          {humanJobLine(attempt.status, fmtTime(attempt.nextAttemptAt))}
+          {humanJobLine(attempt.status, fmtTime(attempt.nextAttemptAt), attempt.errorCode)}
         </Status>
       </div>
       <p className="mt-1 text-xs text-ink-mute">
@@ -77,12 +77,12 @@ export function JobRunList({ runs }: { runs: JobRunView[] }) {
   return (
     <ul>
       {runs.map((run) => {
-        const human = humanJobStatus(run.status);
         const current = run.attempts.find((attempt) =>
           run.currentAttemptSequence === null
             ? true
             : attempt.sequence === run.currentAttemptSequence,
         ) ?? run.attempts.at(-1);
+        const human = humanJobStatus(run.status, current?.errorCode);
         const canRetry = Boolean(current)
           && ['failed', 'needs_human'].includes(run.status)
           && ['failed', 'needs_human'].includes(current!.status);
@@ -93,7 +93,7 @@ export function JobRunList({ runs }: { runs: JobRunView[] }) {
               <div className="flex flex-wrap items-center gap-2">
                 <span className="text-sm font-medium first-letter:uppercase">{stageName(run.jobType)}</span>
                 <Status tone={human.tone} title={run.status}>
-                  {humanJobLine(run.status, fmtTime(current?.nextAttemptAt))}
+                  {humanJobLine(run.status, fmtTime(current?.nextAttemptAt), current?.errorCode)}
                 </Status>
                 {run.duplicateSuppressions > 0 && (
                   <Badge tone="info" title={run.lastDuplicateAt ? `Останній: ${fmtDate(run.lastDuplicateAt)}` : undefined}>

@@ -29,6 +29,7 @@ import {
   type EnrichmentBranch,
 } from './enrichmentBarrier.js';
 import { businessTransitions } from './statuses.js';
+import { isRunnerUnavailableError } from '../agents/types.js';
 
 export type { JobName } from './jobDefinitions.js';
 export type { EnqueueResult } from './workflowRunStore.js';
@@ -245,15 +246,28 @@ export async function processJob(
       return;
     }
 
-    if (isRateLimitedError(err)) {
-      const waitMs = err.retryAfterMs;
+    // The agent runner is unreachable — typically the executor still coming up
+    // after a deploy, or the gateway between restarts. That is a pause, not a
+    // failed attempt: retrying three times in ninety seconds and then parking
+    // the business on Roman's desk (BEAUTIFY Laser, 2026-09-04: «спроб: 4»,
+    // RUNNER_UNAVAILABLE) turned every deploy into a decision. Back off and
+    // resume on our own; the attempt budget stays untouched.
+    const runnerDown = isRunnerUnavailableError(err);
+    if (isRateLimitedError(err) || runnerDown) {
+      const waitMs = runnerDown
+        ? Math.min(10 * 60_000, 60_000 * 2 ** Math.max(0, attempt - 1))
+        : err.retryAfterMs;
       const nextAttemptAt = new Date(Date.now() + waitMs);
-      const errorDetail = `subscription limit (${err.rateLimitType ?? 'unknown'}); resumes ${nextAttemptAt.toISOString()}`;
+      const errorCode = runnerDown ? 'RUNNER_UNAVAILABLE' as const : 'RATE_LIMITED' as const;
+      const errorDetail = runnerDown
+        ? `runner unavailable (${String(err.message).slice(0, 160)}); resumes ${nextAttemptAt.toISOString()}`
+        : `subscription limit (${err.rateLimitType ?? 'unknown'}); resumes ${nextAttemptAt.toISOString()}`;
       const continuation = await new WorkflowRunStore(pool, b).continueAfterRateLimit({
         bossJobId: job.id,
         retryAfterMs: waitMs,
         errorDetail,
         nextAttemptAt,
+        errorCode,
       });
       if (continuation.kind === 'stale') {
         log.warn('stale rate-limit result ignored', {
@@ -265,7 +279,7 @@ export async function processJob(
         const parked = await db.update(schema.workflowJobs)
           .set({
             status: 'retry_wait', attempts: Math.max(0, attempt - 1),
-            nextAttemptAt, errorCode: 'RATE_LIMITED', errorDetail,
+            nextAttemptAt, errorCode, errorDetail,
             finishedAt: new Date(),
           })
           .where(and(
@@ -281,17 +295,19 @@ export async function processJob(
           );
         }
       }
-      log.warn('job parked on subscription limit', {
+      log.warn(runnerDown ? 'job parked: agent runner unavailable' : 'job parked on subscription limit', {
         name, jobId: job.id,
         runId: continuation.kind === 'legacy' ? null : continuation.runId,
         successorJobId: continuation.kind === 'legacy' ? null : continuation.bossJobId,
         waitMinutes: Math.round(waitMs / 60_000),
         resumesAt: nextAttemptAt.toISOString(),
       });
-      await notifySubscriptionPause({
-        jobType: name, businessId: payload.businessId, resumesAt: nextAttemptAt,
-        runtime: err.runtime,
-      }).catch(() => {});
+      if (!runnerDown) {
+        await notifySubscriptionPause({
+          jobType: name, businessId: payload.businessId, resumesAt: nextAttemptAt,
+          runtime: err.runtime,
+        }).catch(() => {});
+      }
       return;
     }
     const isFinalAttempt = attempt > definition.retry.limit;

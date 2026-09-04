@@ -91,6 +91,37 @@ await withDisposableFactoryDatabase(async ({ pool, db, boss }) => {
     assert.equal(result.rows.length, 2);
   });
 
+  await check('an unreachable runner pauses the same way, under its own code', async () => {
+    const down = await store.enqueue({
+      name: 'content-and-design',
+      payload: { businessId: `e2e-${randomUUID()}`, idempotencyKey: `runner-down:${randomUUID()}` },
+    });
+    assert.equal(down.kind, 'accepted');
+    await db.update(schema.workflowJobs)
+      .set({ status: 'running', attempts: 1, startedAt: new Date() })
+      .where(eq(schema.workflowJobs.id, down.attemptId));
+    await db.update(schema.workflowJobRuns)
+      .set({ status: 'running', updatedAt: new Date() })
+      .where(eq(schema.workflowJobRuns.id, down.runId));
+    const resumesAt = new Date(Date.now() + 60_000);
+    const result = await store.continueAfterRateLimit({
+      bossJobId: down.bossJobId,
+      retryAfterMs: 60_000,
+      nextAttemptAt: resumesAt,
+      errorDetail: `runner unavailable (fetch failed); resumes ${resumesAt.toISOString()}`,
+      errorCode: 'RUNNER_UNAVAILABLE',
+    });
+    assert.equal(result.kind, 'scheduled');
+    const [paused] = await db.select().from(schema.workflowJobs)
+      .where(eq(schema.workflowJobs.id, down.attemptId));
+    assert.equal(paused?.status, 'retry_wait');
+    assert.equal(paused?.errorCode, 'RUNNER_UNAVAILABLE');
+    assert.equal(paused?.attempts, 0);
+    const [downRun] = await db.select().from(schema.workflowJobRuns)
+      .where(eq(schema.workflowJobRuns.id, down.runId));
+    assert.equal(downRun?.status, 'retry_wait');
+  });
+
   await check('a late rate-limit result cannot create work for a cancelled run', async () => {
     const staleKey = `stale-rate-limit:${randomUUID()}`;
     const stale = await store.enqueue({

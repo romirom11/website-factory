@@ -151,12 +151,25 @@ if (bizRows.rowCount !== 1) throw new Error('smoke normalizer did not create exa
 const businessId = bizRows.rows[0].id as string;
 assertFixtureId(businessId, 'business');
 
-// dedup: same placeId again must NOT create a second business
-await normalizeHandler({ campaignId: CID, candidate: { ...candidate, name: `${fixtureName} DUPLICATE` } });
+// dedup: the same place found again (another query, another listing URL)
+// must NOT create a second business — but its source is evidence and is kept.
+await normalizeHandler({
+  campaignId: CID,
+  candidate: {
+    ...candidate,
+    name: `${fixtureName} DUPLICATE`,
+    listingUrl: `${candidate.listingUrl}&hl=el`,
+  },
+});
 bizRows = await pool.query(`select * from businesses where campaign_id = $1`, [CID]);
 check('dedup by place_id', bizRows.rowCount === 1);
 const srcCount = await pool.query(`select count(*)::int n from business_sources where business_id = $1`, [businessId]);
 check('duplicate attached as source', srcCount.rows[0].n >= 2, `sources=${srcCount.rows[0].n}`);
+// An identical re-delivery (same listing URL) is the same source, not a new
+// one: attachSource is idempotent per (business, url, method) since PR #1.
+await normalizeHandler({ campaignId: CID, candidate });
+const srcAgain = await pool.query(`select count(*)::int n from business_sources where business_id = $1`, [businessId]);
+check('re-delivered candidate does not duplicate its source', srcAgain.rows[0].n === srcCount.rows[0].n, `sources=${srcAgain.rows[0].n}`);
 
 const contactChannels = await pool.query(
   `select channel from business_contacts where business_id = $1 order by channel`, [businessId]);

@@ -274,7 +274,16 @@ const JOB: Record<string, HumanStatus> = {
   retry_wait: { text: 'Пауза: ліміт підписки', tone: 'wait', needsRoman: false },
 };
 
-export function humanJobStatus(status: string): HumanStatus {
+/**
+ * `retry_wait` is two different pauses: the subscription window (the default
+ * wording) and an agent runner that is temporarily unreachable — after a
+ * deploy, most often. Both resume on their own; only the reason differs, and
+ * the reason is what a person reading the row wants to know.
+ */
+const RUNNER_PAUSE: HumanStatus = { text: 'Пауза: runner недоступний', tone: 'wait', needsRoman: false };
+
+export function humanJobStatus(status: string, errorCode?: string | null): HumanStatus {
+  if (status === 'retry_wait' && errorCode === 'RUNNER_UNAVAILABLE') return RUNNER_PAUSE;
   return JOB[status] ?? { text: status, tone: 'idle', needsRoman: false };
 }
 
@@ -287,8 +296,8 @@ export function humanJobStatus(status: string): HumanStatus {
  * differ React throws a hydration error (#418) and re-renders the subtree. The
  * caller formats once, on the server, and passes the result.
  */
-export function humanJobLine(status: string, resumesAt?: string | null): string {
-  const base = humanJobStatus(status).text;
+export function humanJobLine(status: string, resumesAt?: string | null, errorCode?: string | null): string {
+  const base = humanJobStatus(status, errorCode).text;
   if (status !== 'retry_wait' || !resumesAt) return base;
   return `${base}, відновиться о ${resumesAt}`;
 }

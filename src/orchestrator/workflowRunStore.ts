@@ -251,12 +251,19 @@ export class WorkflowRunStore {
     };
   }
 
-  /** Schedule exactly one successor physical attempt for a rate-limited run. */
+  /**
+   * Schedule exactly one successor physical attempt for a paused run.
+   *
+   * A pause is a subscription window (`RATE_LIMITED`) or an unreachable agent
+   * runner (`RUNNER_UNAVAILABLE`, e.g. the executor still starting after a
+   * deploy): both resume by themselves and neither counts as an attempt.
+   */
   async continueAfterRateLimit(input: {
     bossJobId: string;
     retryAfterMs: number;
     errorDetail: string;
     nextAttemptAt: Date;
+    errorCode?: 'RATE_LIMITED' | 'RUNNER_UNAVAILABLE';
   }): Promise<RateLimitContinuationResult> {
     const client = await this.pool.connect();
     const database = drizzle(client, { schema });
@@ -359,7 +366,7 @@ export class WorkflowRunStore {
           status: 'retry_wait',
           attempts: Math.max(0, current.attempts - 1),
           nextAttemptAt: input.nextAttemptAt,
-          errorCode: 'RATE_LIMITED',
+          errorCode: input.errorCode ?? 'RATE_LIMITED',
           errorDetail: input.errorDetail,
           finishedAt: new Date(),
         }).where(eq(schema.workflowJobs.id, current.id));

@@ -6,6 +6,7 @@
  * a Claude/Codex/OpenCode subscription.
  */
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import {
@@ -236,7 +237,12 @@ try {
 
     await rm(path.join(staged, 'delete.txt'));
     await writeFile(path.join(staged, 'new.txt'), 'new output');
+    // The agent's scratch (TMPDIR/HOME) stays on the executor: a sandbox
+    // runtime socket left behind there must neither sync nor fail the sync.
+    await mkdir(path.join(staged, '.factory-tmp'));
+    execFileSync('mkfifo', [path.join(staged, '.factory-tmp', 'srt-mux-1-a.sock')]);
     await syncWorkspace(staged, source);
+    assert.equal(existsSync(path.join(source, '.factory-tmp')), false);
     assert.equal(existsSync(path.join(source, 'delete.txt')), false);
     assert.equal(await readFile(path.join(source, 'new.txt'), 'utf8'), 'new output');
     assert.equal(await readFile(path.join(source, 'node_modules', 'private-cache'), 'utf8'), 'cache');
@@ -362,6 +368,22 @@ try {
     await mkdir(path.join(root, 'workspace', 'output', '.next'), { recursive: true });
     await writeFile(path.join(root, 'workspace', 'node_modules', 'ignored.txt'), secret);
     await writeFile(path.join(root, 'workspace', 'output', '.next', 'leak.txt'), secret);
+    await assert.rejects(
+      assertNoSecretLeaks(root, [secret]),
+      (error: unknown) => error instanceof RunnerSecurityError && error.code === 'SECURITY_VIOLATION',
+    );
+  });
+
+  await check('runner output scan ignores agent scratch but still rejects special files in output', async () => {
+    const root = path.join(tmp, 'secret-scan-scratch');
+    const secret = 'scratch-runner-secret-value';
+    await mkdir(path.join(root, 'workspace', '.factory-tmp'), { recursive: true });
+    await mkdir(path.join(root, 'workspace', 'output'), { recursive: true });
+    await writeFile(path.join(root, 'workspace', 'output', 'page.txt'), 'ordinary output');
+    // Claude Code's sandbox runtime leaves srt-mux-*.sock behind in TMPDIR.
+    execFileSync('mkfifo', [path.join(root, 'workspace', '.factory-tmp', 'srt-mux-1-a.sock')]);
+    await assertNoSecretLeaks(root, [secret]);
+    execFileSync('mkfifo', [path.join(root, 'workspace', 'output', 'dev.sock')]);
     await assert.rejects(
       assertNoSecretLeaks(root, [secret]),
       (error: unknown) => error instanceof RunnerSecurityError && error.code === 'SECURITY_VIOLATION',

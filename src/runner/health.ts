@@ -13,6 +13,7 @@ import {
 } from '../agents/confinement.js';
 import { codeAgentEnv } from '../agents/sandbox.js';
 import { guardHookPath } from '../agents/claudeCodeRuntime.js';
+import { executionPaths, SANDBOX_SOCKET_SAMPLE, UNIX_SOCKET_PATH_MAX } from './workspace.js';
 import { confinedCommand, sandboxScratchEnv } from '../agents/confinement.js';
 import { redactSensitiveText } from '../lib/redaction.js';
 import { enabledOpenCodeProviderIds } from './egressRegistry.js';
@@ -134,6 +135,19 @@ function assertExecutorEnvironment(): void {
   }
   if (process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB !== '1') {
     throw new Error('CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 is required');
+  }
+  // The CLI's shell sandbox binds unix sockets under the workspace TMPDIR and
+  // Linux caps that path at 108 bytes; over the cap every Bash call in a
+  // session dies with «Sandbox is required but failed to initialize».
+  const socket = path.join(
+    executionPaths('00000000-0000-4000-8000-000000000000').workspace,
+    SANDBOX_SOCKET_SAMPLE,
+  );
+  if (Buffer.byteLength(socket) > UNIX_SOCKET_PATH_MAX) {
+    throw new Error(
+      `RUNNER_WORK_ROOT is too deep for the CLI sandbox: the socket path would be ` +
+      `${Buffer.byteLength(socket)} bytes (max ${UNIX_SOCKET_PATH_MAX}): ${socket}`,
+    );
   }
   // The tmux guard hook is a child process the CLI spawns by path. A missing
   // file is a «non-blocking hook error» to the CLI — and no guard at all.

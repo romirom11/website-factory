@@ -81,11 +81,23 @@ async function secretsFromJson(file: string): Promise<string[]> {
 }
 
 /** Values are used only for in-memory redaction/equality scans, never logged. */
+// Credential MATERIAL, never credential LOCATIONS. `RUNNER_CREDENTIAL_ROOT`
+// is a path, and the sandbox settings file we write into every workspace
+// (confinement.ts, `denyRead`) legitimately repeats it — so the leak gate
+// rejected each finished 30-minute build for "leaking" its own settings
+// (BEAUTIFY Laser, 2026-09-04). A location suffix says where a secret lives.
+const SECRET_NAME = /(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i;
+const LOCATION_NAME = /(?:_ROOT|_PATH|_DIR|_FILE|_HOME|_URL)$/i;
+
+export function isSensitiveEnvName(name: string): boolean {
+  return SECRET_NAME.test(name) && !LOCATION_NAME.test(name);
+}
+
 export async function runnerSensitiveValues(): Promise<string[]> {
   const values = new Set<string>();
   for (const [name, value] of Object.entries(process.env)) {
     if (!value || value.length < 8) continue;
-    if (/(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i.test(name)) values.add(value);
+    if (isSensitiveEnvName(name)) values.add(value);
   }
   const root = credentialRoot();
   if (root) {

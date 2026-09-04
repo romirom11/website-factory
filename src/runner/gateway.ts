@@ -39,6 +39,7 @@ import {
   runnerCredentialAuthorized,
   safeRunnerError,
 } from './httpBoundary.js';
+import { postJson } from '../lib/httpJson.js';
 
 interface ActiveExecution {
   requestId: string;
@@ -66,17 +67,18 @@ async function callExecutor(request: ExecutionRequest): Promise<ExecutionRespons
   const key = process.env.EXECUTOR_API_KEY ?? '';
   if (!key) throw new Error('EXECUTOR_API_KEY is not configured');
   const timeoutMs = request.options.timeoutMs ?? (request.operation === 'code' ? 60 * 60_000 : 10 * 60_000);
-  const response = await fetch(`${url}/v1/executions`, {
-    method: 'POST',
+  // postJson, not fetch: an agent call keeps this request open for as long as
+  // the model works, and fetch gives up on response headers after 5 minutes.
+  const response = await postJson(`${url}/v1/executions`, {
     headers: {
-      'content-type': 'application/json',
       'x-executor-key': key,
       'x-request-id': request.requestId,
     },
     body: JSON.stringify(request),
-    signal: AbortSignal.timeout(timeoutMs + 30_000),
+    timeoutMs: timeoutMs + 30_000,
   });
-  const decoded = await response.json().catch(() => null);
+  let decoded: unknown = null;
+  try { decoded = JSON.parse(response.text); } catch { /* handled below */ }
   const parsed = ExecutionResponseSchema.safeParse(decoded);
   if (!parsed.success || parsed.data.requestId !== request.requestId) {
     throw new Error(`executor returned invalid response (HTTP ${response.status})`);
@@ -91,13 +93,14 @@ async function proxyControl(
   const url = (process.env.RUNNER_EXECUTOR_URL ?? 'http://agent-runner-executor:8791').replace(/\/+$/, '');
   const key = process.env.EXECUTOR_API_KEY ?? '';
   if (!key) throw new Error('EXECUTOR_API_KEY is not configured');
-  const response = await fetch(`${url}${endpoint}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-executor-key': key },
+  const response = await postJson(`${url}${endpoint}`, {
+    headers: { 'x-executor-key': key },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(endpoint === '/v1/checks' ? 2 * 60_000 : 30_000),
+    // A connect/check runs a real model call; accounts and terminals answer at once.
+    timeoutMs: endpoint === '/v1/checks' ? 2 * 60_000 : endpoint === '/v1/accounts' ? 3 * 60_000 : 30_000,
   });
-  const decoded = await response.json().catch(() => null);
+  let decoded: unknown = null;
+  try { decoded = JSON.parse(response.text); } catch { /* handled below */ }
   const parsed = ControlResponseSchema.safeParse(decoded);
   if (!parsed.success) throw new Error(`executor returned invalid control response (HTTP ${response.status})`);
   return parsed.data;

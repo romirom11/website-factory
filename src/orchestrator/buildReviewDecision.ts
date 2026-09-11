@@ -55,6 +55,46 @@ const DECISION_LABEL = {
   reject: 'відхилити бізнес',
 } as const;
 
+/**
+ * QA-iteration counter a build restarted by Roman begins from.
+ *
+ * The transaction resets `site_projects.qa_iterations` to this and the
+ * successor build-site carries it as `iteration`; visual-qa applies its verdict
+ * only when the two agree (`where qa_iterations = iteration`). They did not —
+ * the job said 1, the row said 0 — so the critic's verdict after Roman's «ще
+ * одна ітерація» was skipped as stale and the build sat in `qa` with no step
+ * to follow, showing «перевіряє критик» for a week (BEAUTIFY Laser,
+ * 2026-09-05 00:16). One constant, used by both.
+ */
+export const ANOTHER_ITERATION_START = 0;
+
+/** The job a claimed decision hands to the queue — pure, so a test can pin it. */
+export function reviewSuccessorJob(
+  input: BuildReviewDecisionInput,
+  businessId: string,
+): {
+  name: 'deploy-demo' | 'build-site';
+  idempotencyKey: string;
+  data: { projectId: number; iteration?: number; issues?: string[] };
+} {
+  if (input.decision === 'deploy_as_is') {
+    return {
+      name: 'deploy-demo',
+      idempotencyKey: `deploy-demo:${businessId}:${input.projectId}`,
+      data: { projectId: input.projectId },
+    };
+  }
+  return {
+    name: 'build-site',
+    idempotencyKey: `build-site:${businessId}:${input.projectId}:roman:${Date.now()}`,
+    data: {
+      projectId: input.projectId,
+      iteration: ANOTHER_ITERATION_START,
+      issues: [`[high/roman] ${input.instruction?.trim() || input.reason}`],
+    },
+  };
+}
+
 /** Atomically claim exactly one operator decision for a parked QA build. */
 export async function claimBuildReviewDecision(
   input: BuildReviewDecisionInput,
@@ -96,21 +136,7 @@ export async function executeBuildReviewDecision(
   const transitions = new BusinessTransitionService(db);
   let claimed: Extract<BuildReviewDecisionResult, { kind: 'claimed' }> | undefined;
   try {
-    const job = input.decision === 'deploy_as_is'
-      ? {
-          name: 'deploy-demo' as const,
-          idempotencyKey: `deploy-demo:${project.businessId}:${input.projectId}`,
-          data: { projectId: input.projectId },
-        }
-      : {
-          name: 'build-site' as const,
-          idempotencyKey: `build-site:${project.businessId}:${input.projectId}:roman:${Date.now()}`,
-          data: {
-            projectId: input.projectId,
-            iteration: 1,
-            issues: [`[high/roman] ${input.instruction?.trim() || input.reason}`],
-          },
-        };
+    const job = reviewSuccessorJob(input, project.businessId);
     const enqueueResult = await enqueueWithMutation(
       job.name,
       {
@@ -170,7 +196,7 @@ async function claimBuildReviewDecisionInTransaction(
   const [projectClaim] = await tx.update(schema.siteProjects)
     .set({
       state: PROJECT_TARGET[input.decision],
-      ...(input.decision === 'another_iteration' ? { qaIterations: 0 } : {}),
+      ...(input.decision === 'another_iteration' ? { qaIterations: ANOTHER_ITERATION_START } : {}),
     })
     .where(and(
       eq(schema.siteProjects.id, input.projectId),

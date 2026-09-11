@@ -454,6 +454,7 @@ async function loadBusinessReviews(excludeBusinessIds: Set<string>): Promise<{
       socialsGap: r.openGaps.includes('socials_unresolved'),
       hasPendingApproval: false,
       statusReason: r.statusReason,
+      buildJobStatus: r.buildJobStatus,
     });
 
     // Nothing pressable means nothing is being asked RIGHT NOW: a rebuild is

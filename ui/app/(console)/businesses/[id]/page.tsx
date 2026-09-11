@@ -249,6 +249,7 @@ export default async function BusinessPage({ params }: { params: Promise<{ id: s
     socialsGap: gaps.some((g) => !g.resolved && g.gap === 'socials_unresolved'),
     hasPendingApproval: Boolean(pendingApproval),
     statusReason: biz.statusReason,
+    buildJobStatus: buildJob?.status,
   });
 
   // «Потрібна твоя увага» через фактчек означає «прочитай звіт критика», тож

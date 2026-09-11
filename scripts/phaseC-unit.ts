@@ -13,6 +13,9 @@ import {
   brandNeglect, chooseDirection, routeDesignGate, scoreDirection, vetoesFor,
 } from '../src/build/rubric.js';
 import { checkProvenance } from '../src/build/provenance.js';
+import { isSiteWorthyAmenity } from '../src/workers/snapshot.js';
+import { KEN_BURNS_SUPERSAMPLE, kenBurnsFilter } from '../src/media/video.js';
+import { VisualCritiqueSchema } from '../src/build/schemas.js';
 import { unusableContactReason } from '../src/build/snapshot.js';
 import {
   WOW_FAIL_THRESHOLD, WOW_MAX, condenseNotes, parseMotionIndex,
@@ -683,6 +686,31 @@ async function html(body: string, opts: { noindex?: boolean } = {}): Promise<str
     `${opts.noindex === false ? '' : '<meta name="robots" content="noindex, nofollow"/>'}` +
     `<title>Nail Studio Aigli</title></head><body>${body}</body></html>`);
   return dir;
+}
+
+// ── amenities: facts, but not all of them belong on a salon's page ─────────
+for (const [name, worthy] of [
+  ['Τουαλέτα', false], ['Restroom', false], ['Gender-neutral restroom', false],
+  ['Συνιστώνται ραντεβού', true], ['Wheelchair accessible entrance', true], ['Πιστωτικές κάρτες', true],
+] as const) {
+  check(`amenity «${name}» ${worthy ? 'stays' : 'is dropped'}`, isSiteWorthyAmenity(name) === worthy);
+}
+
+// ── Ken Burns: whole-pixel zoompan steps are the hero shake ────────────────
+{
+  const filter = kenBurnsFilter({ width: 1280, height: 720, frames: 250, fps: 25 });
+  check('ken burns supersamples at least 4x before zoompan', KEN_BURNS_SUPERSAMPLE >= 4
+    && filter.includes(`scale=${1280 * KEN_BURNS_SUPERSAMPLE}:${720 * KEN_BURNS_SUPERSAMPLE}`), filter);
+  check('ken burns zooms on the supersampled frame and downsamples with lanczos',
+    filter.includes(`s=${1280 * KEN_BURNS_SUPERSAMPLE}x${720 * KEN_BURNS_SUPERSAMPLE}`)
+    && filter.includes('scale=1280:720:flags=lanczos') && filter.endsWith('format=yuv420p'), filter);
+}
+
+// ── critic: a cursor-driven mechanic is unobservable in frames ─────────────
+{
+  const verdict = VisualCritiqueSchema.shape.mechanicVerdicts.element.shape.verdict;
+  check('critic may answer «unobservable» for a hover mechanic', verdict.safeParse('unobservable').success);
+  check('critic verdicts still reject unknown words', !verdict.safeParse('maybe').success);
 }
 
 {

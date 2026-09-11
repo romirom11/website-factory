@@ -79,6 +79,36 @@ export async function ffmpegAvailable(): Promise<boolean> {
 }
 
 /**
+ * zoompan moves its crop window in WHOLE pixels of the frame it is given, so
+ * the push-in advances in steps: at 2× supersampling a 1280-wide clip held
+ * still for 5–7 frames and then jumped half an output pixel — stretched by
+ * object-cover onto a 1440px hero that was a visible shake on a night shot
+ * full of fairy lights (BEAUTIFY Laser, measured frame-by-frame 2026-09-05).
+ * At 4× a step is a quarter of an output pixel, which the final lanczos
+ * downscale turns into sub-pixel interpolation instead of a click.
+ */
+export const KEN_BURNS_SUPERSAMPLE = 4;
+
+/** The ffmpeg filter graph, pure so a test can pin the supersampling. */
+export function kenBurnsFilter(opts: {
+  width: number; height: number; frames: number; fps: number; zoomTo?: number;
+}): string {
+  const { width, height, frames, fps } = opts;
+  const zoomTo = opts.zoomTo ?? 1.18;
+  const sw = width * KEN_BURNS_SUPERSAMPLE;
+  const sh = height * KEN_BURNS_SUPERSAMPLE;
+  return [
+    `scale=${sw}:${sh}:force_original_aspect_ratio=increase:flags=lanczos`,
+    `crop=${sw}:${sh}`,
+    `zoompan=z='min(1+(${(zoomTo - 1).toFixed(4)}*on/${frames}),${zoomTo})'`
+      + `:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'`
+      + `:d=1:s=${sw}x${sh}:fps=${fps}`,
+    `scale=${width}:${height}:flags=lanczos`,
+    'format=yuv420p',
+  ].join(',');
+}
+
+/**
  * Deterministic Ken Burns push-in over the real photo. Same inputs => same
  * output, so the pipeline is testable offline. Returns null (never throws)
  * when ffmpeg is missing.
@@ -96,17 +126,7 @@ export async function kenBurnsClip(opts: {
   const height = opts.height ?? 720;
   const frames = Math.max(1, Math.round(opts.durationSec * fps));
 
-  // zoompan works on a supersampled frame to avoid the well-known pixel jitter,
-  // then scales back down to the target size.
-  const zoomTo = 1.18;
-  const filter = [
-    `scale=${width * 2}:${height * 2}:force_original_aspect_ratio=increase`,
-    `crop=${width * 2}:${height * 2}`,
-    `zoompan=z='min(1+(${(zoomTo - 1).toFixed(4)}*on/${frames}),${zoomTo})'`
-      + `:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'`
-      + `:d=1:s=${width}x${height}:fps=${fps}`,
-    'format=yuv420p',
-  ].join(',');
+  const filter = kenBurnsFilter({ width, height, frames, fps });
 
   const args = [
     '-y', '-loop', '1', '-i', path.resolve(opts.imagePath),

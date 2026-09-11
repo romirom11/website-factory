@@ -6,6 +6,20 @@
 import { eq, desc } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
 
+/**
+ * Google Maps «About» attributes the builder may put on the page.
+ *
+ * They are facts (evidence stays), but not every fact is a selling point: a
+ * beauty salon's demo rendered a «ΤΟΥΑΛΕΤΑ» chip beside its phone number
+ * (BEAUTIFY Laser, 2026-09-11). Restroom-type attributes are dropped from the
+ * snapshot in every language gosom returns them in; accessibility, planning and
+ * payment attributes stay.
+ */
+const NON_SITE_AMENITY = /toilet|restroom|bathroom|lavator|\bwc\b|τουαλ|туалет|tuvalet|toilette|baño|servizi igienici/i;
+export function isSiteWorthyAmenity(name: string): boolean {
+  return !NON_SITE_AMENITY.test(name);
+}
+
 export interface ClientSnapshot {
   businessId: string;
   name: string;
@@ -86,7 +100,7 @@ export async function buildClientSnapshot(businessId: string): Promise<ClientSna
     amenities: all('amenity').map((f) => {
       const v = f.value as { group: string; name: string };
       return { group: v.group, name: v.name };
-    }),
+    }).filter((a) => isSiteWorthyAmenity(a.name)),
     services: all('service').map((f) => f.value as { name: string; price: string | null }),
     reviews: excerpts.length ? excerpts : mined,
     reviewDistribution: first<Record<string, number>>('reviews.distribution'),

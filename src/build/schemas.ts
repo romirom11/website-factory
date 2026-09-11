@@ -459,7 +459,8 @@ export const VisualCritiqueSchema = z.object({
    */
   mechanicVerdicts: z.array(z.object({
     name: z.string().min(1).describe('the mechanic or scene, exactly as the contract names it'),
-    verdict: z.enum(['implemented', 'partial', 'absent']),
+    verdict: z.enum(['implemented', 'partial', 'absent', 'unobservable'])
+      .describe('unobservable = the frames cannot show it (cursor-driven), so no verdict is possible'),
     evidence: z.string().min(1).describe('which frame(s) show it, or why nothing does'),
   })).describe('One entry per mechanic and per sceneMap scene supplied in the payload; empty only if none were supplied.'),
 });

@@ -145,5 +145,48 @@ check(
   recoveringBuild,
 );
 
+// A project stuck in `qa` whose newest step skipped itself: nothing will ever
+// move it, and the policy still calls the project «busy» (BEAUTIFY, 2026-09-05).
+const stalledInput = {
+  businessId: 'fixture-stalled',
+  status: 'site_in_progress',
+  projectState: 'qa',
+  projectId: 5,
+  deployUrl: null,
+  build: {
+    enabled: false,
+    needsConfirm: false,
+    availability: 'busy' as const,
+    hint: 'Демо для цього бізнесу вже будується',
+  },
+  socials: { enabled: true, hint: 'Дошукати соцмережі' },
+  openGaps: [],
+  socialsGap: false,
+  hasPendingApproval: false,
+  statusReason: null,
+};
+const stalled = cardActionBar({ ...stalledInput, buildJobStatus: 'skipped' });
+check(
+  'a project stuck in qa with no live step offers resume first, rebuild second',
+  stalled.waiting === null
+    && stalled.actions.map((a) => a.label).join(',') === 'Продовжити збірку,Побудувати заново'
+    && (stalled.actions[0] as { mode?: string }).mode === 'resume'
+    && (stalled.actions[1] as { mode?: string }).mode === 'fresh'
+    && (stalled.hint ?? '').includes('перевірка критиком'),
+  stalled,
+);
+const moving = cardActionBar({ ...stalledInput, buildJobStatus: 'running' });
+check(
+  'the same project with a running step is just waiting',
+  moving.actions.length === 0 && Boolean(moving.waiting),
+  moving,
+);
+const noProject = cardActionBar({ ...stalledInput, projectState: null, projectId: null, buildJobStatus: 'failed' });
+check(
+  'a dead design step with no project offers only a fresh rebuild',
+  noProject.actions.length === 1 && (noProject.actions[0] as { mode?: string }).mode === 'fresh',
+  noProject,
+);
+
 console.log(failures === 0 ? '\n🧪 INBOX POLICY TESTS PASSED' : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);

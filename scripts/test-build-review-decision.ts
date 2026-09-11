@@ -2,8 +2,10 @@ import assert from 'node:assert/strict';
 import { asc, eq } from 'drizzle-orm';
 import * as schema from '../src/db/schema.js';
 import {
+  ANOTHER_ITERATION_START,
   claimBuildReviewDecision,
   parkBuildForHumanReview,
+  reviewSuccessorJob,
 } from '../src/orchestrator/buildReviewDecision.js';
 import { withDisposableFactoryDatabase } from './lib/disposableFactoryDatabase.js';
 
@@ -81,6 +83,29 @@ await withDisposableFactoryDatabase(async ({ db }) => {
     assert.equal(project?.state, 'ready');
     assert.equal(history.length, 2);
     assert.deepEqual(history.map((row) => row.toStatus), ['needs_review', 'site_in_progress']);
+  });
+
+  await check('another iteration resets the QA counter to what its build-site job carries', async () => {
+    const businessId = 'another-iteration';
+    const projectId = await fixture(businessId);
+    await db.update(schema.siteProjects).set({ qaIterations: 3 })
+      .where(eq(schema.siteProjects.id, projectId));
+    await parkBuildForHumanReview({ projectId, businessId, reason: 'QA cap reached' }, db);
+    const input = {
+      projectId, decision: 'another_iteration' as const, reason: 'fix the hero', instruction: 'hero shakes',
+    };
+    const result = await claimBuildReviewDecision(input, db);
+    assert.equal(result.kind, 'claimed');
+    const [project] = await db.select().from(schema.siteProjects)
+      .where(eq(schema.siteProjects.id, projectId));
+    assert.equal(project?.state, 'building');
+    assert.equal(project?.qaIterations, ANOTHER_ITERATION_START);
+    const job = reviewSuccessorJob(input, businessId);
+    assert.equal(job.name, 'build-site');
+    // visual-qa applies its verdict only when the two agree (2026-09-05 regression).
+    assert.equal(job.data.iteration, project?.qaIterations);
+    assert.deepEqual(job.data.issues, ['[high/roman] hero shakes']);
+    assert.equal(reviewSuccessorJob({ ...input, decision: 'deploy_as_is' }, businessId).name, 'deploy-demo');
   });
 
   await check('concurrent operator buttons have exactly one consistent winner', async () => {

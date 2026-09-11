@@ -83,7 +83,10 @@ export function CardActionButtons({ actions, businessId, name, status }: {
     // The outcome goes to the toast rather than to a line under the band: on a
     // phone the band is sticky and the sentence used to land off-screen under
     // it, and the page revalidates on success anyway, which wipes local state.
-    startTransition(() => { void runWithToast(() => startDemoBuild(businessId)); });
+    const mode = action.run === 'build' ? action.mode : undefined;
+    startTransition(() => {
+      void runWithToast(() => startDemoBuild(businessId, { fresh: mode === 'fresh', resume: mode === 'resume' }));
+    });
   };
 
   const runSocials = () => startTransition(() => {

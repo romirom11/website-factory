@@ -30,7 +30,18 @@ export interface StartBuildOptions {
    * exists — the behaviour «Побудувати демо» has always had.
    */
   fresh?: boolean;
+  /**
+   * «Продовжити збірку»: the chain stopped without a successor — a step
+   * skipped its verdict as stale, or died with its process — while the project
+   * row still says building/qa/ready and nothing will ever move it. Re-enqueue
+   * exactly the step that row is waiting for, with the counters it already
+   * has; no new design, no new project. Refused while a step is genuinely
+   * alive, and when there is no such project (then «Побудувати заново»).
+   */
+  resume?: boolean;
 }
+/** Which step a stalled project is waiting for, by its state. */
+const RESUME_STEP = { building: 'build-site', qa: 'visual-qa', ready: 'deploy-demo' } as const;
 export const DEAL_STATES = ['contacted', 'replied', 'meeting', 'proposal', 'won', 'lost'] as const;
 export type DealState = typeof DEAL_STATES[number];
 
@@ -161,6 +172,8 @@ export class OperatorBusinessCommandService {
 
   async startBuild(businessId: string, options: StartBuildOptions = {}): Promise<StartBuildResult> {
     const fresh = Boolean(options.fresh);
+    const resume = Boolean(options.resume);
+    if (fresh && resume) throw new Error('startBuild: fresh and resume are exclusive');
     let result: StartBuildResult = { kind: 'not_found', entity: 'business' };
     const jobs = await this.runStore.enqueueTransaction(async (tx) => {
       const [business] = await tx.select().from(schema.businesses)
@@ -169,7 +182,9 @@ export class OperatorBusinessCommandService {
         .for('update');
       if (!business) return [];
       let status = requireBusinessStatus(business.status, `business ${businessId}`);
-      const allowedStatuses: readonly string[] = fresh ? REBUILD_STATUSES : ['production_ready', 'needs_review'];
+      const allowedStatuses: readonly string[] = resume
+        ? ['site_in_progress']
+        : fresh ? REBUILD_STATUSES : ['production_ready', 'needs_review'];
       if (!allowedStatuses.includes(status)) {
         result = {
           kind: 'state_conflict',
@@ -194,6 +209,53 @@ export class OperatorBusinessCommandService {
           message: `build workflow ${activeRun.jobType} is already active`,
         };
         return [];
+      }
+
+      if (resume) {
+        const [stalled] = await tx.select({
+          id: schema.siteProjects.id,
+          state: schema.siteProjects.state,
+          qaIterations: schema.siteProjects.qaIterations,
+          openIssues: schema.siteProjects.openIssues,
+        })
+          .from(schema.siteProjects)
+          .where(and(
+            eq(schema.siteProjects.businessId, businessId),
+            inArray(schema.siteProjects.state, Object.keys(RESUME_STEP)),
+          ))
+          .orderBy(desc(schema.siteProjects.createdAt))
+          .limit(1);
+        if (!stalled) {
+          result = { kind: 'state_conflict', message: 'no stalled site project to resume' };
+          return [];
+        }
+        const step = RESUME_STEP[stalled.state as keyof typeof RESUME_STEP];
+        const iteration = stalled.qaIterations ?? 0;
+        const base = { businessId, projectId: stalled.id, campaignId: business.campaignId };
+        // A resume is a new logical run: the stale key of the lost step must
+        // not swallow it as a duplicate.
+        const stamp = `resume:${Date.now()}`;
+        if (step === 'visual-qa') {
+          return [{
+            name: 'visual-qa',
+            payload: { ...base, iteration, idempotencyKey: `visual-qa:${businessId}:${stalled.id}:${iteration}:${stamp}` },
+          }];
+        }
+        if (step === 'build-site') {
+          return [{
+            name: 'build-site',
+            payload: {
+              ...base,
+              iteration,
+              issues: (stalled.openIssues as string[] | null) ?? [],
+              idempotencyKey: `build-site:${businessId}:${stalled.id}:${iteration}:${stamp}`,
+            },
+          }];
+        }
+        return [{
+          name: 'deploy-demo',
+          payload: { ...base, idempotencyKey: `deploy-demo:${businessId}:${stalled.id}:${stamp}` },
+        }];
       }
 
       const [activeProject] = await tx.select({ id: schema.siteProjects.id, state: schema.siteProjects.state })

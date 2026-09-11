@@ -193,6 +193,41 @@ try {
   const pubBusiness = await sqlOne<{ status: string }>(`select status from businesses where id = $1`, [pubBiz.id]);
   check('stopped publish closes the ready project', pubSite?.state === 'cancelled', pubSite?.state);
   check('stopped publish returns the business to ready-to-build', pubBusiness?.status === 'production_ready', pubBusiness?.status);
+
+  // ── «Продовжити збірку»: a chain that stopped without a successor ────────
+  const lostBiz = await createBusiness({
+    id: 'e2e-resume-lost', name: 'E2E Resume Lost', status: 'site_in_progress',
+  });
+  const lostProject = await createSiteProject(lostBiz, 'qa');
+  await sql(`update site_projects set qa_iterations = 2 where id = $1`, [lostProject.projectId]);
+  const lostResume = await operator.startBuild(lostBiz.id, { resume: true });
+  check('resume re-queues the critic for a project stuck in qa', lostResume.kind === 'started', lostResume);
+  const lostQueued = await sqlOne<{ status: string; payload: { iteration?: number; projectId?: number } }>(
+    `select status, payload from workflow_jobs where business_id = $1 and job_type = 'visual-qa' order by id desc limit 1`,
+    [lostBiz.id]);
+  check('resumed critic carries the project counter and id',
+    lostQueued?.status === 'queued' && lostQueued.payload.iteration === 2 && lostQueued.payload.projectId === lostProject.projectId,
+    lostQueued);
+  const lostAgain = await operator.startBuild(lostBiz.id, { resume: true });
+  check('resume refuses while the re-queued step is alive', lostAgain.kind === 'state_conflict', lostAgain);
+  const lostFresh = await operator.startBuild(lostBiz.id, { fresh: true });
+  check('a fresh rebuild is refused while the resumed step is alive', lostFresh.kind === 'state_conflict', lostFresh);
+
+  const stuckBiz = await createBusiness({
+    id: 'e2e-resume-building', name: 'E2E Resume Building', status: 'site_in_progress',
+  });
+  await createSiteProject(stuckBiz, 'building');
+  const stuckResume = await operator.startBuild(stuckBiz.id, { resume: true });
+  const stuckQueued = await sqlOne<{ job_type: string }>(
+    `select job_type from workflow_jobs where business_id = $1 order by id desc limit 1`, [stuckBiz.id]);
+  check('resume re-queues the builder for a project stuck in building',
+    stuckResume.kind === 'started' && stuckQueued?.job_type === 'build-site', { stuckResume, stuckQueued });
+
+  const nothingBiz = await createBusiness({
+    id: 'e2e-resume-nothing', name: 'E2E Resume Nothing', status: 'site_in_progress',
+  });
+  const nothingResume = await operator.startBuild(nothingBiz.id, { resume: true });
+  check('resume with no stalled project says so instead of starting a design', nothingResume.kind === 'state_conflict', nothingResume);
 } finally {
   await destroyFixtures();
   await pool.end();

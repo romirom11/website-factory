@@ -434,13 +434,14 @@ export async function funnelCounts(): Promise<Array<{ campaignId: string; status
  */
 export async function startDemoBuild(
   businessId: string,
-  options: { fresh?: boolean } = {},
+  options: { fresh?: boolean; resume?: boolean } = {},
 ): Promise<ActionResult> {
   // `fresh` = «Побудувати заново»: the factory closes the dead project and its
   // failed/parked steps in the same transaction that starts the new build.
+  // `resume` = «Продовжити збірку»: re-queue the step a stalled project waits for.
   const response = await factoryFetch(`/internal/businesses/${businessId}/builds`, {
     method: 'POST',
-    body: { fresh: Boolean(options.fresh) },
+    body: { fresh: Boolean(options.fresh), resume: Boolean(options.resume) },
   });
   if (!response.ok) {
     return { ok: false, message: response.message || 'Фабрика не запустила збірку.' };

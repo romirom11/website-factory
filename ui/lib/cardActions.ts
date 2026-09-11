@@ -21,7 +21,7 @@
  * the client component that performs it.
  */
 
-import type { BuildButtonState } from './buildPolicy';
+import { isActiveJobStatus, type BuildButtonState } from './buildPolicy';
 import type { SocialsButtonState } from './socials';
 import { reviewAsk } from './humanStatus';
 
@@ -44,7 +44,8 @@ export type CardActionKind = 'primary' | 'secondary' | 'danger' | 'link';
  * `build-review`); the rest are plain navigation.
  */
 export type CardActionRun =
-  | { run: 'build' }
+  /** `fresh` = «Побудувати заново», `resume` = «Продовжити збірку», none = «Побудувати демо». */
+  | { run: 'build'; mode?: 'fresh' | 'resume' }
   | { run: 'socials' }
   | { run: 'business-review'; decision: 'recollect_facts' | 'close' }
   | { run: 'href'; href: string; external?: boolean };
@@ -103,7 +104,21 @@ export interface CardActionInput {
    * «Де моя увага треба?» — на картці, що чекала рішення по фактчеку).
    */
   statusReason: string | null | undefined;
+  /**
+   * Status of the newest build-chain step (content-and-design / build-site /
+   * visual-qa / deploy-demo). `build.availability` alone cannot tell a build in
+   * motion from one that stopped without a successor: both leave the project
+   * row in `building`/`qa`, and the policy calls both «busy».
+   */
+  buildJobStatus?: string | null;
 }
+
+/** What a stalled project is waiting for, in Roman's words. */
+const RESUME_STEP: Record<string, string> = {
+  building: 'збірка сайту',
+  qa: 'перевірка критиком',
+  ready: 'публікація',
+};
 
 /**
  * Is this `needs_review` specifically the stage-8 fact-check saying no?
@@ -175,6 +190,7 @@ export function cardActionBar(input: CardActionInput): CardActionBar {
       waiting: null,
       actions: [{
         run: 'build',
+        mode: 'fresh',
         label: 'Побудувати заново',
         kind: 'primary',
         hint: build.hint,
@@ -193,6 +209,33 @@ export function cardActionBar(input: CardActionInput): CardActionBar {
 
   // ── the factory is mid-flight; nothing to press, only something to know ───
   if (status === 'site_in_progress' || isBusyProject(projectState)) {
+    // A step that is queued/running/paused is a build in motion. Anything else
+    // — the newest step skipped, failed, finished with no successor, or no step
+    // at all — is a build that stopped without saying so: the project row still
+    // reads `qa`/`building`, but nothing will ever move it. That is the state
+    // that showed «перевіряє критик» over a dead chain for a week (BEAUTIFY
+    // Laser, 2026-09-05..11). Offer the two ways out instead of a sentence.
+    if (!isActiveJobStatus(input.buildJobStatus)) {
+      const step = projectId && projectState ? RESUME_STEP[projectState] : undefined;
+      const actions: CardAction[] = [];
+      if (step) {
+        actions.push({
+          run: 'build', mode: 'resume', label: 'Продовжити збірку', kind: 'primary',
+          hint: `Фабрика продовжить з кроку «${step}» — без нового дизайну.`,
+        });
+      }
+      actions.push({
+        run: 'build', mode: 'fresh', label: 'Побудувати заново', kind: step ? 'secondary' : 'primary',
+        hint: 'Усе з нуля, від дизайну. Це займає близько години.',
+      });
+      return {
+        waiting: null,
+        hint: step
+          ? `Крок збірки обірвався, а наступний не стартував. Далі мала йти ${step}.`
+          : 'Збірка обірвалась без кроку, що йде.',
+        actions,
+      };
+    }
     return {
       waiting: projectState === 'qa'
         ? 'Демо зібране, зараз його перевіряє критик. Коли закінчить — тут з’явиться рішення.'

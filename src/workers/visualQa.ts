@@ -131,10 +131,21 @@ page Roman will reject.
 
 CONTRACT VERDICTS — when the payload carries \`motionContract\`, fill \`mechanicVerdicts\`:
 one entry per promised mechanic and per sceneMap scene (named "scene:<section>"), verdict
-implemented / partial / absent, with the FRAME that proves it as evidence. This is the check
-that separates a motion site from a page with entrance effects: a promised scrub or pin you
-cannot see across the scroll frames is absent, whatever the code claims. Code turns every
-\`absent\` into a high-severity issue automatically — do not also duplicate it in \`issues\`.
+implemented / partial / absent / unobservable, with the FRAME that proves it as evidence. This
+is the check that separates a motion site from a page with entrance effects: a promised scrub
+or pin you cannot see across the scroll frames is absent, whatever the code claims. Code turns
+every \`absent\` into a high-severity issue automatically — do not also duplicate it in \`issues\`.
+Judge only what these frames CAN show:
+- A mechanic that needs a cursor — hover, focus, press, drag — is \`unobservable\`. The frames
+  have no cursor. Never mark it partial or absent for "no hover state is visible"; that is
+  the method, not the page.
+- \`scrollArrivalPixelDeltas_perDepth\` (20/40/60/80/100%) is measured motion between arrival
+  and the 450ms frame. A depth at or above 0.01 DID animate on arrival even though its frame
+  shows the settled result — an arrival mechanic shorter than 450ms is complete by then by
+  design. Grade the settled composition; never call a scene partial because the frame did not
+  catch it mid-travel.
+- Reserve \`absent\` for what the frames disprove: a scene whose promised layout is not
+  there, a pin or scrub whose consecutive depths show no change, a sticky element that is not.
 
 REFERENCE COMPARISON — fill \`referenceComparison\`: \`closeness\` 0-10 for how near our page gets
 to the reference's level of craft, and \`gap\` naming the single most important thing the
@@ -839,7 +850,9 @@ export async function runVisualCritique(opts: {
               sceneMap: opts.contract.sceneMap,
               note: 'Fill mechanicVerdicts with ONE entry per mechanic above and per sceneMap scene '
                 + '(name scenes as "scene:<section>"). Judge from the motion frames; an entry you '
-                + 'cannot point at a frame for is absent, not implemented.',
+                + 'cannot point at a frame for is absent, not implemented — EXCEPT cursor-driven '
+                + 'mechanics (hover/focus/press/drag), which are unobservable here, and arrival '
+                + 'mechanics at a depth whose measured delta is >= 0.01, which happened before the frame.',
             }
           : null,
         deterministicMotionSignals: opts.motion
@@ -1109,7 +1122,10 @@ export async function visualQaHandler(payload: JobPayload): Promise<void> {
       // The contract check (MOTION-PLAN phase 4): every promised mechanic or
       // scene the critic could not SEE becomes a named, actionable issue.
       for (const v of critique.mechanicVerdicts ?? []) {
-        if (v.verdict === 'implemented') continue;
+        // `unobservable` is the honest answer for hover/focus mechanics: the
+        // frames carry no cursor, and three QA rounds were spent «finishing» a
+        // tile hover nobody could ever see (BEAUTIFY Laser, 2026-09-11).
+        if (v.verdict === 'implemented' || v.verdict === 'unobservable') continue;
         issues.push({
           severity: v.verdict === 'absent' ? 'high' : 'medium',
           category: 'wow', viewport: 'all',

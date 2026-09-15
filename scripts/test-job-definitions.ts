@@ -100,10 +100,11 @@ await check('unknown jobs and duplicate registry entries fail closed', () => {
 });
 
 await check('operator requeue choices come from the registry', () => {
+  // The demo chain is deliberately absent: its steps carry a project and an
+  // iteration, and the business card starts them with the right ones.
   const expected = [
     'enrich', 'enrich-socials', 'refresh-brand', 'collect-assets', 'audit-website',
-    'score-and-qa', 'readiness-gate', 'content-and-design', 'build-site',
-    'visual-qa', 'deploy-demo', 'request-approval',
+    'score-and-qa', 'readiness-gate', 'request-approval',
   ];
   assert.deepEqual([...MANUAL_REQUEUE_JOB_NAMES], expected);
 });

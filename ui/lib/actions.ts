@@ -24,7 +24,7 @@ import { humanStatus, reviewAsk } from './humanStatus';
 import { stageName } from './stageNames';
 import type { ActionResult } from './types';
 import { retryFailedJob, stopFailedBuild } from './buildFailureDecision';
-import { isJobName } from '@factory/jobDefinitions';
+import { isJobName, MANUAL_REQUEUE_JOB_NAMES } from '@factory/jobDefinitions';
 import { isBusinessStatus } from '@factory/businessStatus';
 import { operatorTransition } from './businessTransitions';
 import { factoryFetch } from './factoryApi';
@@ -251,6 +251,9 @@ export async function reenqueueStage(formData: FormData): Promise<ActionResult> 
   const businessId = String(formData.get('businessId') ?? '');
   const requestedJob = String(formData.get('job') ?? '');
   if (!businessId || !isJobName(requestedJob)) return { ok: false, message: 'Не вибрано коректний крок' };
+  if (!(MANUAL_REQUEUE_JOB_NAMES as readonly string[]).includes(requestedJob)) {
+    return { ok: false, message: 'Кроки демо запускаються кнопками в шапці картки, не звідси.' };
+  }
   const job: JobName = requestedJob;
   const [biz] = await db.select().from(schema.businesses).where(eq(schema.businesses.id, businessId));
   if (!biz) return { ok: false, message: 'Бізнес не знайдено' };

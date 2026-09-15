@@ -9,6 +9,7 @@ import { runWithToast, toastResult } from '@/lib/toast';
 import {
   deployBuildAsIs, openBuildPreview, rejectBuild, requestAnotherIteration,
 } from '@/lib/buildReviewActions';
+import { startDemoBuild } from '@/lib/actions';
 
 /**
  * A demo the critic refused to pass after three tries.
@@ -66,6 +67,17 @@ export function BuildReviewCard({ item, showName = true, showDecision = true }: 
       onResult: (res) => { setResult(res); if (res.ok) setMode('idle'); },
     });
   });
+
+  const rebuild = () => {
+    if (!window.confirm(
+      `Побудувати демо для «${item.name}» заново?\n\n`
+      + 'Ця збірка і зауваження критика підуть в архів. Фабрика зробить новий '
+      + 'дизайн з нуля і збере сайт знову — це близько години.',
+    )) return;
+    startTransition(() => {
+      void runWithToast(() => startDemoBuild(item.businessId, { fresh: true }), { onResult: setResult });
+    });
+  };
 
   // Once an action has succeeded the item is gone from the pipeline's point of
   // view; showing its buttons again would invite a second click on a state that
@@ -169,13 +181,16 @@ export function BuildReviewCard({ item, showName = true, showDecision = true }: 
               >
                 Ще спроба
               </button>
+              <button type="button" className="btn-outline" onClick={rebuild} disabled={pending}>
+                Побудувати заново
+              </button>
               <button
                 type="button"
                 className="btn-danger ml-auto"
                 onClick={() => setMode('reject')}
                 disabled={pending}
               >
-                Відхилити
+                Відхилити бізнес
               </button>
             </div>
           )}

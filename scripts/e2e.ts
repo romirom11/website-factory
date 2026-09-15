@@ -846,10 +846,11 @@ async function checkFunnel(browser: import('playwright').Browser): Promise<void>
   const killProj = await createSiteProject(killBiz, 'needs_human_review', { qaIterations: 3 });
   await checking('«Відхилити» rejects with a reason', async () => {
     await page.goto(`${BASE}/businesses/${killBiz.id}`, { waitUntil: 'networkidle' });
-    await page.getByRole('button', { name: /^Відхилити$/ }).first().click();
+    await page.getByRole('button', { name: /^Відхилити бізнес$/ }).first().click();
     await page.waitForTimeout(300);
     await page.locator(`#hdr-rej-${killProj.projectId}`).fill('e2e відхилення');
-    await page.getByRole('button', { name: 'Відхилити бізнес' }).click();
+    // The confirm carries the same words; it is the one that appeared last.
+    await page.getByRole('button', { name: /^Відхилити бізнес$/ }).last().click();
     await page.waitForTimeout(2000);
 
     const biz = await sqlOne<{ status: string; status_reason: string }>(

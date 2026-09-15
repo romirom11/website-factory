@@ -126,6 +126,8 @@ export function OtherActionsDialog({ businessId, name, currentStatus, statuses }
             <p className="text-sm text-ink-soft">
               Ставить один крок конвеєра в чергу ще раз — у ту саму чергу, що й автоматичні.
               Результат перезапише те, що цей крок зробив минулого разу.
+              Кроків демо (дизайн, збірка, перевірка, публікація) тут нема: ними
+              керують кнопки в шапці картки.
             </p>
             <label className="block">
               <span className="label">Який крок</span>

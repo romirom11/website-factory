@@ -1,7 +1,16 @@
 'use client';
 
 /**
- * The three answers to "the critic refused this build", as header buttons.
+ * The four answers to "the critic refused this build", as header buttons.
+ *
+ *   Опублікувати як є   — overrule the critic, deploy this build.
+ *   Ще спроба           — one more fix pass IN THIS build, Roman's note first.
+ *   Побудувати заново   — throw this build away, new design from scratch.
+ *   Відхилити бізнес    — the lead is not worth a demo at all.
+ *
+ * The third did not exist: «reject» meant the business, so «I want to drop
+ * this iteration and just generate the site again» had no button and Roman
+ * was left in the «Інше…» dialog guessing which step to requeue (2026-09-15).
  *
  * The same three server actions the inbox card calls — one implementation of the
  * behaviour, two places it can be reached from. On the business card these live
@@ -17,9 +26,11 @@ import { useState, useTransition } from 'react';
 import type { ActionResult } from '@/lib/types';
 import { runWithToast } from '@/lib/toast';
 import { deployBuildAsIs, rejectBuild, requestAnotherIteration } from '@/lib/buildReviewActions';
+import { startDemoBuild } from '@/lib/actions';
 
-export function BuildDecisionActions({ projectId, name, onModeChange }: {
+export function BuildDecisionActions({ projectId, businessId, name, onModeChange }: {
   projectId: number;
+  businessId: string;
   name: string;
   /** Lets the band drop its general explanation while a form is open. */
   onModeChange?: (open: boolean) => void;
@@ -58,6 +69,17 @@ export function BuildDecisionActions({ projectId, name, onModeChange }: {
     });
   });
 
+  const rebuild = () => {
+    if (!window.confirm(
+      `Побудувати демо для «${name}» заново?\n\n`
+      + 'Ця збірка і зауваження критика підуть в архів. Фабрика зробить новий '
+      + 'дизайн з нуля і збере сайт знову — це близько години.',
+    )) return;
+    startTransition(() => {
+      void runWithToast(() => startDemoBuild(businessId, { fresh: true }), { onResult: setResult });
+    });
+  };
+
   if (done) {
     return <p role="status" className="text-sm text-accent py-2">{result?.message}</p>;
   }
@@ -77,13 +99,16 @@ export function BuildDecisionActions({ projectId, name, onModeChange }: {
           >
             Ще спроба
           </button>
+          <button type="button" className="btn-outline" onClick={rebuild} disabled={pending}>
+            Побудувати заново
+          </button>
           <button
             type="button"
             className="btn-danger"
             onClick={() => setMode('reject')}
             disabled={pending}
           >
-            Відхилити
+            Відхилити бізнес
           </button>
         </div>
       )}

@@ -183,6 +183,7 @@ export function CardActionBar({ bar, businessId, name, status, other }: {
               ? (
                 <BuildDecisionActions
                   projectId={bar.decision.projectId}
+                  businessId={businessId}
                   name={name}
                   onModeChange={setFormOpen}
                 />

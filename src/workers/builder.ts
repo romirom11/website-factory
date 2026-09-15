@@ -76,6 +76,17 @@ function provenanceIssues(report: ProvenanceReport): string[] {
     .map((f) => `provenance [${f.kind}] in ${f.file}: ${f.detail}`);
 }
 
+/**
+ * Fix round or fresh build? A fresh build never carries issues; a delivery with
+ * issues over an existing workspace is a fix whatever its counter says. The
+ * counter alone was the tell, and a human-ordered round that arrived with
+ * `iteration: 0` was rebuilt from the design with Roman's note unread
+ * (2026-09-15, job 580).
+ */
+export function isFixIteration(input: { iteration: number; issues: readonly string[]; hasWorkspace: boolean }): boolean {
+  return input.hasWorkspace && (input.iteration > 0 || input.issues.length > 0);
+}
+
 export async function buildSiteHandler(payload: JobPayload): Promise<void> {
   const startedAt = Date.now();
   const businessId = payload.businessId!;
@@ -87,7 +98,7 @@ export async function buildSiteHandler(payload: JobPayload): Promise<void> {
 
 
   const dir = workspaceDir(businessId, projectId);
-  const isFix = iteration > 0 && existsSync(path.join(dir, 'package.json'));
+  const isFix = isFixIteration({ iteration, issues, hasWorkspace: existsSync(path.join(dir, 'package.json')) });
 
   // The live trace Roman watches while this runs. Written into the workspace
   // itself, so `factory` (which serves the API) reads it off the shared

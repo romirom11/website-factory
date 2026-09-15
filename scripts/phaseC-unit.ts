@@ -16,6 +16,7 @@ import { checkProvenance } from '../src/build/provenance.js';
 import { isSiteWorthyAmenity } from '../src/workers/snapshot.js';
 import { KEN_BURNS_SUPERSAMPLE, kenBurnsFilter } from '../src/media/video.js';
 import { VisualCritiqueSchema } from '../src/build/schemas.js';
+import { isFixIteration } from '../src/workers/builder.js';
 import { unusableContactReason } from '../src/build/snapshot.js';
 import {
   WOW_FAIL_THRESHOLD, WOW_MAX, condenseNotes, parseMotionIndex,
@@ -705,6 +706,12 @@ for (const [name, worthy] of [
     filter.includes(`s=${1280 * KEN_BURNS_SUPERSAMPLE}x${720 * KEN_BURNS_SUPERSAMPLE}`)
     && filter.includes('scale=1280:720:flags=lanczos') && filter.endsWith('format=yuv420p'), filter);
 }
+
+// ── builder: a delivery with issues over an existing workspace is a fix ────
+check('iteration 0 with no issues is a fresh build', !isFixIteration({ iteration: 0, issues: [], hasWorkspace: false }));
+check('a numbered round over an existing workspace is a fix', isFixIteration({ iteration: 2, issues: ['[high/layout] x'], hasWorkspace: true }));
+check("Roman's note with iteration 0 over an existing workspace is still a fix", isFixIteration({ iteration: 0, issues: ['[high/roman] menu too big'], hasWorkspace: true }));
+check('no workspace is never a fix, whatever the counter says', !isFixIteration({ iteration: 3, issues: ['x'], hasWorkspace: false }));
 
 // ── critic: a cursor-driven mechanic is unobservable in frames ─────────────
 {

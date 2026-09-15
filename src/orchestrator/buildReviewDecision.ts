@@ -56,22 +56,25 @@ const DECISION_LABEL = {
 } as const;
 
 /**
- * QA-iteration counter a build restarted by Roman begins from.
+ * The job a claimed decision hands to the queue — pure, so a test can pin it.
  *
- * The transaction resets `site_projects.qa_iterations` to this and the
- * successor build-site carries it as `iteration`; visual-qa applies its verdict
- * only when the two agree (`where qa_iterations = iteration`). They did not —
- * the job said 1, the row said 0 — so the critic's verdict after Roman's «ще
- * одна ітерація» was skipped as stale and the build sat in `qa` with no step
- * to follow, showing «перевіряє критик» for a week (BEAUTIFY Laser,
- * 2026-09-05 00:16). One constant, used by both.
+ * «Ще одна ітерація» is a FIX round over the existing build, and its
+ * `iteration` is the project's own QA counter, untouched:
+ *
+ * - visual-qa applies its verdict only where `qa_iterations = iteration`. A
+ *   reset counter with a job that said 1 made the critic skip its verdict as
+ *   stale and left the build in `qa` for a week (2026-09-05).
+ * - the builder treats `iteration: 0` as a FRESH build from the design, so a
+ *   reset to 0 made it rebuild the page and ignore Roman's note entirely — the
+ *   note that was the whole point of the button (2026-09-15, job 580).
+ * - the counter is already at the QA cap when a build is parked, so after this
+ *   one round the critic either publishes or hands the build back to Roman —
+ *   one round, not three more.
  */
-export const ANOTHER_ITERATION_START = 0;
-
-/** The job a claimed decision hands to the queue — pure, so a test can pin it. */
 export function reviewSuccessorJob(
   input: BuildReviewDecisionInput,
   businessId: string,
+  qaIterations: number,
 ): {
   name: 'deploy-demo' | 'build-site';
   idempotencyKey: string;
@@ -89,7 +92,7 @@ export function reviewSuccessorJob(
     idempotencyKey: `build-site:${businessId}:${input.projectId}:roman:${Date.now()}`,
     data: {
       projectId: input.projectId,
-      iteration: ANOTHER_ITERATION_START,
+      iteration: Math.max(1, qaIterations),
       issues: [`[high/roman] ${input.instruction?.trim() || input.reason}`],
     },
   };
@@ -124,6 +127,7 @@ export async function executeBuildReviewDecision(
 
   const [project] = await db.select({
     businessId: schema.siteProjects.businessId,
+    qaIterations: schema.siteProjects.qaIterations,
   }).from(schema.siteProjects)
     .where(eq(schema.siteProjects.id, input.projectId));
   if (!project) return { kind: 'conflict', message: 'Збірку не знайдено.' };
@@ -136,7 +140,7 @@ export async function executeBuildReviewDecision(
   const transitions = new BusinessTransitionService(db);
   let claimed: Extract<BuildReviewDecisionResult, { kind: 'claimed' }> | undefined;
   try {
-    const job = reviewSuccessorJob(input, project.businessId);
+    const job = reviewSuccessorJob(input, project.businessId, project.qaIterations ?? 0);
     const enqueueResult = await enqueueWithMutation(
       job.name,
       {
@@ -194,10 +198,8 @@ async function claimBuildReviewDecisionInTransaction(
   }
 
   const [projectClaim] = await tx.update(schema.siteProjects)
-    .set({
-      state: PROJECT_TARGET[input.decision],
-      ...(input.decision === 'another_iteration' ? { qaIterations: ANOTHER_ITERATION_START } : {}),
-    })
+    // The QA counter is deliberately left alone: see reviewSuccessorJob.
+    .set({ state: PROJECT_TARGET[input.decision] })
     .where(and(
       eq(schema.siteProjects.id, input.projectId),
       eq(schema.siteProjects.state, 'needs_human_review'),

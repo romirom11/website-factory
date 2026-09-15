@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import { asc, eq } from 'drizzle-orm';
 import * as schema from '../src/db/schema.js';
 import {
-  ANOTHER_ITERATION_START,
   claimBuildReviewDecision,
   parkBuildForHumanReview,
   reviewSuccessorJob,
@@ -85,7 +84,7 @@ await withDisposableFactoryDatabase(async ({ db }) => {
     assert.deepEqual(history.map((row) => row.toStatus), ['needs_review', 'site_in_progress']);
   });
 
-  await check('another iteration resets the QA counter to what its build-site job carries', async () => {
+  await check('another iteration is a fix round that keeps the QA counter and hands it to its job', async () => {
     const businessId = 'another-iteration';
     const projectId = await fixture(businessId);
     await db.update(schema.siteProjects).set({ qaIterations: 3 })
@@ -99,13 +98,15 @@ await withDisposableFactoryDatabase(async ({ db }) => {
     const [project] = await db.select().from(schema.siteProjects)
       .where(eq(schema.siteProjects.id, projectId));
     assert.equal(project?.state, 'building');
-    assert.equal(project?.qaIterations, ANOTHER_ITERATION_START);
-    const job = reviewSuccessorJob(input, businessId);
+    assert.equal(project?.qaIterations, 3, 'the counter is not reset: one round, then back to Roman');
+    const job = reviewSuccessorJob(input, businessId, project?.qaIterations ?? 0);
     assert.equal(job.name, 'build-site');
-    // visual-qa applies its verdict only when the two agree (2026-09-05 regression).
+    // visual-qa applies its verdict only when the two agree (2026-09-05 regression),
+    // and the builder treats 0 as a fresh build that ignores the note (2026-09-15).
     assert.equal(job.data.iteration, project?.qaIterations);
+    assert.ok((job.data.iteration ?? 0) > 0);
     assert.deepEqual(job.data.issues, ['[high/roman] hero shakes']);
-    assert.equal(reviewSuccessorJob({ ...input, decision: 'deploy_as_is' }, businessId).name, 'deploy-demo');
+    assert.equal(reviewSuccessorJob({ ...input, decision: 'deploy_as_is' }, businessId, 3).name, 'deploy-demo');
   });
 
   await check('concurrent operator buttons have exactly one consistent winner', async () => {

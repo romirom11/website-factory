@@ -21,7 +21,10 @@ services:
       retries: 20
 
   minio:
-    image: minio/minio:latest
+    # quay.io, pinned: Docker Hub stopped serving minio/minio (pull denied,
+    # 2026-09-15) and every deploy died on the pull. This is the exact release
+    # the production volume already runs, so no data migration is involved.
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:

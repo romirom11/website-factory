@@ -204,6 +204,11 @@ services:
       RUNNER_API_KEY: ${RUNNER_API_KEY:?RUNNER_API_KEY must be set for remote agent execution}
       EXECUTOR_API_KEY: ${RUNNER_EXECUTOR_API_KEY:?RUNNER_EXECUTOR_API_KEY must be set for the private executor hop}
       RUNNER_EXECUTOR_URL: http://agent-runner-executor:8791
+      # The live build terminal (ttyd in the executor) is reachable ONLY through
+      # this gateway: the console's reverse proxy cannot see the runner networks.
+      # Point the console's `/terminal` route (Dokploy domain, or any proxy) at
+      # THIS service, port 8790 — never at the executor or factory-build.
+      RUNNER_TERMINAL_URL: http://agent-runner-executor:${BUILD_TERMINAL_PORT:-7681}
       RUNNER_SITES_ROOT: /app/sites
       RUNNER_INPUTS_ROOT: /app/agent-inputs
       RUNNER_WORK_ROOT: /app/runner-work

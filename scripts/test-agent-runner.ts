@@ -7,7 +7,9 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { createServer as createHttpServer } from 'node:http';
+import { connect as netConnect } from 'node:net';
 import { existsSync } from 'node:fs';
 import {
   appendFile,
@@ -70,7 +72,7 @@ const {
 } = await import('../src/runner/workspace.js');
 const { Hono } = await import('hono');
 const { serve } = await import('@hono/node-server');
-const { createGatewayApp } = await import('../src/runner/gateway.js');
+const { createGatewayApp, attachTerminalProxy } = await import('../src/runner/gateway.js');
 const { createExecutorApp } = await import('../src/runner/executor.js');
 const { remoteAgentTransport } = await import('../src/agents/remoteTransport.js');
 const {
@@ -487,6 +489,86 @@ try {
   const gateway = await listen(createGatewayApp());
   gatewayServer = gateway.server;
   process.env.RUNNER_GATEWAY_URL = gateway.url;
+  attachTerminalProxy(gateway.server as import('node:http').Server);
+
+  // ── the build terminal rides through the gateway ─────────────────────────
+  // A stand-in ttyd: the page and token over HTTP, and an echoing WebSocket.
+  const seenAuth: string[] = [];
+  const fakeTtyd = createHttpServer((req, res) => {
+    seenAuth.push(req.headers.authorization ?? '');
+    if (req.url === '/terminal/token') { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"token":""}'); return; }
+    if (req.url?.startsWith('/terminal')) { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<title>ttyd</title>'); return; }
+    res.writeHead(404); res.end();
+  });
+  const ttydSockets = new Set<import('node:stream').Duplex>();
+  fakeTtyd.on('upgrade', (req, socket, head) => {
+    ttydSockets.add(socket);
+    socket.on('close', () => ttydSockets.delete(socket));
+    const key = String(req.headers['sec-websocket-key'] ?? '');
+    const accept = createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: ${accept}\r\n\r\n`);
+    if (head.length) socket.write(head);
+    socket.on('data', (chunk) => socket.write(chunk));
+  });
+  await new Promise<void>((resolve) => fakeTtyd.listen(0, '127.0.0.1', resolve));
+  const ttydPort = (fakeTtyd.address() as { port: number }).port;
+  process.env.RUNNER_TERMINAL_URL = `http://127.0.0.1:${ttydPort}`;
+  const gatewayPort = Number(new URL(gateway.url).port);
+
+  await check('gateway proxies the build terminal page with its basic-auth header intact', async () => {
+    const page = await fetch(`${gateway.url}/terminal/`, { headers: { authorization: 'Basic cm9tYW46eA==' } });
+    assert.equal(page.status, 200);
+    assert.match(await page.text(), /ttyd/);
+    assert.equal(seenAuth.at(-1), 'Basic cm9tYW46eA==');
+    const token = await fetch(`${gateway.url}/terminal/token`);
+    assert.equal(token.status, 200);
+    assert.equal(token.headers.get('content-type'), 'application/json');
+  });
+
+  await check('gateway carries the terminal WebSocket upgrade and both directions of traffic', async () => {
+    const socket = netConnect({ host: '127.0.0.1', port: gatewayPort });
+    await once(socket, 'connect');
+    socket.write('GET /terminal/ws HTTP/1.1\r\nhost: gateway\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n');
+    let received = '';
+    const until = (marker: string) => new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`no «${marker}» in: ${received}`)), 5_000);
+      const onData = (chunk: Buffer) => {
+        received += chunk.toString('utf8');
+        if (received.includes(marker)) { clearTimeout(timer); socket.off('data', onData); resolve(); }
+      };
+      socket.on('data', onData);
+      if (received.includes(marker)) { clearTimeout(timer); socket.off('data', onData); resolve(); }
+    });
+    await until('101 Switching Protocols');
+    assert.match(received, /sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK\+xOo=/);
+    socket.write('ping-through-gateway');
+    await until('ping-through-gateway');
+    socket.destroy();
+  });
+
+  await check('gateway closes upgrades outside /terminal and answers 502 when ttyd is down', async () => {
+    const other = netConnect({ host: '127.0.0.1', port: gatewayPort });
+    await once(other, 'connect');
+    other.write('GET /v1/executions HTTP/1.1\r\nhost: gateway\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n');
+    let seen = '';
+    other.on('data', (chunk: Buffer) => { seen += chunk.toString('utf8'); });
+    const ended = await Promise.race([
+      new Promise<string>((resolve) => { other.once('close', () => resolve('closed')); other.once('end', () => resolve('closed')); }),
+      new Promise<string>((resolve) => setTimeout(() => resolve('still open'), 5_000)),
+    ]);
+    other.destroy();
+    assert.equal(ended, 'closed', `gateway kept a foreign upgrade open; received: ${seen}`);
+    assert.equal(seen.includes('101'), false);
+
+    // An upgraded socket is no longer an HTTP connection to Node, so
+    // closeAllConnections() leaves it and close() would wait forever.
+    for (const upgraded of ttydSockets) upgraded.destroy();
+    fakeTtyd.closeAllConnections();
+    await new Promise<void>((resolve) => fakeTtyd.close(() => resolve()));
+    const down = await fetch(`${gateway.url}/terminal/`);
+    assert.equal(down.status, 502);
+    assert.match(await down.text(), /not running/);
+  });
 
   const gatewayPost = async (body: unknown, key = process.env.RUNNER_API_KEY ?? ''): Promise<Response> =>
     fetch(`${gateway.url}/v1/executions`, {

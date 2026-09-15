@@ -4,7 +4,10 @@
  */
 import { createHash } from 'node:crypto';
 import { mkdir, stat, utimes } from 'node:fs/promises';
+import { request as httpRequest, type IncomingMessage, type Server } from 'node:http';
+import { connect as netConnect } from 'node:net';
 import path from 'node:path';
+import { Readable, type Duplex } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import { Hono, type Context } from 'hono';
 import { serve } from '@hono/node-server';
@@ -276,8 +279,109 @@ async function runThroughGateway(request: ExecutionRequest): Promise<ExecutionRe
   return promise;
 }
 
+// ─── build terminal proxy ─────────────────────────────────────────────────────
+//
+// ttyd serves the live build session inside `agent-runner-executor`, which by
+// design sits only on the private runner networks — the reverse proxy in front
+// of the console cannot reach it, and pointing a route straight at the executor
+// answered 502 for weeks (the route on the server still named `factory-build`,
+// where ttyd lived before the runner split). This gateway already stands on
+// both sides, so it carries `/terminal` across: plain HTTP for ttyd's page and
+// token, and the WebSocket upgrade for the terminal itself. No gateway
+// credential here on purpose — a browser cannot send one — ttyd's own basic
+// auth (login `roman`, derived password) stays the lock, exactly as before.
+
+const TERMINAL_PREFIX = '/terminal';
+/** Hop-by-hop headers never cross a proxy; `host` is rewritten for the upstream. */
+const HOP_BY_HOP = new Set([
+  'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+  'te', 'trailer', 'transfer-encoding', 'upgrade', 'host',
+]);
+
+/** Where ttyd lives: the executor host on the terminal port unless configured. */
+export function terminalUpstream(): URL {
+  const configured = process.env.RUNNER_TERMINAL_URL;
+  if (configured) return new URL(configured);
+  const upstream = new URL(process.env.RUNNER_EXECUTOR_URL ?? 'http://agent-runner-executor:8791');
+  upstream.port = process.env.BUILD_TERMINAL_PORT ?? '7681';
+  return upstream;
+}
+
+export function isTerminalPath(pathname: string): boolean {
+  return pathname === TERMINAL_PREFIX || pathname.startsWith(`${TERMINAL_PREFIX}/`);
+}
+
+function proxyTerminalHttp(c: Context): Promise<Response> {
+  const upstream = terminalUpstream();
+  const incoming = new URL(c.req.url);
+  const headers: Record<string, string> = {};
+  c.req.raw.headers.forEach((value, key) => { if (!HOP_BY_HOP.has(key)) headers[key] = value; });
+  headers.host = upstream.host;
+  return new Promise((resolve) => {
+    const req = httpRequest({
+      host: upstream.hostname,
+      port: Number(upstream.port || 80),
+      method: c.req.method,
+      path: `${incoming.pathname}${incoming.search}`,
+      headers,
+      timeout: 30_000,
+    }, (res) => {
+      const out = new Headers();
+      for (const [key, value] of Object.entries(res.headers)) {
+        if (HOP_BY_HOP.has(key) || value === undefined) continue;
+        for (const item of Array.isArray(value) ? value : [value]) out.append(key, item);
+      }
+      const bodiless = c.req.method === 'HEAD' || res.statusCode === 204 || res.statusCode === 304;
+      resolve(new Response(
+        bodiless ? null : Readable.toWeb(res) as ReadableStream,
+        { status: res.statusCode ?? 502, headers: out },
+      ));
+    });
+    req.on('timeout', () => req.destroy(new Error('terminal upstream timed out')));
+    req.on('error', () => resolve(new Response('build terminal is not running', { status: 502 })));
+    const body = c.req.raw.body;
+    if (body && c.req.method !== 'GET' && c.req.method !== 'HEAD') {
+      Readable.fromWeb(body as import('node:stream/web').ReadableStream).pipe(req);
+    } else {
+      req.end();
+    }
+  });
+}
+
+/**
+ * Carry WebSocket upgrades under `/terminal` to ttyd. Hono's fetch handler never
+ * sees an `upgrade`, so this sits on the Node server itself: the original
+ * request head is replayed to the upstream and the two sockets are piped.
+ * Any other upgrade path is closed — the gateway speaks WebSocket for ttyd only.
+ */
+export function attachTerminalProxy(server: Server): Server {
+  server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+    const pathname = (req.url ?? '/').split('?')[0] ?? '/';
+    if (!isTerminalPath(pathname)) { socket.destroy(); return; }
+    const upstream = terminalUpstream();
+    const target = netConnect({ host: upstream.hostname, port: Number(upstream.port || 80) }, () => {
+      const lines = [`${req.method ?? 'GET'} ${req.url ?? '/'} HTTP/1.1`, `host: ${upstream.host}`];
+      for (const [key, value] of Object.entries(req.headers)) {
+        if (key === 'host' || value === undefined) continue;
+        for (const item of Array.isArray(value) ? value : [value]) lines.push(`${key}: ${item}`);
+      }
+      target.write(`${lines.join('\r\n')}\r\n\r\n`);
+      if (head.length) target.write(head);
+      socket.pipe(target).pipe(socket);
+    });
+    target.on('error', () => {
+      socket.end('HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\n\r\nbuild terminal is not running');
+    });
+    socket.on('error', () => target.destroy());
+    socket.on('close', () => target.destroy());
+  });
+  return server;
+}
+
 export function createGatewayApp(): Hono {
   const app = new Hono();
+  app.all(TERMINAL_PREFIX, proxyTerminalHttp);
+  app.all(`${TERMINAL_PREFIX}/*`, proxyTerminalHttp);
   app.get('/health', async (c) => {
     const executorUrl = (process.env.RUNNER_EXECUTOR_URL ?? 'http://agent-runner-executor:8791').replace(/\/+$/, '');
     const executor = await fetch(`${executorUrl}/health`, { signal: AbortSignal.timeout(2_000) })
@@ -403,7 +507,7 @@ function requestIdFrom(c: Context): string {
 export async function startGateway(): Promise<void> {
   const removed = await pruneRunnerWork().catch(() => 0);
   const port = Number(process.env.RUNNER_GATEWAY_PORT ?? 8790);
-  serve({ fetch: createGatewayApp().fetch, port, hostname: '0.0.0.0' });
+  attachTerminalProxy(serve({ fetch: createGatewayApp().fetch, port, hostname: '0.0.0.0' }) as Server);
   const cleanup = setInterval(() => {
     void pruneRunnerWork(undefined, undefined, new Set(inFlight.keys()));
   }, 6 * 60 * 60_000);

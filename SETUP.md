@@ -148,14 +148,18 @@ BUILD_TERMINAL_BASE_URL=http://<host-або-tailscale-імʼя>:7681
 «з браузера» означає: через Tailscale, SSH-тунель (`ssh -L 7681:localhost:7681
 <host>`) або той самий authenticated reverse-proxy, що й UI.
 
-**Як це налаштовано на бойовому сервері (2026-08-22):** Dokploy сам не вміє
-додати path-маршрут на compose-сервіс, тому маршрут заведений РУЧНИМ файлом
-`/etc/dokploy/traefik/dynamic/website-factory-terminal-custom.yml` —
-`Host(website-factory.kdnx.cloud) && PathPrefix(/terminal)` →
-`http://agent-runner-executor:7681`, priority 100 (вище за Host-only роутер UI).
-Traefik підхоплює зміни файлу без рестарту; Dokploy цей файл не генерує і не
-чіпає. При переїзді сервера файл треба перенести або створити заново, а в
-«Адресі термінала збірки» стоїть `https://website-factory.kdnx.cloud/terminal`.
+**Як це налаштовано на бойовому сервері (2026-09-15):** ttyd живе в
+`agent-runner-executor`, який навмисно стоїть лише у приватних runner-мережах —
+reverse proxy консолі його не бачить. Тому `/terminal` проксіює
+`agent-runner-gateway` (порт 8790): звичайний HTTP для сторінки і токена ttyd та
+WebSocket-upgrade для самого термінала (`attachTerminalProxy` у
+`src/runner/gateway.ts`). Маршрут заводиться як звичайний **Dokploy-домен на
+compose-сервіс**: `website-factory.kdnx.cloud`, шлях `/terminal`, сервіс
+`agent-runner-gateway`, порт `8790`. Dokploy сам додає traefik-labels і підключає
+gateway до `dokploy-network`. Ручного traefik-файлу більше не потрібно (старий
+`/etc/dokploy/traefik/dynamic/website-factory-terminal-custom.yml` вказував на
+`factory-build:7681`, де ttyd не живе з 24.08 — звідси тижні 502). У «Адресі
+термінала збірки» стоїть `https://website-factory.kdnx.cloud/terminal`.
 Памʼятай: ttyd живе лише під час активної збірки — поза нею `/terminal`
 відповідає 502/504, і це норма, а не зламаний маршрут. Пароль — basic auth,
 логін `roman`, пароль **похідний** від приватного `RUNNER_EXECUTOR_API_KEY`;

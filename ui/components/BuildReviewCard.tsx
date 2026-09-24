@@ -141,7 +141,7 @@ export function BuildReviewCard({ item, showName = true, showDecision = true }: 
         {item.openIssues.length > 0 && (
           <details className="mt-5">
             <summary className="disclosure">
-              Що не сподобалось критику ({item.openIssues.length})
+              Що ще можна поліпшити ({item.openIssues.length})
             </summary>
             <ul className="mt-3 space-y-2.5 max-w-[70ch]">
               {item.openIssues.map((issue, i) => (

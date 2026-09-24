@@ -163,7 +163,7 @@ Google Places API не використовується: ні як основн�
 | 8 | Production-readiness gate | код | qualified ≠ production_ready; gaps: identity, verified contact, 3+ послуги, 3+ assets, hero/logo, review context |
 | 9 | Content brief + design | structured calls | brief тільки з verified фактів; 3 структурно різні art directions; рубрика обирає |
 | 10 | Site build | **code agent** у workspace | Next.js static export; `pnpm build` зелений; факти тільки зі snapshot |
-| 11 | Visual QA loop | Playwright + multimodal critique | 390/768/1440, overflow, console, битi assets, наявність контакту; issues → назад у workspace агента; ліміт 3 ітерації → needs_human_review |
+| 11 | Visual QA loop | Playwright + multimodal critique | 390/768/1440, overflow, console, битi assets, наявність контакту; issues → назад у workspace агента; ліміт 1 ітерація (`MAX_QA_ITERATIONS`) → **публікація як є** з рештою зауважень у картці; блокують лише детерміновані дефекти (контакт/noindex/placeholder/provenance) → needs_human (рішення №14) |
 | 12 | Private deploy | код | неугадуваний URL, noindex, health check; публічний домен клієнта не створюється |
 | 13 | Approval | Web UI: approval-черга (+ Telegram-пуш з лінком) | без записаного в БД Approve send неможливий технічно |
 | 14 | Outreach | канальні адаптери | пріоритет: живі канали перед поштою. WhatsApp (WAHA, авто) → Instagram (картка) → Viber (картка) → email (Gmail, авто, fallback); рівно один send на idempotency key |
@@ -254,6 +254,18 @@ pay-per-token білінгу; вичерпані ліміти підписки �
 11. **Дизайн-стек:** готові компоненти (Aceternity + Magic UI в шаблоні) + офіційні GSAP skills + куровані референси на нішу. Кастомні дизайн-skills не пишемо. (Розділ 2.4.)
 12. **Відео: авто Ken Burns + ручний wow-кліп** (змінено 2026-08-22; було: FlowKit/Chrome-міст — видалено, бо кожен міст до Flow потребує живого Chrome поза датацентром, а на маку Роман нічого не тримає). Базово — ffmpeg Ken Burns з реального фото; wow — відео-бриф на картці бізнесу, Роман генерує і завантажує mp4, наступна збірка підхоплює. Без pay-per-use відео-API. (Розділ 2.5.)
 13. **Зображення через gen-image skill Романа** (Codex CLI, gpt-image-2, підписка ChatGPT): декор/фони/патерни/og-images з позначкою `ai_generated`; ніколи не замінюють реальні фото бізнесу. (Розділ 2.5.)
+14. **Критик дорадчий, людський гейт один** (2026-09-24). Було: після
+`MAX_QA_ITERATIONS` збірка паркувалась у `needs_human_review`, і Роман
+вирішував «опублікувати як є / ще спроба / відхилити». На практиці це
+подвоювало гейт (демо він і так дивиться перед відправкою), множило картки у
+Вхідних і коштувало 2–4 години на бізнес. Тепер: один автоматичний раунд
+критика (`MAX_QA_ITERATIONS=1`, назад білдеру йдуть лише `high`), після нього
+демо **публікується як є**, решта зауважень лишається в картці згорнутим
+списком. Публікацію блокують лише детерміновані дефекти (нема контакту,
+нема noindex, placeholder-текст, вигадані факти/чужі файли) — тоді крок стає
+`needs_human` з кнопкою «Побудувати заново». Правки після публікації — кнопка
+«Виправити демо» (слова Романа → раунд виправлення → повторна публікація на
+ту саму адресу). Єдине рішення людини у флоу демо — approval перед відправкою.
 
 ---
 

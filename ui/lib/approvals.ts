@@ -105,6 +105,14 @@ export async function loadApprovalQueue(): Promise<ApprovalItem[]> {
     ) continue;
     // Approved with no row yet is still in flight, so keep it visible too.
 
+    // A pending approval whose business went BACK into the build flow — Roman
+    // pressed «Виправити демо» or «Побудувати заново» — is not a decision
+    // right now: the demo it describes is being replaced. It returns on its
+    // own once the republish lands the business in site_ready again. Without
+    // this, one business showed «Демо готове — чекає на твоє слово» next to
+    // the card of the very build replacing it (2026-09-24).
+    if (a.decision === null && ['site_in_progress', 'needs_review'].includes(biz.status)) continue;
+
     const audit = auditBy.get(a.businessId);
     const project = projectBy.get(a.businessId);
     const channel: string | null = draft.channel ?? null;

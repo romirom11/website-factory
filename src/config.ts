@@ -370,7 +370,7 @@ export const config = {
     get terminalWritable(): boolean { return getSettingBool('BUILD_TERMINAL_WRITABLE', false); },
     /** Critic issues at or above this severity are fed back to the builder. */
     get qaFeedbackSeverity(): 'low' | 'medium' | 'high' {
-      return (process.env.QA_FEEDBACK_SEVERITY ?? 'medium') as 'low' | 'medium' | 'high';
+      return (process.env.QA_FEEDBACK_SEVERITY ?? 'high') as 'low' | 'medium' | 'high';
     },
   },
   /** dry_run simulates every send; live actually contacts businesses. UI-switchable. */
@@ -379,7 +379,8 @@ export const config = {
   },
   get dashboardPort(): number { return Number(process.env.DASHBOARD_PORT ?? 8787); },
   get demoPort(): number { return Number(process.env.DEMO_PORT ?? 8788); },
-  get maxQaIterations(): number { return Number(process.env.MAX_QA_ITERATIONS ?? 3); },
+  /** Automatic critic rounds before the demo publishes as is (SPEC decision 14). */
+  get maxQaIterations(): number { return Number(process.env.MAX_QA_ITERATIONS ?? 1); },
   get followupDays(): number[] {
     return getSetting('FOLLOWUP_SCHEDULE_DAYS').split(',').map((s) => Number(s.trim())).filter(Number.isFinite);
   },

@@ -212,6 +212,40 @@ const HERO_SUSTAINED_PIXEL_THRESHOLD = 0.004;
 /** Per-pixel channel delta below which two frames are "the same pixel". */
 const PIXEL_NOISE_FLOOR = 12;
 
+/**
+ * Issue categories that may still BLOCK a publication once the critic's rounds
+ * are spent. Everything in `content` is deterministic and factual — a page
+ * with no real contact, no noindex, placeholder copy or a fabricated detail
+ * must not go out under the business's name. Taste (layout, wow, photo
+ * treatment, motion) never blocks: the critic is advisory (SPEC decision 14).
+ */
+export const HARD_QA_CATEGORIES: ReadonlySet<string> = new Set(['content']);
+
+export type QaVerdict =
+  | { kind: 'iterate' }
+  | { kind: 'publish'; leftovers: number }
+  | { kind: 'fail'; hard: string[] };
+
+/**
+ * What happens after a QA pass with `blocking` issues left, given how many
+ * rounds have run. Pure, so the three outcomes are pinned by a unit test:
+ *
+ *   iterate — rounds remain: the issues go back to the builder;
+ *   publish — rounds are spent and nothing hard remains: ship as is, the
+ *             leftovers stay visible in the card;
+ *   fail    — rounds are spent and a hard defect remains: needs a person.
+ */
+export function qaVerdict(input: {
+  iteration: number;
+  cap: number;
+  blocking: ReadonlyArray<{ category: string; issue: string }>;
+}): QaVerdict {
+  if (input.iteration + 1 < input.cap) return { kind: 'iterate' };
+  const hard = input.blocking.filter((i) => HARD_QA_CATEGORIES.has(i.category)).map((i) => i.issue);
+  if (hard.length) return { kind: 'fail', hard };
+  return { kind: 'publish', leftovers: input.blocking.length };
+}
+
 export interface MotionEvidence {
   /** Frames handed to the critic, in capture order. */
   frames: Array<{ name: string; buf: Buffer; caption: string }>;
@@ -1277,44 +1311,65 @@ export async function visualQaHandler(payload: JobPayload): Promise<void> {
     return;
   }
 
-  // Phase 5 (MOTION-PLAN): a page whose ONLY remaining blockers are motion/wow
-  // gets one extra round — those fixes are small, targeted and cheap compared
-  // to parking a finished layout on Roman's desk over choreography.
-  const motionOnly = blocking.every((i) => i.category === 'motion-appropriateness' || i.category === 'wow');
-  const iterationCap = config.maxQaIterations + (motionOnly ? 1 : 0);
-  if (iteration + 1 >= iterationCap) {
+  // The critic is advisory (SPEC decision 14): once its rounds are spent the
+  // demo publishes as is and the leftovers stay in the card, because the one
+  // human gate is Roman looking at the demo before the send. Parking the build
+  // on him instead doubled that gate, put two cards in Вхідні for one business
+  // and cost 2–4 hours per demo (2026-09-24). Only a deterministic defect —
+  // no contact, no noindex, placeholder copy, a fabricated fact — still stops.
+  const verdict = qaVerdict({ iteration, cap: config.maxQaIterations, blocking });
+  if (verdict.kind === 'fail') {
     await logStage(
       logPath,
-      `Ліміт ${iterationCap} ітерацій вичерпано, ${blocking.length} проблем лишилось — чекає на Романа`,
+      `Збірка не пройшла обовʼязкові перевірки (${verdict.hard.length}) — потрібна нова збірка`,
       'visual-qa',
     );
-    const parked = await parkBuildForHumanReview({
-      projectId,
-      businessId,
-      reason: `QA limit (${iterationCap}) reached with ${blocking.length} open issues`,
-      projectPatch: qaProjectPatch,
-    });
-    if (!parked) {
-      log.info('stale visual QA verdict ignored: project or business already advanced', {
-        businessId,
-        projectId,
-      });
-      throw new JobSkippedError(`Проєкт ${projectId} або бізнес уже перейшли далі — вердикт перевірки не застосовано.`);
-    }
-    // Decision #9: every Telegram push links into the control UI; Telegram has
-    // no controls of its own.
+    await db.update(schema.siteProjects).set(qaProjectPatch)
+      .where(and(eq(schema.siteProjects.id, projectId), eq(schema.siteProjects.state, 'qa')));
     await notifyTelegram(
-      `🔍 Демо для <b>${snapshot.name}</b> потребує людини після ${config.maxQaIterations} QA-ітерацій.\n` +
-      `Відкриті проблеми:\n${blocking.slice(0, 6).map((i) => `• [${i.severity}] ${i.issue.slice(0, 140)}`).join('\n')}\n\n` +
-      `👉 <a href="${uiLinks.business(businessId)}">Відкрити картку бізнесу</a>`,
+      `⛔ Демо для <b>${snapshot.name}</b> не пройшло обовʼязкові перевірки:\n` +
+      `${verdict.hard.slice(0, 4).map((issue) => `• ${issue.slice(0, 140)}`).join('\n')}\n\n` +
+      `👉 <a href="${uiLinks.business(businessId)}">Побудувати заново</a>`,
     ).catch(() => {});
-    // Terminal for the automated pipeline: reclaim the build artefacts. Sources
-    // and QA reports stay so a human can inspect what went wrong.
-    await collectWorkspaceGarbage(dir, 'needs_human_review').catch(() => {});
-    // NEEDS_HUMAN: the queue parks it without a retry storm (SPEC §7).
+    // NEEDS_HUMAN: the queue parks the step without a retry storm (SPEC §7);
+    // the card offers «Побудувати заново».
     throw new NeedsHumanError(
-      `visual QA exhausted ${config.maxQaIterations} iterations for ${businessId}; ${blocking.length} issues remain`,
+      `Збірка не пройшла обовʼязкові перевірки: ${verdict.hard.map((issue) => issue.slice(0, 120)).join(' | ')}`,
     );
+  }
+  if (verdict.kind === 'publish') {
+    await logStage(
+      logPath,
+      `Раунди критика вичерпано, ${verdict.leftovers} зауважень лишилось у картці — публікую як є`,
+      'visual-qa',
+    );
+    let published = false;
+    await commitWorkflow(async (tx) => {
+      const [updated] = await tx.update(schema.siteProjects)
+        .set({ ...qaProjectPatch, state: 'ready' })
+        .where(and(
+          eq(schema.siteProjects.id, projectId),
+          eq(schema.siteProjects.state, 'qa'),
+          eq(schema.siteProjects.qaIterations, iteration),
+        ))
+        .returning({ id: schema.siteProjects.id });
+      if (!updated) return [];
+      published = true;
+      return [{
+        name: 'deploy-demo',
+        payload: {
+          businessId,
+          projectId,
+          campaignId: payload.campaignId,
+          idempotencyKey: `deploy-demo:${businessId}:${projectId}`,
+        },
+      }];
+    });
+    if (!published) {
+      log.info('stale visual QA verdict ignored: project already advanced', { businessId, projectId });
+      throw new JobSkippedError(`Проєкт ${projectId} уже перейшов далі — вердикт перевірки не застосовано.`);
+    }
+    return;
   }
 
   // Feed the issues back into the SAME workspace and let the builder iterate.

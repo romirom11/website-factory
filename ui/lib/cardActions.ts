@@ -67,6 +67,13 @@ export interface CardActionBar {
    * component; `actions` stays empty.
    */
   decision?: { projectId: number };
+  /**
+   * Set when a PUBLISHED demo can be corrected in place: the header renders
+   * «Виправити демо» (a note form) and «Побудувати заново» next to the plain
+   * buttons. Without it the only way out of «Демо опубліковано» was to find
+   * a manual override (Roman, 2026-09-24: «побачив баг — як пофіксити?»).
+   */
+  fix?: { projectId: number };
   /** One line under the row, when the state needs explaining but has no primary. */
   hint?: string;
   /**
@@ -205,6 +212,7 @@ export function cardActionBar(input: CardActionInput): CardActionBar {
     return {
       waiting: null,
       actions: [approve, openDemo('Відкрити демо')].filter(Boolean) as CardAction[],
+      ...(status === 'site_ready' && projectState === 'deployed' && projectId ? { fix: { projectId } } : {}),
     };
   }
 

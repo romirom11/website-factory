@@ -478,6 +478,37 @@ async function latestVerdict(businessId: string): Promise<string | null> {
  * status, build already running) must not stop the rest, exactly like a failing
  * business never stops a campaign.
  */
+/**
+ * «Виправити демо»: Roman saw a bug on the PUBLISHED demo. His note goes into
+ * the build workspace first (the factory owns the files and refuses when the
+ * workspace is gone), then the factory turns the published build into a fix
+ * round: builder → critic → republish under the same URL, or back to Roman.
+ */
+export async function fixPublishedDemo(input: {
+  businessId: string;
+  projectId: number;
+  note: string;
+}): Promise<ActionResult> {
+  const note = input.note.trim();
+  if (!note) return { ok: false, message: 'Напиши, що саме поправити — без цього правка повторить те саме.' };
+  const written = await factoryFetch(`/internal/qa-note/${input.projectId}`, {
+    method: 'POST',
+    body: { note },
+  });
+  if (!written.ok) {
+    return { ok: false, message: written.message || 'Не вдалося записати нотатку у воркспейс — правку не запущено.' };
+  }
+  const response = await factoryFetch(`/internal/businesses/${input.businessId}/demo-fixes`, {
+    method: 'POST',
+    body: { note },
+  });
+  if (!response.ok) return { ok: false, message: response.message || 'Фабрика не запустила правку.' };
+  revalidatePath('/businesses');
+  revalidatePath(`/businesses/${input.businessId}`);
+  revalidatePath('/inbox');
+  return { ok: true, message: 'Правку поставлено в чергу: агент виправить, критик перевірить, демо опублікується на ту саму адресу.' };
+}
+
 export async function startDemoBuildBulk(businessIds: string[]): Promise<ActionResult> {
   const ids = [...new Set(businessIds.filter(Boolean))];
   if (!ids.length) return { ok: false, message: 'Нічого не обрано' };

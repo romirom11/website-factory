@@ -30,6 +30,7 @@ function executor(
     markDoNotContact: async (businessId) => ({ kind: 'blocked', businessId, blockedAddresses: 2 }),
     updateDealStage: async (businessId, state) => ({ kind: 'updated', businessId, state }),
     startBuild: async (businessId) => ({ kind: 'started', businessId, job: acceptedJob }),
+    fixPublishedDemo: async (businessId) => ({ kind: 'started', businessId, projectId: 6, job: acceptedJob }),
     recollectFacts: async (businessId) => ({ kind: 'started', businessId, job: acceptedJob }),
     ...overrides,
   };
@@ -82,6 +83,23 @@ await check('valid commands preserve normalized service results', async () => {
   assert.equal(build.status, 202);
   assert.equal(build.body.result.job.kind, 'accepted');
   assert.equal(recollect.status, 202);
+});
+
+await check('a published demo takes a fix note and refuses without one', async () => {
+  const seen: string[] = [];
+  const app = appWith('secret', executor({
+    fixPublishedDemo: async (businessId, note) => {
+      seen.push(note);
+      return note.trim()
+        ? { kind: 'started', businessId, projectId: 6, job: acceptedJob }
+        : { kind: 'state_conflict', message: 'note is required' };
+    },
+  }));
+  const fixed = await post(app, '/internal/businesses/a/demo-fixes', { note: 'footer phone is wrong' }, 'secret');
+  assert.equal(fixed.status, 202);
+  assert.equal(fixed.body.result.projectId, 6);
+  assert.deepEqual(seen, ['footer phone is wrong']);
+  assert.equal((await post(app, '/internal/businesses/a/demo-fixes', {}, 'secret')).status, 409);
 });
 
 await check('domain conflicts are explicit and retryable by the UI', async () => {

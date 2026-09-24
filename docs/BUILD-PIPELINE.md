@@ -22,9 +22,11 @@ production_ready
   → site_ready → request-approval (фаза D)
 ```
 
-Ліміт QA-ітерацій — `MAX_QA_ITERATIONS` (3). Вичерпано → `site_projects.state =
-needs_human_review`, бізнес у `needs_review`, job у `needs_human` (не failed,
-без retry-шторму), пуш у Telegram.
+Ліміт QA-ітерацій — `MAX_QA_ITERATIONS` (1). Вичерпано → **публікація як є**:
+проєкт у `ready`, `deploy-demo` у черзі, решта зауважень у `open_issues`
+(SPEC, рішення №14). Виняток — детерміновані дефекти (категорія `content`:
+контакт, noindex, placeholder, provenance): тоді job у `needs_human` (не failed,
+без retry-шторму), пуш у Telegram, вихід — «Побудувати заново».
 
 ### Build policy gate (перед stage 9)
 
@@ -216,7 +218,7 @@ Provenance-знахідки **не валять job** — вони їдуть у
 Ban-list слоупу — частина промпта. Падіння критика не валить job (детерміновані
 гейти лишаються), але й не пропускає сторінку автоматично.
 
-Issues (детерміновані + критик ≥ `QA_FEEDBACK_SEVERITY`, дефолт medium) →
+Issues (детерміновані + критик ≥ `QA_FEEDBACK_SEVERITY`, дефолт high) →
 `QA-ISSUES.md` **у той самий workspace** → білдер фіксить на місці. Кожна ітерація
 пише свій JSON-звіт; ключі накопичуються в `site_projects.qa_report_keys`.
 
@@ -274,9 +276,9 @@ health check б'є по ньому. Конфлікту немає в обидв�
 | `BUILDER_FIX_MAX_TURNS` | 120 | стеля ходів QA-фікса |
 | `BUILDER_TIMEOUT_MINUTES` | 90 | wall-clock однієї сесії |
 | `BUILD_VERIFY_TIMEOUT_MINUTES` | 20 | незалежний `pnpm build` |
-| `QA_FEEDBACK_SEVERITY` | medium | від якої severity issues критика йдуть назад |
+| `QA_FEEDBACK_SEVERITY` | high | від якої severity issues критика йдуть назад |
 | `MEDIA_GEN_IMAGES` | true | генерувати декоративний фон |
-| `MAX_QA_ITERATIONS` | 3 | стеля циклу |
+| `MAX_QA_ITERATIONS` | 1 | стеля циклу; далі публікація як є |
 | `DEPLOYS_DIR` | deploys | куди кладуться демо |
 | `DEMO_HOST` | 127.0.0.1 | бінд демо-сервера (назовні — тільки через тунель, §8) |
 

@@ -17,6 +17,7 @@ import { isSiteWorthyAmenity } from '../src/workers/snapshot.js';
 import { KEN_BURNS_SUPERSAMPLE, kenBurnsFilter } from '../src/media/video.js';
 import { VisualCritiqueSchema } from '../src/build/schemas.js';
 import { isFixIteration } from '../src/workers/builder.js';
+import { qaVerdict } from '../src/workers/visualQa.js';
 import { unusableContactReason } from '../src/build/snapshot.js';
 import {
   WOW_FAIL_THRESHOLD, WOW_MAX, condenseNotes, parseMotionIndex,
@@ -712,6 +713,20 @@ check('iteration 0 with no issues is a fresh build', !isFixIteration({ iteration
 check('a numbered round over an existing workspace is a fix', isFixIteration({ iteration: 2, issues: ['[high/layout] x'], hasWorkspace: true }));
 check("Roman's note with iteration 0 over an existing workspace is still a fix", isFixIteration({ iteration: 0, issues: ['[high/roman] menu too big'], hasWorkspace: true }));
 check('no workspace is never a fix, whatever the counter says', !isFixIteration({ iteration: 3, issues: ['x'], hasWorkspace: false }));
+
+// ── critic is advisory: after its rounds the demo publishes unless a hard defect remains ──
+{
+  const taste = [{ category: 'wow', issue: 'no scroll choreography' }, { category: 'layout', issue: 'footer collides' }];
+  const hard = [{ category: 'content', issue: 'no robots noindex meta tag' }];
+  check('rounds remain → back to the builder', qaVerdict({ iteration: 0, cap: 2, blocking: taste }).kind === 'iterate');
+  const publish = qaVerdict({ iteration: 0, cap: 1, blocking: taste });
+  check('rounds spent, only taste left → publish as is with the leftovers counted',
+    publish.kind === 'publish' && publish.leftovers === 2, publish);
+  const fail = qaVerdict({ iteration: 0, cap: 1, blocking: [...taste, ...hard] });
+  check('rounds spent, a deterministic defect left → fail with only the hard ones named',
+    fail.kind === 'fail' && fail.hard.length === 1 && fail.hard[0]!.includes('noindex'), fail);
+  check('nothing left → publish', qaVerdict({ iteration: 3, cap: 1, blocking: [] }).kind === 'publish');
+}
 
 // ── critic: a cursor-driven mechanic is unobservable in frames ─────────────
 {

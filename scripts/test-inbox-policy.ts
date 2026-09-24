@@ -197,6 +197,14 @@ check(
     && published.actions.map((a) => a.label).join(',') === 'Підтвердити відправку,Відкрити демо',
   published,
 );
+// «Виправити демо» in flight with the old approval still pending: the send is
+// NOT the next step, the running fix is.
+const fixing = cardActionBar({ ...stalledInput, projectState: 'building', hasPendingApproval: true, buildJobStatus: 'running' });
+check(
+  'a pending approval does not offer the send while the demo is being fixed',
+  fixing.actions.length === 0 && Boolean(fixing.waiting),
+  fixing,
+);
 const noProject = cardActionBar({ ...stalledInput, projectState: null, projectId: null, buildJobStatus: 'failed' });
 check(
   'a dead design step with no project offers only a fresh rebuild',

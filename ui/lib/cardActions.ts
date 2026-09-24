@@ -174,7 +174,7 @@ export function cardActionBar(input: CardActionInput): CardActionBar {
       decision: { projectId },
       waiting: null,
       actions: [],
-      hint: 'Критик не прийняв демо за 3 спроби. Подивись збірку в «Демо» нижче і вирішуй: '
+      hint: 'Ця збірка чекає на рішення. Подивись її в «Демо» нижче і вирішуй: '
         + 'опублікувати як є, дати ще одну спробу в цій збірці, побудувати заново з нуля '
         + 'або відхилити бізнес.',
     };
@@ -208,7 +208,10 @@ export function cardActionBar(input: CardActionInput): CardActionBar {
   }
 
   // ── the demo is built and the send is the next human decision ─────────────
-  if (status === 'site_ready' || (hasPendingApproval && status !== 'contacted')) {
+  // A pending approval does not make the send the next step while the demo it
+  // describes is being rebuilt or fixed: those statuses fall through to the
+  // in-flight branch below.
+  if (status === 'site_ready' || (hasPendingApproval && !['contacted', 'site_in_progress', 'needs_review'].includes(status))) {
     return {
       waiting: null,
       actions: [approve, openDemo('Відкрити демо')].filter(Boolean) as CardAction[],

@@ -228,6 +228,49 @@ try {
   });
   const nothingResume = await operator.startBuild(nothingBiz.id, { resume: true });
   check('resume with no stalled project says so instead of starting a design', nothingResume.kind === 'state_conflict', nothingResume);
+
+  // ── «Виправити демо»: a fix round over a PUBLISHED build ──────────────────
+  const fixBiz = await createBusiness({
+    id: 'e2e-fix-published', name: 'E2E Fix Published', status: 'site_ready',
+  });
+  const fixProject = await createSiteProject(fixBiz, 'deployed', { deployed: true, qaIterations: 4 });
+  const noNote = await operator.fixPublishedDemo(fixBiz.id, '   ');
+  check('a fix without a note is refused', noNote.kind === 'state_conflict', noNote);
+  const fixed = await operator.fixPublishedDemo(fixBiz.id, 'footer phone is wrong');
+  check('a published demo takes a fix round', fixed.kind === 'started' && fixed.projectId === fixProject.projectId, fixed);
+  const fixJob = await sqlOne<{ status: string; payload: { iteration?: number; issues?: string[]; projectId?: number } }>(
+    `select status, payload from workflow_jobs where business_id = $1 and job_type = 'build-site' order by id desc limit 1`,
+    [fixBiz.id]);
+  check('the fix round is a numbered iteration over the same project carrying the note',
+    fixJob?.status === 'queued' && fixJob.payload.projectId === fixProject.projectId
+    && (fixJob.payload.iteration ?? 0) >= 1 && fixJob.payload.issues?.[0] === '[high/roman] footer phone is wrong',
+    fixJob);
+  const fixSite = await sqlOne<{ state: string; deploy_token: string | null }>(
+    `select state, deploy_token from site_projects where id = $1`, [fixProject.projectId]);
+  const fixBusiness = await sqlOne<{ status: string }>(`select status from businesses where id = $1`, [fixBiz.id]);
+  check('the project goes back to building and keeps its URL token for the republish',
+    fixSite?.state === 'building' && Boolean(fixSite.deploy_token), fixSite);
+  check('the business is back in the build flow', fixBusiness?.status === 'site_in_progress', fixBusiness?.status);
+  const fixAgain = await operator.fixPublishedDemo(fixBiz.id, 'again');
+  check('a second fix is refused while the first is queued', fixAgain.kind === 'state_conflict', fixAgain);
+
+  const notLiveBiz = await createBusiness({
+    id: 'e2e-fix-not-published', name: 'E2E Fix Not Published', status: 'production_ready',
+  });
+  const notLive = await operator.fixPublishedDemo(notLiveBiz.id, 'anything');
+  check('a fix on a business without a published demo says so', notLive.kind === 'state_conflict', notLive);
+
+  // ── «Побудувати заново» from a published demo ─────────────────────────────
+  const redoBiz = await createBusiness({
+    id: 'e2e-rebuild-published', name: 'E2E Rebuild Published', status: 'site_ready',
+  });
+  const redoProject = await createSiteProject(redoBiz, 'deployed', { deployed: true });
+  const redo = await operator.startBuild(redoBiz.id, { fresh: true });
+  check('a fresh rebuild starts from a published demo', redo.kind === 'started', redo);
+  const redoSite = await sqlOne<{ state: string }>(`select state from site_projects where id = $1`, [redoProject.projectId]);
+  const redoBusiness = await sqlOne<{ status: string }>(`select status from businesses where id = $1`, [redoBiz.id]);
+  check('the published project is closed and the business is ready to build again',
+    redoSite?.state === 'cancelled' && redoBusiness?.status === 'production_ready', { redoSite, redoBusiness });
 } finally {
   await destroyFixtures();
   await pool.end();

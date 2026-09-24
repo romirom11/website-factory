@@ -28,6 +28,7 @@ import {
 } from '@/lib/actions';
 import { runWithToast } from '@/lib/toast';
 import { BuildDecisionActions } from './BuildDecisionActions';
+import { PublishedDemoActions } from './PublishedDemoActions';
 import type { CardAction, CardActionBar as Bar } from '@/lib/cardActions';
 
 /**
@@ -201,6 +202,14 @@ export function CardActionBar({ bar, businessId, name, status, other }: {
               <p className="text-sm text-ink-soft max-w-[62ch] py-1">{bar.waiting}</p>
             )}
           </div>
+
+          {/* A published demo can still be corrected — its own row, under the
+              send/open buttons, so fixing never looks like sending. */}
+          {bar.fix && (
+            <div className="basis-full mt-2.5">
+              <PublishedDemoActions projectId={bar.fix.projectId} businessId={businessId} name={name} />
+            </div>
+          )}
 
           {/* `pt-2.5` used to nudge a bare text link onto the buttons' baseline.
               «Інше…» is a real btn-sm now, so it aligns on its own box. */}

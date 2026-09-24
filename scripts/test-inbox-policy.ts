@@ -181,6 +181,22 @@ check(
   moving.actions.length === 0 && Boolean(moving.waiting),
   moving,
 );
+// A published demo is still editable: the send stays, and a fix form joins it.
+const published = cardActionBar({
+  ...stalledInput,
+  status: 'site_ready',
+  projectState: 'deployed',
+  projectId: 6,
+  deployUrl: 'https://demo/x/',
+  build: { enabled: false, needsConfirm: false, availability: 'busy' as const, hint: 'Демо для цього бізнесу вже будується' },
+  buildJobStatus: 'succeeded',
+});
+check(
+  'a published demo keeps its send and open buttons and offers a fix',
+  published.fix?.projectId === 6
+    && published.actions.map((a) => a.label).join(',') === 'Підтвердити відправку,Відкрити демо',
+  published,
+);
 const noProject = cardActionBar({ ...stalledInput, projectState: null, projectId: null, buildJobStatus: 'failed' });
 check(
   'a dead design step with no project offers only a fresh rebuild',

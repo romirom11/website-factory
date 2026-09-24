@@ -19,7 +19,7 @@ const ACTIVE_RUN_STATUSES = ['queued', 'running', 'retry_wait'] as const;
 const BUILD_JOB_TYPES = ['content-and-design', 'build-site', 'visual-qa', 'deploy-demo'] as const;
 /** Business statuses a FRESH rebuild may start from: the build flow itself is
  * included because that is where a dead build leaves its business parked. */
-const REBUILD_STATUSES = ['production_ready', 'needs_review', 'site_in_progress'] as const;
+const REBUILD_STATUSES = ['production_ready', 'needs_review', 'site_in_progress', 'site_ready'] as const;
 
 export interface StartBuildOptions {
   /**
@@ -66,6 +66,12 @@ export type DealStageResult = OperatorCommandConflict | {
 export type StartBuildResult = OperatorCommandConflict | {
   kind: 'started';
   businessId: string;
+  job: EnqueueResult;
+};
+export type FixPublishedDemoResult = OperatorCommandConflict | {
+  kind: 'started';
+  businessId: string;
+  projectId: number;
   job: EnqueueResult;
 };
 
@@ -280,11 +286,14 @@ export class OperatorBusinessCommandService {
         // Whatever the previous build left behind is closed in the same
         // transaction that starts the successor, so the Inbox never shows the
         // old failure next to the new run.
+        // A published demo is closed too: the files at its URL stay served
+        // until the new build publishes under its own token, so nothing a
+        // person may already be looking at goes dark.
         await tx.update(schema.siteProjects)
           .set({ state: 'cancelled' })
           .where(and(
             eq(schema.siteProjects.businessId, businessId),
-            inArray(schema.siteProjects.state, ACTIVE_PROJECT_STATES),
+            inArray(schema.siteProjects.state, [...ACTIVE_PROJECT_STATES, 'deployed']),
           ));
         const closedAttempts = await tx.update(schema.workflowJobs)
           .set({ status: 'cancelled', errorCode: null, errorDetail: reason, finishedAt })
@@ -310,6 +319,20 @@ export class OperatorBusinessCommandService {
           });
           if (recovered.kind !== 'moved') {
             throw new Error(`fresh build lost its locked recovery for ${businessId}`);
+          }
+          status = 'production_ready';
+        } else if (status === 'site_ready') {
+          // Backwards on purpose — a published demo is being thrown away — so
+          // it is an override under Roman's name, not a normal transition.
+          const moved = await this.transitions.overrideInTransaction(tx, {
+            businessId,
+            expectedStatus: 'site_ready',
+            to: 'production_ready',
+            actor: 'roman',
+            reason,
+          });
+          if (moved.kind !== 'moved') {
+            throw new Error(`fresh build lost its locked override for ${businessId}`);
           }
           status = 'production_ready';
         }
@@ -366,6 +389,101 @@ export class OperatorBusinessCommandService {
     });
     const job = jobs[0];
     if (job) result = { kind: 'started', businessId, job };
+    return result;
+  }
+
+  /**
+   * «Виправити демо»: a fix round over a PUBLISHED build, with Roman's note as
+   * the brief. The demo he saw the bug on stays live at its URL while the
+   * builder works; the critic then republishes under the same token (deploy
+   * reuses `deploy_token`) or, if it still objects, hands the build back to
+   * him. Before this the only way out of «Демо опубліковано» was a full
+   * rebuild from the design (2026-09-24).
+   *
+   * The note itself goes into QA-ISSUES.md through `/internal/qa-note`, which
+   * also checks the workspace is still on disk — the caller does that first.
+   */
+  async fixPublishedDemo(businessId: string, note: string): Promise<FixPublishedDemoResult> {
+    const brief = note.trim();
+    if (!brief) return { kind: 'state_conflict', message: 'note is required' };
+    // `as`, not an annotation: TS narrows a `let` by its initializer and does
+    // not see the closure below reassign it, so the `started` check at the end
+    // would otherwise be judged impossible.
+    let result = { kind: 'not_found', entity: 'business' } as FixPublishedDemoResult;
+    const jobs = await this.runStore.enqueueTransaction(async (tx) => {
+      const [business] = await tx.select().from(schema.businesses)
+        .where(eq(schema.businesses.id, businessId))
+        .limit(1)
+        .for('update');
+      if (!business) return [];
+      const status = requireBusinessStatus(business.status, `business ${businessId}`);
+      if (status !== 'site_ready') {
+        result = { kind: 'state_conflict', message: `business status ${status} has no published demo to fix` };
+        return [];
+      }
+      const [activeRun] = await tx.select({ jobType: schema.workflowJobRuns.jobType })
+        .from(schema.workflowJobRuns)
+        .where(and(
+          eq(schema.workflowJobRuns.businessId, businessId),
+          inArray(schema.workflowJobRuns.jobType, BUILD_JOB_TYPES),
+          inArray(schema.workflowJobRuns.status, ACTIVE_RUN_STATUSES),
+        ))
+        .limit(1);
+      if (activeRun) {
+        result = { kind: 'state_conflict', message: `build workflow ${activeRun.jobType} is already active` };
+        return [];
+      }
+      const [project] = await tx.select({
+        id: schema.siteProjects.id,
+        qaIterations: schema.siteProjects.qaIterations,
+      })
+        .from(schema.siteProjects)
+        .where(and(
+          eq(schema.siteProjects.businessId, businessId),
+          eq(schema.siteProjects.state, 'deployed'),
+        ))
+        .orderBy(desc(schema.siteProjects.createdAt))
+        .limit(1)
+        .for('update');
+      if (!project) {
+        result = { kind: 'state_conflict', message: 'no published demo to fix' };
+        return [];
+      }
+      await tx.update(schema.siteProjects)
+        .set({ state: 'building' })
+        .where(eq(schema.siteProjects.id, project.id));
+      const moved = await this.transitions.overrideInTransaction(tx, {
+        businessId,
+        expectedStatus: 'site_ready',
+        to: 'site_in_progress',
+        actor: 'roman',
+        reason: `Роман замовив правку опублікованого демо: ${brief.slice(0, 200)}`,
+      });
+      if (moved.kind !== 'moved') {
+        throw new Error(`demo fix lost its locked override for ${businessId}`);
+      }
+      // A fix round (iteration ≥ 1) over the existing workspace: the builder
+      // reads QA-ISSUES.md with the note on top; the critic, at the cap
+      // already, publishes or parks after this one round.
+      const iteration = Math.max(1, project.qaIterations ?? 0);
+      result = { kind: 'started', businessId, projectId: project.id, job: { kind: 'accepted' } as EnqueueResult };
+      return [{
+        name: 'build-site',
+        payload: {
+          businessId,
+          projectId: project.id,
+          campaignId: business.campaignId,
+          iteration,
+          issues: [`[high/roman] ${brief}`],
+          idempotencyKey: `build-site:${businessId}:${project.id}:roman:${Date.now()}`,
+        },
+      }];
+    });
+    const job = jobs[0];
+    if (result.kind === 'started') {
+      if (!job) throw new Error(`demo fix for ${businessId} committed without its job`);
+      return { kind: 'started', businessId: result.businessId, projectId: result.projectId, job };
+    }
     return result;
   }
 

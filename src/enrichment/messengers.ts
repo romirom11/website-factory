@@ -41,14 +41,38 @@ function push(out: DetectedContact[], c: DetectedContact): void {
   if (!dupe) out.push(c);
 }
 
-/** Strips tracking noise so two links to the same profile dedupe. */
+/**
+ * Sub-pages of a profile that are not the profile. The Instagram app's «share
+ * profile» link is `instagram.com/<handle>/profilecard/?igsh=…`, and owners
+ * paste exactly that into their Google listing — one reached a contact as
+ * `…/mc_laser_patras/profilecard` (2026-09-25). Facebook pages carry their
+ * own tabs (`/about`, `/reviews`, `/posts`).
+ */
+const PROFILE_SUBPAGES = new Set([
+  'profilecard', 'reels', 'tagged', 'saved', 'followers', 'following', 'channel', 'guides', 'igtv',
+  'about', 'about_details', 'posts', 'reviews', 'photos', 'videos', 'events', 'community', 'services', 'mentions', 'timeline',
+]);
+
+/** Strips tracking noise and profile sub-pages so two links to the same profile dedupe. */
 export function cleanProfileUrl(url: string): string {
   try {
     const u = new URL(url);
     u.hash = '';
     u.search = '';
-    let path = u.pathname.replace(/\/+$/, '');
-    return `${u.protocol}//${u.hostname.replace(/^www\.|^m\./, '')}${path}`.toLowerCase();
+    const host = u.hostname.replace(/^www\.|^m\./, '').toLowerCase();
+    let segments = u.pathname.split('/').filter(Boolean);
+    if (/(^|\.)(instagram|facebook|tiktok)\.com$/.test(host) && segments.length > 1) {
+      // A plain profile is one segment; keep the handle and drop the sub-page.
+      // Special roots (`_u/<handle>`, `people/<name>/<id>`, `profile.php`) keep
+      // their shape — the deny-lists below decide what they are.
+      const first = segments[0]!.toLowerCase();
+      if (!IG_PATH_DENY.has(first) && !FB_PATH_DENY.has(first) && !FB_VERSION_SEGMENT.test(first) && first !== 'people') {
+        segments = segments.filter((segment, index) => index === 0 || !PROFILE_SUBPAGES.has(segment.toLowerCase()));
+        segments = segments.slice(0, 1);
+      }
+    }
+    const path = segments.length ? `/${segments.join('/')}` : '';
+    return `${u.protocol}//${host}${path}`.toLowerCase();
   } catch {
     return url.trim().toLowerCase();
   }

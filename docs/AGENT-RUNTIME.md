@@ -202,7 +202,7 @@ ttyd-порт. На стороні черги `WorkerConsumerPool` підтри�
 Окремий `Dockerfile.runner` ставить усі три CLI в executor (версії піновані):
 
 ```dockerfile
-RUN npm i -g @anthropic-ai/claude-code@2.1.282 @openai/codex@0.149.1 opencode-ai@1.18.23
+RUN npm i -g @anthropic-ai/claude-code@2.1.281 @openai/codex@0.149.1 opencode-ai@1.18.23
 ENV CODEX_HOME=/app/runner-work/.private/codex
 ENV OPENCODE_DISABLE_AUTOUPDATE=1
 USER node          # НЕ hardening: --dangerously-skip-permissions відмовляється працювати під root

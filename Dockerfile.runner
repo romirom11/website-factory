@@ -65,7 +65,7 @@ FROM dependencies AS executor
 # control plane and deterministic workers, never provider auth mounts. Versions
 # are deliberately pinned to the releases exercised by the runtime adapters;
 # an upstream CLI flag/parser change must arrive as a reviewed dependency bump.
-ARG CLAUDE_CODE_VERSION=2.1.282
+ARG CLAUDE_CODE_VERSION=2.1.281
 ARG CODEX_CLI_VERSION=0.149.1
 ARG OPENCODE_VERSION=1.18.23
 RUN npm i -g \

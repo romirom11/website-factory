@@ -52,20 +52,45 @@ export const DEPLOYS_ROOT = path.resolve(process.env.DEPLOYS_DIR ?? 'deploys');
  * rebuild. `trailingSlash: true` guarantees the page URL ends in `/`, so a
  * relative path resolves inside the demo directory.
  */
+/**
+ * The rewrite for one file's text. Exported for the unit test.
+ *
+ * NEVER inside the React Server Components payload. A Next export embeds it as
+ * `self.__next_f.push([1,"…"])` script chunks (and as `*.txt` files for client
+ * navigation), and that stream carries length-prefixed rows (`id:T<hex>,text`).
+ * Adding a `.` in front of `/assets/` inside such a row leaves the declared
+ * byte length two short, the Flight parser runs off the end of the row, throws
+ * «Connection closed.» and React unmounts the whole page — the demo flashed
+ * and went blank (BEAUTIFY Laser, 2026-09-25; the JSON-LD block was the row).
+ * Absolute asset requests the client makes from the untouched payload are
+ * re-rooted by the demo server from the page's Referer (serveDir.ts), so the
+ * payload does not need the rewrite at all.
+ */
+export function relativizeAssetText(original: string, prefix: string, kind: 'html' | 'css' | 'js'): string {
+  const rewrite = (text: string): string => text
+    .replace(/(["'(])\/(_next|assets|generated)\//g, `$1${prefix}$2/`)
+    .replace(/(["'(])\\\/(_next|assets|generated)\\\//g, `$1${prefix}$2/`);
+  if (kind !== 'html') return rewrite(original);
+  return original
+    .split(/(<script\b[^>]*>[\s\S]*?<\/script>)/i)
+    .map((segment) => (/^<script\b/i.test(segment) && segment.includes('__next_f') ? segment : rewrite(segment)))
+    .join('');
+}
+
 async function relativizeAssetPaths(dir: string): Promise<number> {
   let rewritten = 0;
   const walk = async (current: string): Promise<void> => {
     for (const entry of await readdir(current, { withFileTypes: true })) {
       const full = path.join(current, entry.name);
       if (entry.isDirectory()) { await walk(full); continue; }
-      if (!/\.(html|css|js|txt)$/i.test(entry.name)) continue;
+      // `.txt` is the Flight payload for client navigation: see relativizeAssetText.
+      const kind = /\.html$/i.test(entry.name) ? 'html' : /\.css$/i.test(entry.name) ? 'css' : /\.js$/i.test(entry.name) ? 'js' : null;
+      if (!kind) continue;
       const original = await readFile(full, 'utf8');
       // Depth of this file below the demo root decides how far back "./" must go.
       const depth = path.relative(dir, path.dirname(full)).split(path.sep).filter(Boolean).length;
       const prefix = depth === 0 ? './' : '../'.repeat(depth);
-      const updated = original
-        .replace(/(["'(])\/(_next|assets|generated)\//g, `$1${prefix}$2/`)
-        .replace(/(["'(])\\\/(_next|assets|generated)\\\//g, `$1${prefix}$2/`);
+      const updated = relativizeAssetText(original, prefix, kind);
       if (updated !== original) { await writeFile(full, updated); rewritten++; }
     }
   };

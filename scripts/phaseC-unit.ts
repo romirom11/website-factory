@@ -18,6 +18,7 @@ import { KEN_BURNS_SUPERSAMPLE, kenBurnsFilter } from '../src/media/video.js';
 import { VisualCritiqueSchema } from '../src/build/schemas.js';
 import { isFixIteration } from '../src/workers/builder.js';
 import { qaVerdict } from '../src/workers/visualQa.js';
+import { relativizeAssetText } from '../src/workers/deploy.js';
 import { unusableContactReason } from '../src/build/snapshot.js';
 import {
   WOW_FAIL_THRESHOLD, WOW_MAX, condenseNotes, parseMotionIndex,
@@ -713,6 +714,18 @@ check('iteration 0 with no issues is a fresh build', !isFixIteration({ iteration
 check('a numbered round over an existing workspace is a fix', isFixIteration({ iteration: 2, issues: ['[high/layout] x'], hasWorkspace: true }));
 check("Roman's note with iteration 0 over an existing workspace is still a fix", isFixIteration({ iteration: 0, issues: ['[high/roman] menu too big'], hasWorkspace: true }));
 check('no workspace is never a fix, whatever the counter says', !isFixIteration({ iteration: 3, issues: ['x'], hasWorkspace: false }));
+
+// ── deploy: asset paths go relative in markup, never inside the React payload ──
+{
+  const flight = '<script>self.__next_f.push([1,"2:T7,\\"/assets/a.jpg\\"\\n"])</script>';
+  const html = `<link href="/_next/static/x.css"><img src="/assets/a.jpg"><style>.h{background:url(/generated/h.mp4)}</style>${flight}<script>fetch("/assets/z.json")</script>`;
+  const out = relativizeAssetText(html, './', 'html');
+  check('markup asset paths become relative', out.includes('href="./_next/static/x.css"') && out.includes('src="./assets/a.jpg"') && out.includes('url(./generated/h.mp4)'), out);
+  check('the Flight payload script is byte-identical (length-prefixed rows stay valid)', out.includes(flight), out);
+  check('an ordinary inline script is still rewritten', out.includes('fetch("./assets/z.json")'), out);
+  check('css and js are rewritten as before', relativizeAssetText('url(/assets/a.jpg)', '../', 'css') === 'url(../assets/a.jpg)'
+    && relativizeAssetText('"/_next/static/c.js"', './', 'js') === '"./_next/static/c.js"');
+}
 
 // ── critic is advisory: after its rounds the demo publishes unless a hard defect remains ──
 {

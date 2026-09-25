@@ -123,6 +123,11 @@ console.log('# helpers');
 check('normalizeMsisdn strips spaces', normalizeMsisdn('+30 691 234 5678') === '+306912345678');
 check('normalizeMsisdn rejects short', normalizeMsisdn('1234') === null);
 check('cleanProfileUrl drops query', cleanProfileUrl('https://www.instagram.com/beautify_patra?igsh=abc') === 'https://instagram.com/beautify_patra');
+check('cleanProfileUrl drops the app share-link suffix', cleanProfileUrl('https://instagram.com/mc_laser_patras/profilecard/?igsh=NTc4MTIwNjQ2YQ==') === 'https://instagram.com/mc_laser_patras');
+check('cleanProfileUrl drops instagram sub-pages', cleanProfileUrl('https://www.instagram.com/beautify_patra/reels/') === 'https://instagram.com/beautify_patra');
+check('cleanProfileUrl drops facebook tabs', cleanProfileUrl('https://m.facebook.com/BeautifyPatra/about') === 'https://facebook.com/beautifypatra');
+check('cleanProfileUrl keeps a deep-link placeholder path for the deny-list', cleanProfileUrl('https://instagram.com/_u/beautify_patra') === 'https://instagram.com/_u/beautify_patra');
+check('cleanProfileUrl leaves non-social hosts alone', cleanProfileUrl('https://trendyhair.gr/services/nails/') === 'https://trendyhair.gr/services/nails');
 check('classify instagram', classifySocialUrl('https://www.instagram.com/x') === 'instagram');
 check('classify own domain -> null', classifySocialUrl('https://trendyhair.gr/') === null);
 

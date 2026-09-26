@@ -9,8 +9,9 @@
  * `ai_generated` stays false; media generation is a separate, clearly-marked
  * path (spec §2.5).
  */
-import { eq, and } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { db, schema } from '../db/client.js';
+import { cleanProfileUrl } from './messengers.js';
 import { getObject, putAsset, sha256 } from '../lib/storage.js';
 import { log } from '../lib/logger.js';
 import { config } from '../config.js';
@@ -159,6 +160,24 @@ function extFor(contentType: string): string {
  * `source_id` travels with it, so an asset is always traceable to a page a
  * person can open.
  */
+/**
+ * Social captures a business's photos may come from: ONLY profiles that are a
+ * VERIFIED contact of the business. Social discovery captures every candidate
+ * it reads — including profiles the matcher then judged medium or weak, and
+ * even login walls — and mining all of them attached a stranger's selfies to a
+ * dentist whose name a private Instagram account happened to share
+ * (Παναγιωτοπούλου Μαρία, 2026-09-26). Twenty businesses carried such photos;
+ * no demo had been built from them yet. Owned-website captures are unaffected.
+ */
+export function isTrustedSocialCapture(
+  capture: { sourceType: string; url: string },
+  verifiedProfiles: ReadonlyArray<{ channel: string; value: string }>,
+): boolean {
+  if (capture.sourceType !== 'instagram' && capture.sourceType !== 'facebook') return true;
+  const page = cleanProfileUrl(capture.url);
+  return verifiedProfiles.some((c) => c.channel === capture.sourceType && cleanProfileUrl(c.value) === page);
+}
+
 async function mineCaptures(
   businessId: string,
   siteHost: string | null,
@@ -166,6 +185,15 @@ async function mineCaptures(
   const notes: string[] = [];
   const sources = await db.select().from(schema.businessSources)
     .where(eq(schema.businessSources.businessId, businessId));
+  const verifiedProfiles = await db.select({
+    channel: schema.businessContacts.channel,
+    value: schema.businessContacts.value,
+  }).from(schema.businessContacts)
+    .where(and(
+      eq(schema.businessContacts.businessId, businessId),
+      eq(schema.businessContacts.verified, true),
+      inArray(schema.businessContacts.channel, ['instagram', 'facebook']),
+    ));
 
   // Newest capture per (type, url): an older version is superseded evidence.
   const latest = new Map<string, typeof sources[number]>();
@@ -182,6 +210,10 @@ async function mineCaptures(
   for (const src of latest.values()) {
     const type = src.sourceType;
     if (type !== 'owned_website' && type !== 'instagram' && type !== 'facebook') continue;
+    if (!isTrustedSocialCapture(src, verifiedProfiles)) {
+      notes.push(`${type} capture ${src.url} skipped: not a verified profile of this business`);
+      continue;
+    }
 
     let html: string;
     try {

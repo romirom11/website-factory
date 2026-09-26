@@ -75,6 +75,8 @@ export type FixPublishedDemoResult = OperatorCommandConflict | {
   job: EnqueueResult;
 };
 
+export type AddServicesResult = OperatorCommandConflict
+  | { kind: 'added'; businessId: string; added: number; job: EnqueueResult };
 export type RecollectFactsResult = OperatorCommandConflict
   | { kind: 'already_active'; businessId: string }
   | { kind: 'started'; businessId: string; job: EnqueueResult };
@@ -483,6 +485,72 @@ export class OperatorBusinessCommandService {
     if (result.kind === 'started') {
       if (!job) throw new Error(`demo fix for ${businessId} committed without its job`);
       return { kind: 'started', businessId: result.businessId, projectId: result.projectId, job };
+    }
+    return result;
+  }
+
+  /**
+   * «Додати послуги»: Roman types the services the evidence did not yield
+   * (a dentist with no website and no social profile has nowhere for the
+   * factory to read them from), and the readiness gate re-runs at once.
+   *
+   * Still evidence, not invention: every service is a `service` fact citing
+   * ONE `business_sources` row of type `operator` — «Roman said so, on this
+   * date» — so the build snapshot, the provenance check and the card can all
+   * point at where a fact came from. Verified, because a person wrote it.
+   */
+  async addServices(businessId: string, names: readonly string[]): Promise<AddServicesResult> {
+    const cleaned = [...new Set(names.map((n) => n.trim().replace(/\s+/g, ' ')).filter((n) => n.length >= 2 && n.length <= 120))];
+    if (!cleaned.length) return { kind: 'state_conflict', message: 'no services given' };
+    let result = { kind: 'not_found', entity: 'business' } as AddServicesResult;
+    const jobs = await this.runStore.enqueueTransaction(async (tx) => {
+      const [business] = await tx.select({ status: schema.businesses.status, campaignId: schema.businesses.campaignId })
+        .from(schema.businesses)
+        .where(eq(schema.businesses.id, businessId))
+        .limit(1)
+        .for('update');
+      if (!business) return [];
+      const status = requireBusinessStatus(business.status, `business ${businessId}`);
+      if (!['needs_review', 'production_ready', 'enriching'].includes(status)) {
+        result = { kind: 'state_conflict', message: `business status ${status} cannot take services` };
+        return [];
+      }
+      const existing = await tx.select({ value: schema.businessFacts.value })
+        .from(schema.businessFacts)
+        .where(and(eq(schema.businessFacts.businessId, businessId), eq(schema.businessFacts.key, 'service')));
+      const known = new Set(existing.map((f) => String((f.value as { name?: string } | null)?.name ?? '').toLowerCase()));
+      const fresh = cleaned.filter((n) => !known.has(n.toLowerCase()));
+      if (fresh.length) {
+        const [source] = await tx.insert(schema.businessSources).values({
+          businessId,
+          sourceType: 'operator',
+          url: `operator://roman/services/${Date.now()}`,
+          method: 'manual',
+        }).returning({ id: schema.businessSources.id });
+        await tx.insert(schema.businessFacts).values(fresh.map((name) => ({
+          businessId,
+          key: 'service',
+          value: { name, price: null },
+          sourceId: source!.id,
+          confidence: 1,
+          extractionMethod: 'manual',
+          verified: true,
+        })));
+      }
+      result = { kind: 'added', businessId, added: fresh.length, job: { kind: 'accepted' } as EnqueueResult };
+      return [{
+        name: 'readiness-gate',
+        payload: {
+          businessId,
+          campaignId: business.campaignId,
+          idempotencyKey: `readiness-gate:${businessId}:services:${Date.now()}`,
+        },
+      }];
+    });
+    const job = jobs[0];
+    if (result.kind === 'added') {
+      if (!job) throw new Error(`services for ${businessId} committed without the gate job`);
+      return { kind: 'added', businessId, added: result.added, job };
     }
     return result;
   }

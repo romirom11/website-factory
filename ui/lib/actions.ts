@@ -509,6 +509,29 @@ export async function fixPublishedDemo(input: {
   return { ok: true, message: 'Правку поставлено в чергу: агент виправить, критик перевірить, демо опублікується на ту саму адресу.' };
 }
 
+/**
+ * «Додати послуги»: the one hard gap a person can close by hand. Each line is
+ * one service; the factory records them as Roman's own facts and re-runs the
+ * readiness gate, so «Побудувати демо» unlocks by itself.
+ */
+export async function addServices(formData: FormData): Promise<ActionResult> {
+  const businessId = String(formData.get('businessId') ?? '');
+  const services = String(formData.get('services') ?? '')
+    .split(/\r?\n|;/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!businessId) return { ok: false, message: 'Бізнес не вказано' };
+  if (services.length < 3) return { ok: false, message: 'Напиши хоча б три послуги, по одній у рядку.' };
+  const response = await factoryFetch(`/internal/businesses/${businessId}/services`, {
+    method: 'POST',
+    body: { services },
+  });
+  if (!response.ok) return { ok: false, message: response.message || 'Фабрика не прийняла послуги.' };
+  revalidatePath(`/businesses/${businessId}`);
+  revalidatePath('/businesses');
+  return { ok: true, message: `Додано. Фабрика перевіряє готовність — за хвилину «Побудувати демо» стане активною.` };
+}
+
 export async function startDemoBuildBulk(businessIds: string[]): Promise<ActionResult> {
   const ids = [...new Set(businessIds.filter(Boolean))];
   if (!ids.length) return { ok: false, message: 'Нічого не обрано' };

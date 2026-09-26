@@ -127,6 +127,15 @@ check('cleanProfileUrl drops the app share-link suffix', cleanProfileUrl('https:
 check('cleanProfileUrl drops instagram sub-pages', cleanProfileUrl('https://www.instagram.com/beautify_patra/reels/') === 'https://instagram.com/beautify_patra');
 check('cleanProfileUrl drops facebook tabs', cleanProfileUrl('https://m.facebook.com/BeautifyPatra/about') === 'https://facebook.com/beautifypatra');
 check('cleanProfileUrl keeps a deep-link placeholder path for the deny-list', cleanProfileUrl('https://instagram.com/_u/beautify_patra') === 'https://instagram.com/_u/beautify_patra');
+{
+  const { isTrustedSocialCapture } = await import('../src/enrichment/assetCollection.js');
+  const verified = [{ channel: 'instagram', value: 'https://instagram.com/sic.beautyworks' }];
+  check('photos come from a verified profile capture', isTrustedSocialCapture({ sourceType: 'instagram', url: 'https://www.instagram.com/sic.beautyworks/' }, verified));
+  check('a rejected candidate profile is not mined', !isTrustedSocialCapture({ sourceType: 'instagram', url: 'https://www.instagram.com/kanina289' }, verified));
+  check('a login wall is not mined', !isTrustedSocialCapture({ sourceType: 'instagram', url: 'https://www.instagram.com/accounts/login/?next=%2Fleoera' }, verified));
+  check('the other platform needs its own verified contact', !isTrustedSocialCapture({ sourceType: 'facebook', url: 'https://facebook.com/sic.beautyworks' }, verified));
+  check('the owned website is always mined', isTrustedSocialCapture({ sourceType: 'owned_website', url: 'https://sic.gr/' }, []));
+}
 check('cleanProfileUrl leaves non-social hosts alone', cleanProfileUrl('https://trendyhair.gr/services/nails/') === 'https://trendyhair.gr/services/nails');
 check('classify instagram', classifySocialUrl('https://www.instagram.com/x') === 'instagram');
 check('classify own domain -> null', classifySocialUrl('https://trendyhair.gr/') === null);

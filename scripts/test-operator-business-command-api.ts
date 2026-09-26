@@ -31,6 +31,7 @@ function executor(
     updateDealStage: async (businessId, state) => ({ kind: 'updated', businessId, state }),
     startBuild: async (businessId) => ({ kind: 'started', businessId, job: acceptedJob }),
     fixPublishedDemo: async (businessId) => ({ kind: 'started', businessId, projectId: 6, job: acceptedJob }),
+    addServices: async (businessId, names) => ({ kind: 'added', businessId, added: names.length, job: acceptedJob }),
     recollectFacts: async (businessId) => ({ kind: 'started', businessId, job: acceptedJob }),
     ...overrides,
   };
@@ -100,6 +101,16 @@ await check('a published demo takes a fix note and refuses without one', async (
   assert.equal(fixed.body.result.projectId, 6);
   assert.deepEqual(seen, ['footer phone is wrong']);
   assert.equal((await post(app, '/internal/businesses/a/demo-fixes', {}, 'secret')).status, 409);
+});
+
+await check('services typed by Roman reach the command as a clean list', async () => {
+  const seen: string[][] = [];
+  const app = appWith('secret', executor({
+    addServices: async (businessId, names) => { seen.push([...names]); return { kind: 'added', businessId, added: names.length, job: acceptedJob }; },
+  }));
+  const res = await post(app, '/internal/businesses/a/services', { services: ['Καθαρισμός', 42, 'Λεύκανση'] }, 'secret');
+  assert.equal(res.status, 202);
+  assert.deepEqual(seen, [['Καθαρισμός', 'Λεύκανση']]);
 });
 
 await check('domain conflicts are explicit and retryable by the UI', async () => {

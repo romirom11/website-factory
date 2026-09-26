@@ -7,7 +7,7 @@ import {
 
 export type OperatorBusinessCommandExecutor = Pick<
   OperatorBusinessCommandService,
-  'markDoNotContact' | 'updateDealStage' | 'startBuild' | 'fixPublishedDemo' | 'recollectFacts'
+  'markDoNotContact' | 'updateDealStage' | 'startBuild' | 'fixPublishedDemo' | 'addServices' | 'recollectFacts'
 >;
 
 function isDealState(value: unknown): value is DealState {
@@ -75,6 +75,18 @@ export function registerOperatorBusinessCommandRoutes(
       return context.json({ ok: false, message: result.kind === 'not_found' ? 'business not found' : result.message, result }, conflictStatus(result.kind));
     }
     return context.json({ ok: true, message: 'demo fix queued', result }, result.job.kind === 'accepted' ? 202 : 200);
+  });
+
+  app.post('/internal/businesses/:businessId/services', internalAuth, async (context) => {
+    const businessId = context.req.param('businessId').trim();
+    if (!businessId) return context.json({ ok: false, message: 'businessId is required' }, 400);
+    const body = await context.req.json().catch(() => null) as { services?: unknown } | null;
+    const services = Array.isArray(body?.services) ? body.services.filter((s): s is string => typeof s === 'string') : [];
+    const result = await execute.addServices(businessId, services);
+    if (result.kind !== 'added') {
+      return context.json({ ok: false, message: result.kind === 'not_found' ? 'business not found' : result.message, result }, conflictStatus(result.kind));
+    }
+    return context.json({ ok: true, message: `${result.added} services added; readiness re-check queued`, result }, 202);
   });
 
   app.post('/internal/businesses/:businessId/recollect-facts', internalAuth, async (context) => {

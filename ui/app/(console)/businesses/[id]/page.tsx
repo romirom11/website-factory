@@ -29,6 +29,7 @@ import { isSocialChannel, socialsButtonState } from '@/lib/socials';
 import { BrandSwatches } from '@/components/BrandSwatches';
 import { RefreshBrandButton } from '@/components/RefreshBrandButton';
 import { LiveBuildPanel } from '@/components/LiveBuildPanel';
+import { AddServicesForm } from '@/components/AddServicesForm';
 
 export const dynamic = 'force-dynamic';
 
@@ -522,6 +523,7 @@ export default async function BusinessPage({ params }: { params: Promise<{ id: s
               </li>
             ))}
           </ul>
+          {hardGaps.some((g) => g.gap === 'services_min3') && <AddServicesForm businessId={biz.id} />}
         </Panel>
       )}
 

@@ -260,6 +260,27 @@ try {
   const notLive = await operator.fixPublishedDemo(notLiveBiz.id, 'anything');
   check('a fix on a business without a published demo says so', notLive.kind === 'state_conflict', notLive);
 
+  // ── «Додати послуги»: Roman closes the services gap by hand ──────────────
+  const dentistBiz = await createBusiness({
+    id: 'e2e-add-services', name: 'E2E Dentist', status: 'needs_review',
+  });
+  const added = await operator.addServices(dentistBiz.id, [' Καθαρισμός δοντιών ', 'Λεύκανση', 'Λεύκανση', 'Εμφυτεύματα', 'x']);
+  check('services are recorded once each, trimmed, and the gate is queued',
+    added.kind === 'added' && added.added === 3, added);
+  const serviceFacts = await sqlOne<{ n: string; verified: string; src_type: string }>(
+    `select count(*)::text as n, bool_and(f.verified)::text as verified, min(s.source_type) as src_type
+       from business_facts f join business_sources s on s.id = f.source_id
+      where f.business_id = $1 and f.key = 'service'`, [dentistBiz.id]);
+  check('each service is a verified fact citing an operator source',
+    serviceFacts?.n === '3' && serviceFacts.verified === 'true' && serviceFacts.src_type === 'operator', serviceFacts);
+  const servicesGateQueued = await sqlOne<{ n: string }>(
+    `select count(*)::text as n from workflow_jobs where business_id = $1 and job_type = 'readiness-gate' and status = 'queued'`, [dentistBiz.id]);
+  check('the readiness gate re-runs right away', servicesGateQueued?.n === '1', servicesGateQueued);
+  const again = await operator.addServices(dentistBiz.id, ['Λεύκανση']);
+  check('a repeated service is not duplicated', again.kind === 'added' && again.added === 0, again);
+  const empty = await operator.addServices(dentistBiz.id, ['  ', 'x']);
+  check('nothing usable is refused', empty.kind === 'state_conflict', empty);
+
   // ── «Побудувати заново» from a published demo ─────────────────────────────
   const redoBiz = await createBusiness({
     id: 'e2e-rebuild-published', name: 'E2E Rebuild Published', status: 'site_ready',
